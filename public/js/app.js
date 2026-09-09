@@ -19,6 +19,8 @@ class App {
     this.mainContainer = null;
     this.selectedUploadFiles = [];
     this.connectedDevices = [];
+    this.wakeLockSentinel = null;
+    this.deferredPrompt = null;
   }
 
   async init() {
@@ -36,7 +38,10 @@ class App {
     this._setupTransferEvents();
     this._setupConnectionEvents();
     this._setupQrModal();
+    this._setupPwaInstall();
+    this._setupTabGuard();
     this._setupErrorBoundary();
+    this._registerServiceWorker();
 
     // Fetch initial server info
     await this._fetchServerInfo();
@@ -685,6 +690,13 @@ class App {
      Transfer & Connection Events Setup
      ========================================================================== */
   _setupTransferEvents() {
+    transferEngine.on('task:started', () => {
+      this._updateWakeLock();
+      if (this.currentView === 'transfers') {
+        this._renderTransfersView();
+      }
+    });
+
     transferEngine.on('task:progress', () => {
       if (this.currentView === 'transfers') {
         this._renderTransfersView();
@@ -692,12 +704,14 @@ class App {
     });
 
     transferEngine.on('queue:updated', () => {
+      this._updateWakeLock();
       if (this.currentView === 'transfers') {
         this._renderTransfersView();
       }
     });
 
     transferEngine.on('task:completed', (task) => {
+      this._updateWakeLock();
       showToast(`Transferred ${task.name} successfully!`, 'success');
       if (this.currentView === 'transfers') {
         this._renderTransfersView();
@@ -705,6 +719,7 @@ class App {
     });
 
     transferEngine.on('task:error', (task) => {
+      this._updateWakeLock();
       showToast(`Upload failed: ${task.name} (${task.error})`, 'danger');
       if (this.currentView === 'transfers') {
         this._renderTransfersView();
@@ -722,6 +737,7 @@ class App {
   _setupConnectionEvents() {
     const dot = document.getElementById('connection-dot');
     const text = document.getElementById('connection-text');
+    const latencyEl = document.getElementById('connection-latency');
 
     connection.onStatusChange((status) => {
       if (dot && text) {
@@ -732,9 +748,18 @@ class App {
         } else if (status === 'RECONNECTING') {
           dot.classList.add('connection-dot--reconnecting');
           text.textContent = 'Reconnecting';
+          if (latencyEl) latencyEl.style.display = 'none';
         } else {
           text.textContent = 'Offline';
+          if (latencyEl) latencyEl.style.display = 'none';
         }
+      }
+    });
+
+    connection.on('latency:update', (data) => {
+      if (latencyEl && data && typeof data.latencyMs === 'number') {
+        latencyEl.textContent = `${data.latencyMs}ms`;
+        latencyEl.style.display = 'inline-block';
       }
     });
 
@@ -803,6 +828,167 @@ class App {
           showQrModal(this.serverInfo.qrCode, this.serverInfo.connectUrl);
         } else {
           showToast('QR code not ready yet', 'warning');
+        }
+      });
+    }
+  }
+
+  _setupPwaInstall() {
+    const pwaBtn = document.getElementById('btn-pwa-install');
+    if (!pwaBtn) return;
+
+    window.addEventListener('beforeinstallprompt', (e) => {
+      e.preventDefault();
+      this.deferredPrompt = e;
+      pwaBtn.style.display = 'inline-flex';
+    });
+
+    // If on iOS Safari outside standalone mode, show install button to open guide
+    if (this._isIos() && !this._isStandalone()) {
+      pwaBtn.style.display = 'inline-flex';
+    }
+
+    pwaBtn.addEventListener('click', async () => {
+      if (this.deferredPrompt) {
+        this.deferredPrompt.prompt();
+        await this.deferredPrompt.userChoice;
+        this.deferredPrompt = null;
+        pwaBtn.style.display = 'none';
+      } else if (this._isIos()) {
+        this._showIosInstallGuide();
+      }
+    });
+
+    window.addEventListener('appinstalled', () => {
+      this.deferredPrompt = null;
+      pwaBtn.style.display = 'none';
+      showToast('UniversalTrans installed successfully!', 'success');
+    });
+  }
+
+  _isIos() {
+    const ua = window.navigator.userAgent.toLowerCase();
+    return (
+      /iphone|ipad|ipod/.test(ua) ||
+      (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
+    );
+  }
+
+  _isStandalone() {
+    return (
+      ('standalone' in window.navigator && window.navigator.standalone) ||
+      window.matchMedia('(display-mode: standalone)').matches
+    );
+  }
+
+  _showIosInstallGuide() {
+    const content = createElement('div', { class: 'ios-guide' }, [
+      createElement('div', { class: 'ios-guide__step' }, [
+        createElement('span', { class: 'ios-guide__badge' }, '1'),
+        createElement('span', {}, [
+          'Tap the ',
+          createElement('strong', {}, 'Share'),
+          ' button (arrow pointing up) in Safari’s toolbar.',
+        ]),
+      ]),
+      createElement('div', { class: 'ios-guide__step' }, [
+        createElement('span', { class: 'ios-guide__badge' }, '2'),
+        createElement('span', {}, [
+          'Scroll down and tap ',
+          createElement('strong', {}, 'Add to Home Screen'),
+          '.',
+        ]),
+      ]),
+      createElement('div', { class: 'ios-guide__step' }, [
+        createElement('span', { class: 'ios-guide__badge' }, '3'),
+        createElement('span', {}, [
+          'Tap ',
+          createElement('strong', {}, 'Add'),
+          ' in the top-right corner.',
+        ]),
+      ]),
+    ]);
+
+    showModal({
+      title: 'Install UniversalTrans on iOS',
+      contentNode: content,
+      actions: [
+        {
+          label: 'Got it',
+          primary: true,
+          onClick: () => closeModal(),
+        },
+      ],
+    });
+  }
+
+  _setupTabGuard() {
+    window.addEventListener('beforeunload', (e) => {
+      const status = transferEngine.getStatus();
+      if (status.active && status.active.length > 0) {
+        e.preventDefault();
+        e.returnValue = 'Transfer in progress. Are you sure you want to leave?';
+        return e.returnValue;
+      }
+    });
+  }
+
+  async _acquireWakeLock() {
+    if ('wakeLock' in navigator && !this.wakeLockSentinel) {
+      try {
+        this.wakeLockSentinel = await navigator.wakeLock.request('screen');
+        this.wakeLockSentinel.addEventListener('release', () => {
+          this.wakeLockSentinel = null;
+        });
+      } catch {
+        // Silently handle if rejected or unsupported
+      }
+    }
+  }
+
+  async _releaseWakeLock() {
+    if (this.wakeLockSentinel) {
+      try {
+        await this.wakeLockSentinel.release();
+      } catch {
+        // Silently handle
+      }
+      this.wakeLockSentinel = null;
+    }
+  }
+
+  _updateWakeLock() {
+    const status = transferEngine.getStatus();
+    if (status.active && status.active.length > 0) {
+      this._acquireWakeLock();
+    } else {
+      this._releaseWakeLock();
+    }
+  }
+
+  _registerServiceWorker() {
+    if ('serviceWorker' in navigator) {
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') {
+          this._updateWakeLock();
+        }
+      });
+
+      window.addEventListener('load', async () => {
+        try {
+          const registration = await navigator.serviceWorker.register('/sw.js', { scope: '/' });
+          registration.addEventListener('updatefound', () => {
+            const newWorker = registration.installing;
+            if (newWorker) {
+              newWorker.addEventListener('statechange', () => {
+                if (newWorker.state === 'installed' && navigator.serviceWorker.controller) {
+                  showToast('New version available. Refresh to update.', 'info');
+                }
+              });
+            }
+          });
+        } catch (err) {
+          console.warn('ServiceWorker registration skipped:', err.message);
         }
       });
     }

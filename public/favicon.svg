@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <defs>
+    <linearGradient id="primary-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#3b82f6" />
+      <stop offset="100%" stop-color="#60a5fa" />
+    </linearGradient>
+    <linearGradient id="bg-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#111827" />
+      <stop offset="100%" stop-color="#0a0e1a" />
+    </linearGradient>
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="3" result="blur" />
+      <feComposite in="SourceGraphic" in2="blur" operator="over" />
+    </filter>
+  </defs>
+
+  <!-- Background rounded rectangle -->
+  <rect width="64" height="64" rx="16" fill="url(#bg-grad)" stroke="#1e293b" stroke-width="1.5" />
+
+  <!-- Outer pulse ring -->
+  <circle cx="32" cy="32" r="24" stroke="#3b82f6" stroke-width="1" stroke-dasharray="4 3" opacity="0.4" />
+
+  <!-- Directional Interlink Arrows (Universal Transfer) -->
+  <g filter="url(#glow)">
+    <!-- Upward arrow (Send) -->
+    <path d="M22 36 L22 24 L16 30 M22 24 L28 30" stroke="url(#primary-grad)" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round" />
+    <!-- Downward arrow (Receive) -->
+    <path d="M42 28 L42 40 L36 34 M42 40 L48 34" stroke="url(#primary-grad)" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round" />
+  </g>
+
+  <!-- Central wireless connectivity dot -->
+  <circle cx="32" cy="32" r="3" fill="#60a5fa" />
+</svg>

@@ -31,8 +31,13 @@ export function createServer(customConfig = {}) {
   const app = express();
   const _cfg = { ...appConfig, ...customConfig };
 
-  // Security: hide framework banner
+  // Security: hide framework banner and set defensive headers
   app.disable('x-powered-by');
+  app.use((_req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+    next();
+  });
 
   // CORS Middleware: Allow LAN origins & localhost
   app.use((req, res, next) => {
@@ -66,7 +71,17 @@ export function createServer(customConfig = {}) {
   // Serve static assets from public/
   const publicDir = path.resolve('public');
   if (fs.existsSync(publicDir)) {
-    app.use(express.static(publicDir));
+    app.use(
+      express.static(publicDir, {
+        setHeaders: (res, filePath) => {
+          if (filePath.endsWith('sw.js')) {
+            res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+          } else if (filePath.match(/\.(png|svg|ico|css|js|woff2?)$/)) {
+            res.setHeader('Cache-Control', 'public, max-age=3600');
+          }
+        },
+      })
+    );
   }
 
   // Health check endpoint

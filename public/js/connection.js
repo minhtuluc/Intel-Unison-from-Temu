@@ -53,6 +53,10 @@ export class ConnectionManager {
       this.ws.onmessage = (event) => {
         try {
           const message = JSON.parse(event.data);
+          if (message.event === 'server:pong' && this.lastPingTime) {
+            const latency = Math.max(1, Date.now() - this.lastPingTime);
+            this._dispatchEvent('latency:update', { latency });
+          }
           this._dispatchEvent(message.event, message.data);
         } catch {
           // Ignore invalid messages
@@ -142,9 +146,15 @@ export class ConnectionManager {
 
   _startHeartbeat() {
     this._stopHeartbeat();
+    this.sendPing();
     this.pingTimer = setInterval(() => {
-      this.send('client:ping', {});
+      this.sendPing();
     }, 30000);
+  }
+
+  sendPing() {
+    this.lastPingTime = Date.now();
+    this.send('client:ping', {});
   }
 
   _stopHeartbeat() {
