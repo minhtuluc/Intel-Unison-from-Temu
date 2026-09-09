@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+*.log
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Temp and Upload staging/chunks
+temp/
+.temp/
+*.tmp
+
+# Coverage
+coverage/
+.nyc_output/
+
+# OS and Editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# UniversalTrans local data / test output
+local-downloads/

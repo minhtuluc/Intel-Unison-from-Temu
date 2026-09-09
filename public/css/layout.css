@@ -1,0 +1,36 @@
+/**
+ * UniversalTrans Layout and Responsive Styles
+ */
+
+#app {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom)
+    env(safe-area-inset-left);
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 1rem 1.5rem;
+  background-color: var(--color-bg-secondary);
+  border-bottom: 1px solid var(--color-card-border);
+}
+
+.header__brand {
+  font-weight: 700;
+  font-size: 1.25rem;
+  letter-spacing: -0.025em;
+}
+
+.header__status {
+  font-size: 0.875rem;
+  color: var(--color-text-secondary);
+}
+
+.main-content {
+  flex: 1;
+  padding: 1.5rem;
+}

@@ -1,0 +1,55 @@
+{
+  "name": "universaltrans",
+  "version": "1.0.0",
+  "description": "AirDrop-style bidirectional file transfer over local WLAN",
+  "type": "module",
+  "main": "src/server.js",
+  "bin": {
+    "utrans": "./bin/utrans.js"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "start": "node bin/utrans.js",
+    "dev": "nodemon bin/utrans.js",
+    "test": "node --test \"tests/unit/**/*.test.js\"",
+    "test:integration": "node --test \"tests/integration/**/*.test.js\"",
+    "test:all": "node --test \"tests/unit/**/*.test.js\" \"tests/integration/**/*.test.js\"",
+    "test:coverage": "node --test --experimental-test-coverage \"tests/unit/**/*.test.js\"",
+    "test:watch": "node --test --watch \"tests/unit/**/*.test.js\"",
+    "lint": "eslint src/ tests/ bin/",
+    "lint:fix": "eslint src/ tests/ bin/ --fix",
+    "format": "prettier --write ."
+  },
+  "keywords": [
+    "file-transfer",
+    "airdrop",
+    "lan",
+    "wifi",
+    "pwa",
+    "cross-platform"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.21.2",
+    "mime-types": "^2.1.35",
+    "multer": "^1.4.5-lts.1",
+    "nanoid": "^5.0.9",
+    "open": "^10.1.0",
+    "qrcode": "^1.5.4",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.20.0",
+    "eslint": "^9.20.0",
+    "globals": "^15.14.0",
+    "nodemon": "^3.1.9",
+    "prettier": "^3.5.1",
+    "supertest": "^7.0.0"
+  },
+  "overrides": {
+    "qs": "^6.16.0"
+  }
+}
