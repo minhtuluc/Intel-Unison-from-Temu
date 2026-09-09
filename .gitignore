@@ -31,3 +31,8 @@ Thumbs.db
 
 # UniversalTrans local data / test output
 local-downloads/
+
+# Internal agent documentation & planning files (local only)
+.agents/
+docs/
+implementation_plan.md
