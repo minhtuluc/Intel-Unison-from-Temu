@@ -2,28 +2,230 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, viewport-fit=cover, maximum-scale=1.0, user-scalable=no"
+    />
     <meta name="theme-color" content="#0a0e1a" />
+    <meta name="description" content="AirDrop-style bidirectional file transfer over local WLAN" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-    <title>UniversalTrans</title>
+    <meta name="apple-mobile-web-app-title" content="UniversalTrans" />
+    <title>UniversalTrans — LAN File Transfer</title>
+
+    <!-- PWA Manifest & Icons -->
     <link rel="manifest" href="/manifest.json" />
+
+    <!-- Design System Stylesheets -->
     <link rel="stylesheet" href="/css/variables.css" />
     <link rel="stylesheet" href="/css/base.css" />
-    <link rel="stylesheet" href="/css/layout.css" />
-    <link rel="stylesheet" href="/css/components.css" />
     <link rel="stylesheet" href="/css/animations.css" />
+    <link rel="stylesheet" href="/css/components.css" />
+    <link rel="stylesheet" href="/css/layout.css" />
   </head>
   <body>
     <div id="app">
-      <header class="header">
-        <div class="header__brand">UniversalTrans</div>
-        <div class="header__status" id="connection-status">Connecting...</div>
+      <!-- Header Bar -->
+      <header class="header" id="app-header">
+        <div class="header__left">
+          <div class="header__logo">
+            <svg
+              class="header__logo-icon"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2.2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            >
+              <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
+            </svg>
+            <span>UniversalTrans</span>
+          </div>
+          <span class="header__server-name" id="header-server-name">Detecting...</span>
+        </div>
+
+        <div class="header__right">
+          <div class="connection-indicator">
+            <span class="connection-dot" id="connection-dot"></span>
+            <span id="connection-text">Connecting</span>
+          </div>
+          <button
+            class="btn btn--primary btn--sm"
+            id="btn-qr-modal"
+            title="Scan QR Code to connect mobile devices"
+          >
+            <svg
+              width="16"
+              height="16"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            >
+              <rect x="3" y="3" width="7" height="7"></rect>
+              <rect x="14" y="3" width="7" height="7"></rect>
+              <rect x="14" y="14" width="7" height="7"></rect>
+              <rect x="3" y="14" width="7" height="7"></rect>
+            </svg>
+            <span>Connect Device</span>
+          </button>
+        </div>
       </header>
-      <main class="main-content" id="main-view">
-        <p>Loading UniversalTrans...</p>
-      </main>
+
+      <!-- App Body: Sidebar + Main Content -->
+      <div class="app-body">
+        <!-- Desktop Sidebar -->
+        <aside class="sidebar">
+          <nav>
+            <a href="#files" class="nav-link nav-link--active" data-view="files">
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              >
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+                <polyline points="14 2 14 8 20 8"></polyline>
+                <line x1="16" y1="13" x2="8" y2="13"></line>
+                <line x1="16" y1="17" x2="8" y2="17"></line>
+              </svg>
+              <span>Shared Files</span>
+            </a>
+
+            <a href="#upload" class="nav-link" data-view="upload">
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              >
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                <polyline points="17 8 12 3 7 8"></polyline>
+                <line x1="12" y1="3" x2="12" y2="15"></line>
+              </svg>
+              <span>Upload to PC</span>
+            </a>
+
+            <a href="#transfers" class="nav-link" data-view="transfers">
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              >
+                <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline>
+              </svg>
+              <span>Transfers</span>
+            </a>
+
+            <a href="#devices" class="nav-link" data-view="devices">
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              >
+                <rect x="4" y="2" width="16" height="20" rx="2" ry="2"></rect>
+                <line x1="12" y1="18" x2="12.01" y2="18"></line>
+              </svg>
+              <span>Devices</span>
+            </a>
+          </nav>
+        </aside>
+
+        <!-- Main Dynamic View Container -->
+        <main class="main-view" id="main-view">
+          <!-- Rendered by SPA router in app.js -->
+        </main>
+      </div>
+
+      <!-- Mobile Bottom Navigation Bar -->
+      <nav class="bottom-nav">
+        <ul class="bottom-nav__list">
+          <li class="bottom-nav__item">
+            <a href="#files" class="bottom-nav__link bottom-nav__link--active" data-view="files">
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              >
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+                <polyline points="14 2 14 8 20 8"></polyline>
+              </svg>
+              <span>Files</span>
+            </a>
+          </li>
+          <li class="bottom-nav__item">
+            <a href="#upload" class="bottom-nav__link" data-view="upload">
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              >
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                <polyline points="17 8 12 3 7 8"></polyline>
+                <line x1="12" y1="3" x2="12" y2="15"></line>
+              </svg>
+              <span>Upload</span>
+            </a>
+          </li>
+          <li class="bottom-nav__item">
+            <a href="#transfers" class="bottom-nav__link" data-view="transfers">
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              >
+                <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline>
+              </svg>
+              <span>Transfers</span>
+            </a>
+          </li>
+          <li class="bottom-nav__item">
+            <a href="#devices" class="bottom-nav__link" data-view="devices">
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              >
+                <rect x="4" y="2" width="16" height="20" rx="2" ry="2"></rect>
+                <line x1="12" y1="18" x2="12.01" y2="18"></line>
+              </svg>
+              <span>Devices</span>
+            </a>
+          </li>
+        </ul>
+      </nav>
+
+      <!-- Overlay & Toasts Containers -->
+      <div id="modal-container"></div>
+      <div id="toast-container" class="toast-container"></div>
     </div>
+
+    <!-- Client Application Entry -->
     <script type="module" src="/js/app.js"></script>
   </body>
 </html>

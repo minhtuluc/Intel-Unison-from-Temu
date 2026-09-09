@@ -18,8 +18,8 @@
     "test:all": "node --test \"tests/unit/**/*.test.js\" \"tests/integration/**/*.test.js\"",
     "test:coverage": "node --test --experimental-test-coverage \"tests/unit/**/*.test.js\" \"tests/integration/**/*.test.js\"",
     "test:watch": "node --test --watch \"tests/unit/**/*.test.js\"",
-    "lint": "eslint src/ tests/ bin/",
-    "lint:fix": "eslint src/ tests/ bin/ --fix",
+    "lint": "eslint src/ tests/ bin/ public/js/",
+    "lint:fix": "eslint src/ tests/ bin/ public/js/ --fix",
     "format": "prettier --write ."
   },
   "keywords": [

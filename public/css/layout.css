@@ -1,36 +1,269 @@
 /**
- * UniversalTrans Layout and Responsive Styles
+ * UniversalTrans Layout & Responsive Grid
+ * Responsive shell: Desktop Sidebar vs Mobile Bottom Nav with safe areas.
  */
 
 #app {
   display: flex;
   flex-direction: column;
   min-height: 100vh;
-  padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom)
-    env(safe-area-inset-left);
+  background-color: var(--color-bg-primary);
+  padding-top: env(safe-area-inset-top);
+  padding-left: env(safe-area-inset-left);
+  padding-right: env(safe-area-inset-right);
 }
 
+/* ==========================================================================
+   Header Bar
+   ========================================================================== */
 .header {
+  height: var(--header-height);
+  background-color: var(--color-bg-secondary);
+  border-bottom: 1px solid var(--color-border);
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 1rem 1.5rem;
-  background-color: var(--color-bg-secondary);
-  border-bottom: 1px solid var(--color-card-border);
+  padding: 0 var(--space-6);
+  position: sticky;
+  top: 0;
+  z-index: var(--z-sticky);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
 }
 
-.header__brand {
-  font-weight: 700;
-  font-size: 1.25rem;
-  letter-spacing: -0.025em;
+.header__left {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
 }
 
-.header__status {
-  font-size: 0.875rem;
+.header__logo {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-weight: 800;
+  font-size: var(--font-size-lg);
+  letter-spacing: -0.03em;
+  color: var(--color-text-primary);
+}
+
+.header__logo-icon {
+  width: 28px;
+  height: 28px;
+  color: var(--color-accent);
+}
+
+.header__server-name {
+  font-size: var(--font-size-xs);
+  color: var(--color-text-muted);
+  font-family: var(--font-mono);
+  background: var(--color-bg-primary);
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-border);
+}
+
+.header__right {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+}
+
+.connection-indicator {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--font-size-xs);
+  font-weight: 500;
   color: var(--color-text-secondary);
 }
 
-.main-content {
+.connection-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: var(--radius-full);
+  background-color: var(--color-danger);
+  transition:
+    background-color var(--transition-normal),
+    box-shadow var(--transition-normal);
+}
+
+.connection-dot--connected {
+  background-color: var(--color-success);
+  box-shadow: var(--shadow-glow-success);
+}
+
+.connection-dot--reconnecting {
+  background-color: var(--color-warning);
+  box-shadow: 0 0 8px rgba(245, 158, 11, 0.4);
+}
+
+/* ==========================================================================
+   App Body (Sidebar + Main View)
+   ========================================================================== */
+.app-body {
+  display: flex;
   flex: 1;
-  padding: 1.5rem;
+}
+
+.sidebar {
+  width: var(--sidebar-width);
+  background-color: var(--color-bg-secondary);
+  border-right: 1px solid var(--color-border);
+  padding: var(--space-6) var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  flex-shrink: 0;
+}
+
+.nav-link {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-md);
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-sm);
+  font-weight: 500;
+  transition: all var(--transition-fast);
+}
+
+.nav-link svg {
+  width: 20px;
+  height: 20px;
+  flex-shrink: 0;
+}
+
+.nav-link:hover {
+  color: var(--color-text-primary);
+  background-color: var(--color-bg-tertiary);
+}
+
+.nav-link--active {
+  color: var(--color-accent);
+  background-color: var(--color-accent-subtle);
+  font-weight: 600;
+}
+
+.main-view {
+  flex: 1;
+  padding: var(--space-8);
+  max-width: 1200px;
+  width: 100%;
+  margin: 0 auto;
+}
+
+.view-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: var(--space-6);
+}
+
+.view-title {
+  font-size: var(--font-size-2xl);
+  font-weight: 700;
+}
+
+.view-subtitle {
+  font-size: var(--font-size-sm);
+  color: var(--color-text-secondary);
+  margin-top: var(--space-1);
+}
+
+/* ==========================================================================
+   Mobile Bottom Navigation
+   ========================================================================== */
+.bottom-nav {
+  display: none;
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: var(--bottom-nav-height);
+  background-color: var(--color-bg-glass);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border-top: 1px solid var(--color-border);
+  z-index: var(--z-nav);
+  padding-bottom: env(safe-area-inset-bottom);
+}
+
+.bottom-nav__list {
+  display: flex;
+  height: 100%;
+  list-style: none;
+}
+
+.bottom-nav__item {
+  flex: 1;
+}
+
+.bottom-nav__link {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--color-text-muted);
+  font-size: var(--font-size-xs);
+  gap: 3px;
+  transition: color var(--transition-fast);
+}
+
+.bottom-nav__link svg {
+  width: 20px;
+  height: 20px;
+}
+
+.bottom-nav__link--active {
+  color: var(--color-accent);
+  font-weight: 600;
+}
+
+/* ==========================================================================
+   Responsive Adaptations
+   ========================================================================== */
+@media (max-width: 1024px) {
+  .sidebar {
+    display: none;
+  }
+
+  .bottom-nav {
+    display: block;
+  }
+
+  .main-view {
+    padding: var(--space-4);
+    padding-bottom: calc(var(--bottom-nav-height) + var(--space-8) + env(safe-area-inset-bottom));
+  }
+
+  .header {
+    padding: 0 var(--space-4);
+  }
+
+  .header__server-name {
+    display: none;
+  }
+}
+
+@media (max-width: 640px) {
+  .files-grid {
+    grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+    gap: var(--space-3);
+  }
+
+  .file-card__preview {
+    height: 90px;
+  }
+
+  .file-card__icon {
+    width: 40px;
+    height: 40px;
+  }
+
+  .view-title {
+    font-size: var(--font-size-xl);
+  }
 }
