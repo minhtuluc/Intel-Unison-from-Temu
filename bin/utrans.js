@@ -19,7 +19,7 @@ Usage:
   utrans [options] [files/folders...]
 
 Options:
-  -p, --port <number>    Set server port (default: 3456)
+  -p, --port <number>    Set server port (default: 8080)
   -v, --version          Show version number
   -h, --help             Show this help message
 

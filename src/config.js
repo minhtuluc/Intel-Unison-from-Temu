@@ -8,7 +8,7 @@ import path from 'node:path';
 import { AppError } from './middleware/error-handler.js';
 
 export const DEFAULT_CONFIG = {
-  port: 3456,
+  port: 8080,
   uploadDir: path.join(os.homedir(), 'Downloads', 'UniversalTrans'),
   tempDir: path.join(process.cwd(), 'temp'),
   chunkSize: 10 * 1024 * 1024, // 10MB

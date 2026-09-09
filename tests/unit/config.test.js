@@ -113,7 +113,7 @@ describe('Config System', () => {
       delete process.env.UTRANS_PIN;
 
       const loaded = loadConfig();
-      assert.equal(loaded.port, 3456);
+      assert.equal(loaded.port, 8080);
       assert.equal(loaded.maxConcurrentTransfers, 5);
       assert.equal(loaded.pin, null);
     });

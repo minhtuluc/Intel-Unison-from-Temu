@@ -20,7 +20,8 @@
     "test:watch": "node --test --watch \"tests/unit/**/*.test.js\"",
     "lint": "eslint src/ tests/ bin/ public/js/",
     "lint:fix": "eslint src/ tests/ bin/ public/js/ --fix",
-    "format": "prettier --write ."
+    "format": "prettier --write .",
+    "setup:shortcuts": "node scripts/setup-desktop-shortcuts.js"
   },
   "keywords": [
     "file-transfer",
