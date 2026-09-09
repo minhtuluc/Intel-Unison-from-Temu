@@ -10,36 +10,40 @@ import path from 'node:path';
 import multer from 'multer';
 import { shareManager } from '../services/share-manager.js';
 import { chunkedUploadManager } from '../services/chunked-upload.js';
+import { pendingUploadManager } from '../services/pending-upload.js';
+import { broadcastEvent } from '../websocket/handlers.js';
 import { config } from '../config.js';
 import { AppError } from '../middleware/error-handler.js';
 import { sanitizeFileName } from '../utils/file-utils.js';
 
 export const transferRouter = Router();
 
-// Storage for simple upload (<100MB) directly to uploadDir
+// Storage for simple upload (<100MB) staged in pending directory awaiting approval
 const simpleUploadStorage = multer.diskStorage({
   destination: async (_req, _file, cb) => {
+    const pendingDir = path.join(config.tempDir, 'pending');
     try {
-      await fs.promises.mkdir(config.uploadDir, { recursive: true });
-      cb(null, config.uploadDir);
+      await fs.promises.mkdir(pendingDir, { recursive: true });
+      cb(null, pendingDir);
     } catch (err) {
-      cb(err, config.uploadDir);
+      cb(err, pendingDir);
     }
   },
   filename: (_req, file, cb) => {
     const cleanName = sanitizeFileName(file.originalname);
-    let finalPath = path.join(config.uploadDir, cleanName);
+    const pendingDir = path.join(config.tempDir, 'pending');
+    let finalPath = path.join(pendingDir, cleanName);
 
     if (!fs.existsSync(finalPath)) {
       return cb(null, cleanName);
     }
 
-    // Resolve name collisions safely
+    // Resolve name collisions safely in pending area
     const ext = path.extname(cleanName);
     const base = path.basename(cleanName, ext);
     let counter = 1;
     while (fs.existsSync(finalPath)) {
-      finalPath = path.join(config.uploadDir, `${base}_(${counter})${ext}`);
+      finalPath = path.join(pendingDir, `${base}_(${counter})${ext}`);
       counter++;
     }
     cb(null, path.basename(finalPath));
@@ -139,22 +143,48 @@ transferRouter.get('/api/thumbnail/:fileId', (req, res) => {
  * POST /api/upload
  * Simple upload endpoint for single/multiple files (<100MB).
  */
-transferRouter.post('/api/upload', simpleUpload.array('files'), (req, res, next) => {
+transferRouter.post('/api/upload', simpleUpload.array('files'), async (req, res, next) => {
   try {
     const files = req.files || [];
     if (files.length === 0) {
       throw new AppError('NO_FILES_UPLOADED', 400, 'No files provided in upload');
     }
 
-    const uploaded = files.map((f) => ({
-      name: f.filename,
-      size: f.size,
-      path: f.path,
-    }));
+    const senderDevice = {
+      deviceId: req.headers['x-device-id'] || req.body?.deviceId || 'unknown',
+      deviceName: req.headers['x-device-name'] || req.body?.deviceName || 'Mobile Device',
+      platform: req.headers['x-platform'] || req.body?.platform || 'unknown',
+    };
+
+    const uploaded = [];
+    const pending = [];
+    const wss = req.app.get('wss');
+
+    for (const f of files) {
+      const record = pendingUploadManager.createPending({
+        fileName: f.originalname || f.filename,
+        fileSize: f.size,
+        mimeType: f.mimetype,
+        tempPath: f.path,
+        senderDevice,
+      });
+
+      uploaded.push({
+        name: f.filename,
+        size: f.size,
+        path: f.path,
+        transferId: record.transferId,
+      });
+      pending.push(record);
+
+      if (wss) {
+        broadcastEvent(wss, 'upload:request', { pending: record });
+      }
+    }
 
     res.status(201).json({
       success: true,
-      data: { uploaded },
+      data: { uploaded, pending },
     });
   } catch (error) {
     next(error);
@@ -230,7 +260,7 @@ transferRouter.get('/api/upload/status/:uploadId', (req, res, next) => {
 
 /**
  * POST /api/upload/complete
- * Merges all uploaded chunks into the final destination file.
+ * Merges all uploaded chunks into the pending staging file awaiting approval.
  */
 transferRouter.post('/api/upload/complete', async (req, res, next) => {
   try {
@@ -239,12 +269,91 @@ transferRouter.post('/api/upload/complete', async (req, res, next) => {
       throw new AppError('INVALID_INPUT', 400, 'uploadId is required');
     }
 
-    const result = await chunkedUploadManager.complete(uploadId);
+    const pendingDir = path.join(config.tempDir, 'pending');
+    const result = await chunkedUploadManager.complete(uploadId, pendingDir);
+
+    const senderDevice = {
+      deviceId: req.headers['x-device-id'] || req.body?.deviceId || 'unknown',
+      deviceName: req.headers['x-device-name'] || req.body?.deviceName || 'Mobile Device',
+      platform: req.headers['x-platform'] || req.body?.platform || 'unknown',
+    };
+
+    const record = pendingUploadManager.createPending({
+      fileName: result.fileName,
+      fileSize: result.size,
+      mimeType: result.mimeType || 'application/octet-stream',
+      tempPath: result.filePath,
+      senderDevice,
+    });
+
+    const wss = req.app.get('wss');
+    if (wss) {
+      broadcastEvent(wss, 'upload:request', { pending: record });
+    }
 
     res.json({
       success: true,
-      data: result,
+      data: { ...result, pending: record, transferId: record.transferId },
     });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * GET /api/upload/pending
+ * Returns list of pending file transfers awaiting PC user approval.
+ */
+transferRouter.get('/api/upload/pending', (_req, res) => {
+  res.json({
+    success: true,
+    data: pendingUploadManager.listPending(),
+  });
+});
+
+/**
+ * POST /api/upload/decision
+ * PC user accepts or declines a pending upload.
+ */
+transferRouter.post('/api/upload/decision', async (req, res, next) => {
+  try {
+    const { transferId, action } = req.body || {};
+    if (!transferId || !action) {
+      throw new AppError('INVALID_INPUT', 400, 'transferId and action are required');
+    }
+
+    const wss = req.app.get('wss');
+
+    if (action === 'accept') {
+      const accepted = await pendingUploadManager.accept(transferId);
+      if (wss) {
+        broadcastEvent(wss, 'transfer:complete', {
+          transferId,
+          fileName: accepted.fileName,
+          size: accepted.size,
+        });
+      }
+      return res.json({
+        success: true,
+        data: accepted,
+      });
+    }
+
+    if (action === 'decline') {
+      const declined = await pendingUploadManager.decline(transferId);
+      if (wss) {
+        broadcastEvent(wss, 'transfer:rejected', {
+          transferId,
+          reason: 'REJECTED_BY_PC',
+        });
+      }
+      return res.json({
+        success: true,
+        data: declined,
+      });
+    }
+
+    throw new AppError('INVALID_INPUT', 400, 'Action must be "accept" or "decline"');
   } catch (error) {
     next(error);
   }

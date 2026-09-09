@@ -155,21 +155,33 @@ export class ConnectionManager {
   }
 
   _registerDevice() {
+    let deviceId = localStorage.getItem('utrans_device_id');
+    if (!deviceId) {
+      deviceId = `dev_${Math.random().toString(36).slice(2, 10)}`;
+      localStorage.setItem('utrans_device_id', deviceId);
+    }
+
     const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
-    const platform = /iPhone|iPad|iPod/i.test(navigator.userAgent)
-      ? 'iOS'
-      : /Android/i.test(navigator.userAgent)
-        ? 'Android'
-        : /Windows/i.test(navigator.userAgent)
-          ? 'Windows'
-          : /Linux/i.test(navigator.userAgent)
-            ? 'Linux'
-            : 'Other';
+    let platform = 'web';
+    if (/iPhone|iPad|iPod/i.test(navigator.userAgent)) platform = 'ios';
+    else if (/Android/i.test(navigator.userAgent)) platform = 'android';
+    else if (/Windows/i.test(navigator.userAgent)) platform = 'windows';
+    else if (/Linux/i.test(navigator.userAgent)) platform = 'linux';
+    else if (/Mac/i.test(navigator.userAgent)) platform = 'mac';
+
+    let deviceName = localStorage.getItem('utrans_device_name');
+    if (!deviceName) {
+      deviceName = isMobile ? `${platform.toUpperCase()} Mobile` : `${platform.toUpperCase()} PC`;
+      localStorage.setItem('utrans_device_name', deviceName);
+    }
 
     this.send('client:register', {
-      deviceName: isMobile ? `${platform} Mobile` : `${platform} PC`,
+      deviceId,
+      deviceName,
       platform,
-      userAgent: navigator.userAgent,
+      isHost:
+        !isMobile &&
+        (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'),
     });
   }
 

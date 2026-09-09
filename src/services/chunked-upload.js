@@ -164,7 +164,7 @@ export class ChunkedUploadManager {
    * @param {string} uploadId
    * @returns {Promise<{ fileName: string, filePath: string, size: number, duration: number, averageSpeed: string }>}
    */
-  async complete(uploadId) {
+  async complete(uploadId, targetDir = this.config.uploadDir) {
     const session = this.sessions.get(uploadId);
     if (!session) {
       throw new AppError('UPLOAD_EXPIRED', 410, 'Upload session not found or has expired');
@@ -178,12 +178,12 @@ export class ChunkedUploadManager {
       );
     }
 
-    // Ensure upload directory exists
-    await fs.promises.mkdir(this.config.uploadDir, { recursive: true });
+    // Ensure target directory exists
+    await fs.promises.mkdir(targetDir, { recursive: true });
 
     // Handle existing filename collisions cleanly
     let finalFileName = session.fileName;
-    let finalPath = path.join(this.config.uploadDir, finalFileName);
+    let finalPath = path.join(targetDir, finalFileName);
 
     let counter = 1;
     const ext = path.extname(session.fileName);
@@ -191,7 +191,7 @@ export class ChunkedUploadManager {
 
     while (fs.existsSync(finalPath)) {
       finalFileName = `${base}_(${counter})${ext}`;
-      finalPath = path.join(this.config.uploadDir, finalFileName);
+      finalPath = path.join(targetDir, finalFileName);
       counter++;
     }
 

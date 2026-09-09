@@ -88,3 +88,22 @@ export async function copyToClipboard(text) {
     return false;
   }
 }
+
+/**
+ * Formats seconds into human-readable ETA string ("45s", "3m 12s", "1h 5m").
+ * @param {number} seconds
+ * @returns {string}
+ */
+export function formatEta(seconds) {
+  if (typeof seconds !== 'number' || isNaN(seconds) || seconds <= 0 || !isFinite(seconds)) {
+    return '--';
+  }
+  const sec = Math.round(seconds);
+  if (sec < 60) return `${sec}s`;
+  const min = Math.floor(sec / 60);
+  const remSec = sec % 60;
+  if (min < 60) return `${min}m ${remSec}s`;
+  const hrs = Math.floor(min / 60);
+  const remMin = min % 60;
+  return `${hrs}h ${remMin}m`;
+}

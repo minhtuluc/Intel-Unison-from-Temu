@@ -19,6 +19,8 @@ import { filesRouter } from './routes/files.js';
 import { transferRouter } from './routes/transfer.js';
 import { shareManager } from './services/share-manager.js';
 import { chunkedUploadManager } from './services/chunked-upload.js';
+import { pendingUploadManager } from './services/pending-upload.js';
+import { setupWebSocket } from './websocket/index.js';
 
 /**
  * Creates and configures the Express application instance.
@@ -117,6 +119,9 @@ export async function startServer(options = {}) {
     const server = app.listen(port, host, async (err) => {
       if (err) return reject(err);
 
+      const wss = setupWebSocket(server);
+      app.set('wss', wss);
+
       logger.info(`UniversalTrans server running at ${url}`);
 
       // Render QR in terminal for instant mobile scan
@@ -142,13 +147,20 @@ export async function startServer(options = {}) {
       // Setup graceful shutdown handlers
       const shutdown = async (signal) => {
         logger.info(`Received ${signal}, shutting down gracefully...`);
+        try {
+          wss.close();
+        } catch {
+          // Ignore ws close error
+        }
         server.close(async () => {
           try {
             shareManager.clear();
             await chunkedUploadManager.cleanup();
+            await pendingUploadManager.cleanup();
           } catch {
             // Ignore cleanup errors during shutdown
           }
+
           logger.info('UniversalTrans shutdown complete');
           process.exit(0);
         });
@@ -157,7 +169,7 @@ export async function startServer(options = {}) {
       process.once('SIGINT', () => shutdown('SIGINT'));
       process.once('SIGTERM', () => shutdown('SIGTERM'));
 
-      resolve({ server, app, url });
+      resolve({ server, app, url, wss });
     });
   });
 }

@@ -10,6 +10,7 @@ import fs from 'node:fs';
 import { shareManager } from '../services/share-manager.js';
 import { config } from '../config.js';
 import { AppError } from '../middleware/error-handler.js';
+import { broadcastEvent } from '../websocket/handlers.js';
 
 export const filesRouter = Router();
 
@@ -72,6 +73,11 @@ filesRouter.post('/api/share', (req, res, next) => {
           shared.push(meta);
         }
 
+        const wss = req.app.get('wss');
+        if (wss) {
+          broadcastEvent(wss, 'share:update', shareManager.listFiles());
+        }
+
         res.status(201).json({
           success: true,
           data: { shared },
@@ -95,6 +101,11 @@ filesRouter.post('/api/share', (req, res, next) => {
 
         const shared = await shareManager.addFiles(paths);
 
+        const wss = req.app.get('wss');
+        if (wss) {
+          broadcastEvent(wss, 'share:update', shareManager.listFiles());
+        }
+
         res.status(201).json({
           success: true,
           data: { shared },
@@ -117,6 +128,11 @@ filesRouter.delete('/api/share/:fileId', (req, res, next) => {
 
     if (!removed) {
       throw new AppError('FILE_NOT_FOUND', 404, `File ${fileId} not found in staging`);
+    }
+
+    const wss = req.app.get('wss');
+    if (wss) {
+      broadcastEvent(wss, 'share:update', shareManager.listFiles());
     }
 
     res.json({
