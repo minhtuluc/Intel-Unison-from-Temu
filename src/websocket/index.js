@@ -3,27 +3,37 @@
  * Initializes ws server attached to HTTP server.
  */
 
+import { randomUUID } from 'node:crypto';
 import { WebSocketServer } from 'ws';
 import { logger } from '../utils/logger.js';
 import { handleWsMessage, broadcastEvent } from './handlers.js';
-import { discoveryService } from '../services/discovery.js';
+import { DiscoveryService } from '../services/discovery.js';
+import { extractSessionCookie } from '../middleware/session-auth.js';
 
-export function setupWebSocket(server, hostAuth) {
+export function setupWebSocket(server, auth = {}) {
+  const { hostAuth, sessions, pinRequired = false, discovery = new DiscoveryService() } = auth;
   const wss = new WebSocketServer({ server, path: '/ws' });
 
   wss.on('connection', (ws, req) => {
     ws.isAlive = true;
+    ws.connectionId = randomUUID();
+    ws.discovery = discovery;
     ws._remoteIp = req.socket.remoteAddress;
     ws.verifyHost = (token) => Boolean(hostAuth?.verify(req, token));
     ws.isHost = false;
+    ws.pinRequired = Boolean(pinRequired);
+    // Without a PIN every LAN client keeps the previous open behaviour.
+    ws.authorized = !ws.pinRequired;
+    // Browsers cannot set headers on a WebSocket handshake, so the HttpOnly session
+    // cookie is accepted as well: a second tab must not be locked out by the PIN gate.
+    const cookieSession = sessions?.verify(extractSessionCookie(req)) ? true : false;
+    ws.verifySession = (token) => Boolean(sessions?.verify(token) || cookieSession);
 
     logger.info('WebSocket client connected', { ip: ws._remoteIp });
 
     ws.on('pong', () => {
       ws.isAlive = true;
-      if (ws.deviceId) {
-        discoveryService.touch(ws.deviceId);
-      }
+      ws.discovery.touchConnection(ws.connectionId);
     });
 
     ws.on('message', (message) => {
@@ -31,14 +41,14 @@ export function setupWebSocket(server, hostAuth) {
     });
 
     ws.on('close', () => {
-      if (ws.deviceId) {
-        const device = discoveryService.getDevice(ws.deviceId);
-        discoveryService.removeDevice(ws.deviceId);
+      const device = ws.discovery.getDeviceByConnection(ws.connectionId);
+      if (device) {
+        ws.discovery.removeConnection(ws.connectionId);
         broadcastEvent(wss, 'device:leave', {
-          deviceId: ws.deviceId,
-          deviceName: device?.deviceName || 'Unknown Device',
+          deviceId: device.id,
+          label: device.label,
         });
-        logger.info('WebSocket client left', { deviceId: ws.deviceId });
+        logger.info('WebSocket client left', { deviceId: device.id });
       } else {
         logger.info('WebSocket client disconnected');
       }
@@ -53,7 +63,7 @@ export function setupWebSocket(server, hostAuth) {
   const interval = setInterval(() => {
     for (const ws of wss.clients) {
       if (ws.isAlive === false) {
-        logger.info('Terminating unresponsive WebSocket client', { deviceId: ws.deviceId });
+        logger.info('Terminating unresponsive WebSocket client', { connectionId: ws.connectionId });
         ws.terminate();
         continue;
       }

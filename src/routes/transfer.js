@@ -8,21 +8,31 @@ import { Router } from 'express';
 import fs from 'node:fs';
 import path from 'node:path';
 import multer from 'multer';
-import { shareManager } from '../services/share-manager.js';
-import { chunkedUploadManager } from '../services/chunked-upload.js';
-import { pendingUploadManager } from '../services/pending-upload.js';
 import { broadcastEvent } from '../websocket/handlers.js';
-import { config } from '../config.js';
 import { AppError } from '../middleware/error-handler.js';
 import { sanitizeFileName } from '../utils/file-utils.js';
 import { requireHost } from '../middleware/host-auth.js';
 
 export const transferRouter = Router();
 
+/**
+ * Sender attribution for approvals. The IP is observed by the server; the display
+ * name is whatever the client claimed and is marked untrusted for the host UI.
+ * @param {import('express').Request} req
+ */
+function describeSender(req) {
+  return {
+    ip: req.ip || req.socket?.remoteAddress || 'unknown',
+    label: req.headers['x-device-name'] || req.body?.deviceName || 'Unknown device',
+    labelUntrusted: true,
+    platform: req.headers['x-platform'] || req.body?.platform || 'unknown',
+  };
+}
+
 // Storage for simple upload (<100MB) staged in pending directory awaiting approval
 const simpleUploadStorage = multer.diskStorage({
-  destination: async (_req, _file, cb) => {
-    const pendingDir = path.join(config.tempDir, 'pending');
+  destination: async (req, _file, cb) => {
+    const pendingDir = path.join(req.app.locals.runtime.config.tempDir, 'pending');
     try {
       await fs.promises.mkdir(pendingDir, { recursive: true });
       cb(null, pendingDir);
@@ -30,9 +40,9 @@ const simpleUploadStorage = multer.diskStorage({
       cb(err, pendingDir);
     }
   },
-  filename: (_req, file, cb) => {
+  filename: (req, file, cb) => {
     const cleanName = sanitizeFileName(file.originalname);
-    const pendingDir = path.join(config.tempDir, 'pending');
+    const pendingDir = path.join(req.app.locals.runtime.config.tempDir, 'pending');
     let finalPath = path.join(pendingDir, cleanName);
 
     if (!fs.existsSync(finalPath)) {
@@ -56,11 +66,41 @@ const simpleUpload = multer({
   limits: { fileSize: 100 * 1024 * 1024 }, // 100MB limit for simple upload
 });
 
-// Memory storage for receiving chunk buffer
-const chunkUpload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: config.chunkSize + 1024 * 1024 }, // Chunk size with headroom
-});
+/** Headroom above one chunk allowed by the transport layer. */
+const CHUNK_HEADROOM = 1024 * 1024;
+
+// Chunk bodies are buffered in memory, so the transport ceiling must stay close to
+// one chunk: it is derived from the runtime config and cached per runtime.
+const chunkUploads = new WeakMap();
+function chunkUploadFor(runtime) {
+  let upload = chunkUploads.get(runtime);
+  if (!upload) {
+    upload = multer({
+      storage: multer.memoryStorage(),
+      limits: { fileSize: runtime.config.chunkSize + CHUNK_HEADROOM },
+    });
+    chunkUploads.set(runtime, upload);
+  }
+  return upload;
+}
+
+/** Parses one chunk and reports an oversized body as 413 instead of a 500. */
+function parseChunkUpload(req, res, next) {
+  const { chunkSize } = req.app.locals.runtime.config;
+  chunkUploadFor(req.app.locals.runtime).single('chunk')(req, res, (err) => {
+    if (!err) return next();
+    if (err.code === 'LIMIT_FILE_SIZE') {
+      return next(
+        new AppError(
+          'CHUNK_TOO_LARGE',
+          413,
+          `Chunk exceeds the allowed size (${chunkSize} bytes plus headroom)`
+        )
+      );
+    }
+    return next(err);
+  });
+}
 
 /**
  * GET /api/download/:fileId
@@ -69,7 +109,7 @@ const chunkUpload = multer({
 transferRouter.get('/api/download/:fileId', async (req, res, next) => {
   try {
     const { fileId } = req.params;
-    const fileRecord = shareManager.getFile(fileId);
+    const fileRecord = req.app.locals.runtime.shareManager.getFile(fileId);
 
     if (!fileRecord) {
       throw new AppError('FILE_NOT_FOUND', 404, `File ${fileId} not found`);
@@ -151,29 +191,25 @@ transferRouter.post('/api/upload', simpleUpload.array('files'), async (req, res,
       throw new AppError('NO_FILES_UPLOADED', 400, 'No files provided in upload');
     }
 
-    const senderDevice = {
-      deviceId: req.headers['x-device-id'] || req.body?.deviceId || 'unknown',
-      deviceName: req.headers['x-device-name'] || req.body?.deviceName || 'Mobile Device',
-      platform: req.headers['x-platform'] || req.body?.platform || 'unknown',
-    };
+    // Sender attribution is observed by the server; the claimed name is a label only.
+    const sender = describeSender(req);
 
     const uploaded = [];
     const pending = [];
     const wss = req.app.get('wss');
 
     for (const f of files) {
-      const record = pendingUploadManager.createPending({
+      const record = req.app.locals.runtime.pendingUploadManager.createPending({
         fileName: f.originalname || f.filename,
         fileSize: f.size,
         mimeType: f.mimetype,
         tempPath: f.path,
-        senderDevice,
+        sender,
       });
 
       uploaded.push({
         name: f.filename,
         size: f.size,
-        path: f.path,
         transferId: record.transferId,
       });
       pending.push(record);
@@ -199,7 +235,11 @@ transferRouter.post('/api/upload', simpleUpload.array('files'), async (req, res,
 transferRouter.post('/api/upload/init', async (req, res, next) => {
   try {
     const { fileName, fileSize, mimeType } = req.body || {};
-    const result = await chunkedUploadManager.initUpload({ fileName, fileSize, mimeType });
+    const result = await req.app.locals.runtime.chunkedUploadManager.initUpload({
+      fileName,
+      fileSize,
+      mimeType,
+    });
 
     res.json({
       success: true,
@@ -214,7 +254,7 @@ transferRouter.post('/api/upload/init', async (req, res, next) => {
  * POST /api/upload/chunk
  * Uploads a single chunk of a large file.
  */
-transferRouter.post('/api/upload/chunk', chunkUpload.single('chunk'), async (req, res, next) => {
+transferRouter.post('/api/upload/chunk', parseChunkUpload, async (req, res, next) => {
   try {
     const { uploadId, chunkIndex } = req.body || {};
 
@@ -226,7 +266,16 @@ transferRouter.post('/api/upload/chunk', chunkUpload.single('chunk'), async (req
       throw new AppError('CHUNK_INVALID', 400, 'No chunk data provided');
     }
 
-    const result = await chunkedUploadManager.addChunk(
+    const runtime = req.app.locals.runtime;
+    if (req.file.size > runtime.config.chunkSize + CHUNK_HEADROOM) {
+      throw new AppError(
+        'CHUNK_TOO_LARGE',
+        413,
+        `Chunk exceeds the allowed size (${runtime.config.chunkSize} + headroom bytes)`
+      );
+    }
+
+    const result = await runtime.chunkedUploadManager.addChunk(
       uploadId,
       parseInt(chunkIndex, 10),
       req.file.buffer
@@ -248,7 +297,7 @@ transferRouter.post('/api/upload/chunk', chunkUpload.single('chunk'), async (req
 transferRouter.get('/api/upload/status/:uploadId', (req, res, next) => {
   try {
     const { uploadId } = req.params;
-    const status = chunkedUploadManager.getStatus(uploadId);
+    const status = req.app.locals.runtime.chunkedUploadManager.getStatus(uploadId);
 
     res.json({
       success: true,
@@ -270,21 +319,19 @@ transferRouter.post('/api/upload/complete', async (req, res, next) => {
       throw new AppError('INVALID_INPUT', 400, 'uploadId is required');
     }
 
-    const pendingDir = path.join(config.tempDir, 'pending');
-    const result = await chunkedUploadManager.complete(uploadId, pendingDir);
+    const runtime = req.app.locals.runtime;
+    const pendingDir = path.join(runtime.config.tempDir, 'pending');
+    const result = await runtime.chunkedUploadManager.complete(uploadId, pendingDir);
 
-    const senderDevice = {
-      deviceId: req.headers['x-device-id'] || req.body?.deviceId || 'unknown',
-      deviceName: req.headers['x-device-name'] || req.body?.deviceName || 'Mobile Device',
-      platform: req.headers['x-platform'] || req.body?.platform || 'unknown',
-    };
+    // Sender attribution is observed by the server; the claimed name is a label only.
+    const sender = describeSender(req);
 
-    const record = pendingUploadManager.createPending({
+    const record = runtime.pendingUploadManager.createPending({
       fileName: result.fileName,
       fileSize: result.size,
       mimeType: result.mimeType || 'application/octet-stream',
       tempPath: result.filePath,
-      senderDevice,
+      sender,
     });
 
     const wss = req.app.get('wss');
@@ -294,7 +341,14 @@ transferRouter.post('/api/upload/complete', async (req, res, next) => {
 
     res.json({
       success: true,
-      data: { ...result, pending: record, transferId: record.transferId },
+      data: {
+        fileName: result.fileName,
+        size: result.size,
+        duration: result.duration,
+        averageSpeed: result.averageSpeed,
+        pending: record,
+        transferId: record.transferId,
+      },
     });
   } catch (error) {
     next(error);
@@ -305,10 +359,10 @@ transferRouter.post('/api/upload/complete', async (req, res, next) => {
  * GET /api/upload/pending
  * Returns list of pending file transfers awaiting PC user approval.
  */
-transferRouter.get('/api/upload/pending', requireHost, (_req, res) => {
+transferRouter.get('/api/upload/pending', requireHost, (req, res) => {
   res.json({
     success: true,
-    data: pendingUploadManager.listPending(),
+    data: req.app.locals.runtime.pendingUploadManager.listPending(),
   });
 });
 
@@ -326,7 +380,7 @@ transferRouter.post('/api/upload/decision', requireHost, async (req, res, next) 
     const wss = req.app.get('wss');
 
     if (action === 'accept') {
-      const accepted = await pendingUploadManager.accept(transferId);
+      const accepted = await req.app.locals.runtime.pendingUploadManager.accept(transferId);
       if (wss) {
         broadcastEvent(wss, 'transfer:complete', {
           transferId,
@@ -341,7 +395,7 @@ transferRouter.post('/api/upload/decision', requireHost, async (req, res, next) 
     }
 
     if (action === 'decline') {
-      const declined = await pendingUploadManager.decline(transferId);
+      const declined = await req.app.locals.runtime.pendingUploadManager.decline(transferId);
       if (wss) {
         broadcastEvent(wss, 'transfer:rejected', {
           transferId,

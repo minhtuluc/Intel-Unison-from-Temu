@@ -6,24 +6,35 @@
 import { Router } from 'express';
 import os from 'node:os';
 import qrcode from 'qrcode';
-import { config } from '../config.js';
 import { getLanIp } from '../utils/network.js';
 import { AppError } from '../middleware/error-handler.js';
-import { discoveryService } from '../services/discovery.js';
+import { requireHost } from '../middleware/host-auth.js';
+import {
+  buildClearedSessionCookie,
+  buildSessionCookie,
+  extractSessionToken,
+} from '../middleware/session-auth.js';
 
 export const infoRouter = Router();
 
-// Track PIN attempts per IP for rate limiting: ip -> { attempts: number, lastAttempt: number, lockedUntil: number }
-const authAttempts = new Map();
+// Track PIN attempts per IP for rate limiting: ip -> { attempts, lastAttempt, lockedUntil }.
+// Kept on app.locals so two app instances in one process cannot share counters.
+function attemptsFor(req) {
+  if (!req.app.locals.authAttempts) {
+    req.app.locals.authAttempts = new Map();
+  }
+  return req.app.locals.authAttempts;
+}
 
 /**
  * GET /api/info
  * Returns server identification, platform, LAN connection URL, and QR code.
  */
-infoRouter.get('/api/info', async (_req, res, next) => {
+infoRouter.get('/api/info', async (req, res, next) => {
   try {
+    const runtime = req.app.locals.runtime;
     const ip = getLanIp() || '127.0.0.1';
-    const port = config.port;
+    const port = runtime.port;
     const connectUrl = `http://${ip}:${port}`;
 
     let qrCode = '';
@@ -41,7 +52,7 @@ infoRouter.get('/api/info', async (_req, res, next) => {
       // Graceful fallback if QR generation encounters an issue
     }
 
-    const connectedDevices = discoveryService.getDevices().length;
+    const connectedDevices = runtime.discovery.getDevices().length;
 
     res.json({
       success: true,
@@ -53,6 +64,7 @@ infoRouter.get('/api/info', async (_req, res, next) => {
         port,
         connectUrl,
         qrCode,
+        pinRequired: Boolean(req.app.locals.pinRequired),
         connectedDevices,
         uptime: Math.floor(process.uptime()),
       },
@@ -68,8 +80,10 @@ infoRouter.get('/api/info', async (_req, res, next) => {
  */
 infoRouter.post('/api/auth', (req, res, next) => {
   try {
+    const pin = req.app.locals.runtime.config.pin;
+
     // If no PIN is configured on server, bypass authentication
-    if (!config.pin) {
+    if (!pin) {
       return res.json({
         success: true,
         data: {
@@ -79,6 +93,7 @@ infoRouter.post('/api/auth', (req, res, next) => {
       });
     }
 
+    const authAttempts = attemptsFor(req);
     const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
     const now = Date.now();
     const attemptRecord = authAttempts.get(clientIp) || {
@@ -104,9 +119,9 @@ infoRouter.post('/api/auth', (req, res, next) => {
 
     attemptRecord.lastAttempt = now;
 
-    const { pin } = req.body || {};
+    const submittedPin = (req.body || {}).pin;
 
-    if (!pin || String(pin).trim() !== String(config.pin)) {
+    if (!submittedPin || String(submittedPin).trim() !== String(pin)) {
       attemptRecord.attempts += 1;
 
       // Lockout for 5 minutes after 5 failed attempts
@@ -127,17 +142,42 @@ infoRouter.post('/api/auth', (req, res, next) => {
     // Success - reset attempts
     authAttempts.delete(clientIp);
 
-    // Simple deterministic session token for local WLAN
-    const token = `utrans_${Buffer.from(`${clientIp}:${now}`).toString('base64url')}`;
+    const issued = req.app.locals.sessions.issue(clientIp);
+
+    // Media and download URLs cannot set headers in a browser, so the session is
+    // also carried in an HttpOnly, SameSite=Strict cookie.
+    res.setHeader('Set-Cookie', buildSessionCookie(issued.token, Math.floor(issued.ttlMs / 1000)));
 
     res.json({
       success: true,
       data: {
-        token,
-        expiresIn: 86400,
+        token: issued.token,
+        expiresAt: issued.expiresAt,
+        expiresIn: Math.floor(issued.ttlMs / 1000),
       },
     });
   } catch (error) {
     next(error);
   }
+});
+
+/**
+ * POST /api/auth/logout
+ * Revokes the caller's session capability.
+ */
+infoRouter.post('/api/auth/logout', (req, res) => {
+  const token = extractSessionToken(req);
+  const revoked = token ? req.app.locals.sessions.revoke(token) : false;
+  res.setHeader('Set-Cookie', buildClearedSessionCookie());
+  res.json({ success: true, data: { revoked } });
+});
+
+/**
+ * POST /api/auth/revoke-all
+ * Host-only: invalidates every issued session.
+ */
+infoRouter.post('/api/auth/revoke-all', requireHost, (req, res) => {
+  const revoked = req.app.locals.sessions.revokeAll();
+  res.setHeader('Set-Cookie', buildClearedSessionCookie());
+  res.json({ success: true, data: { revoked } });
 });

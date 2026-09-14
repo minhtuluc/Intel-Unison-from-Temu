@@ -2,7 +2,6 @@ import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { WebSocket } from 'ws';
 import { startServer } from '../../src/server.js';
-import { shareManager } from '../../src/services/share-manager.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -13,6 +12,7 @@ describe('WebSocket Server Integration Tests', () => {
   let wsUrl;
   let tempDir;
   let sampleFile;
+  let runtime;
 
   before(async () => {
     tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'utrans-ws-test-'));
@@ -26,6 +26,7 @@ describe('WebSocket Server Integration Tests', () => {
       tempDir,
       uploadDir: path.join(tempDir, 'uploads'),
     });
+    runtime = serverInstance.runtime;
 
     const addr = serverInstance.server.address();
     baseUrl = `http://127.0.0.1:${addr.port}`;
@@ -42,7 +43,8 @@ describe('WebSocket Server Integration Tests', () => {
     if (serverInstance?.server) {
       await new Promise((resolve) => serverInstance.server.close(resolve));
     }
-    shareManager.clear();
+    runtime.shareManager.clear();
+    await runtime.pendingUploadManager.cleanup();
     try {
       await fs.promises.rm(tempDir, { recursive: true, force: true });
     } catch {
@@ -79,10 +81,11 @@ describe('WebSocket Server Integration Tests', () => {
     );
 
     const data = await registeredPromise;
-    assert.equal(data.deviceId, 'dev_test_alpha');
-    assert.equal(data.device.deviceName, 'Pixel 8 Pro');
+    assert.match(data.device.id, /^[0-9a-f-]{36}$/);
+    assert.equal(data.device.label, 'Pixel 8 Pro');
+    assert.equal(data.device.labelUntrusted, true);
     assert.ok(Array.isArray(data.devices));
-    assert.ok(data.devices.some((d) => d.deviceId === 'dev_test_alpha'));
+    assert.ok(data.devices.some((d) => d.label === 'Pixel 8 Pro'));
 
     ws.close();
   });
@@ -133,12 +136,14 @@ describe('WebSocket Server Integration Tests', () => {
       leavePromiseResolve = resolve;
     });
 
+    let joinedDeviceId = null;
     wsClient1.on('message', (raw) => {
       const msg = JSON.parse(raw.toString());
-      if (msg.event === 'device:join' && msg.data.device.deviceId === 'dev_client_2') {
+      if (msg.event === 'device:join' && msg.data.device.label === 'iPhone 15') {
+        joinedDeviceId = msg.data.device.id;
         joinPromiseResolve(msg.data);
       }
-      if (msg.event === 'device:leave' && msg.data.deviceId === 'dev_client_2') {
+      if (msg.event === 'device:leave' && msg.data.deviceId === joinedDeviceId) {
         leavePromiseResolve(msg.data);
       }
     });
@@ -155,13 +160,16 @@ describe('WebSocket Server Integration Tests', () => {
     );
 
     const joinData = await joinPromise;
-    assert.equal(joinData.device.deviceId, 'dev_client_2');
-    assert.equal(joinData.device.deviceName, 'iPhone 15');
+    assert.match(joinData.device.id, /^[0-9a-f-]{36}$/);
+    assert.equal(joinData.device.label, 'iPhone 15');
+    assert.equal(joinData.device.platform, 'ios');
+    assert.notEqual(joinData.device.id, 'dev_client_2');
 
     // Close client 2 and verify leave broadcast
     wsClient2.close();
     const leaveData = await leavePromise;
-    assert.equal(leaveData.deviceId, 'dev_client_2');
+    assert.equal(leaveData.deviceId, joinedDeviceId);
+    assert.equal(leaveData.label, 'iPhone 15');
 
     wsClient1.close();
   });
@@ -179,10 +187,13 @@ describe('WebSocket Server Integration Tests', () => {
       });
     });
 
-    // Stage a file via JSON paths
+    // Stage a file via JSON paths (host action)
     const res = await fetch(`${baseUrl}/api/share`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Host-Token': serverInstance.app.locals.hostAuth.token,
+      },
       body: JSON.stringify({ paths: [sampleFile] }),
     });
 

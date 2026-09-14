@@ -4,27 +4,19 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { startServer } from '../../src/server.js';
-import { config } from '../../src/config.js';
 
 describe('Upload Approval & Decision Integration Tests', () => {
   let serverInstance;
   let baseUrl;
   let tempDir;
   let uploadDir;
-
-  let origUploadDir;
-  let origTempDir;
+  let runtime;
   let hostHeaders;
 
   before(async () => {
     tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'utrans-approval-test-'));
     uploadDir = path.join(tempDir, 'uploads');
     await fs.promises.mkdir(uploadDir, { recursive: true });
-
-    origUploadDir = config.uploadDir;
-    origTempDir = config.tempDir;
-    config.uploadDir = uploadDir;
-    config.tempDir = tempDir;
 
     serverInstance = await startServer({
       port: 0,
@@ -33,6 +25,7 @@ describe('Upload Approval & Decision Integration Tests', () => {
       tempDir,
       uploadDir,
     });
+    runtime = serverInstance.runtime;
 
     const addr = serverInstance.server.address();
     baseUrl = `http://127.0.0.1:${addr.port}`;
@@ -49,8 +42,8 @@ describe('Upload Approval & Decision Integration Tests', () => {
     if (serverInstance?.server) {
       await new Promise((resolve) => serverInstance.server.close(resolve));
     }
-    config.uploadDir = origUploadDir;
-    config.tempDir = origTempDir;
+    runtime.shareManager.clear();
+    await runtime.pendingUploadManager.cleanup();
     try {
       await fs.promises.rm(tempDir, { recursive: true, force: true });
     } catch {
@@ -155,8 +148,8 @@ describe('Upload Approval & Decision Integration Tests', () => {
   });
 
   it('should handle chunked upload complete staging and approval flow', async () => {
-    const origChunkSize = config.chunkSize;
-    config.chunkSize = 25; // 25 bytes per chunk
+    const origChunkSize = runtime.config.chunkSize;
+    runtime.config.chunkSize = 25; // 25 bytes per chunk
 
     try {
       const chunkData = Buffer.from('Chunked_Payload_Data_123456'); // 27 bytes -> 2 chunks
@@ -216,7 +209,7 @@ describe('Upload Approval & Decision Integration Tests', () => {
       const readContent = await fs.promises.readFile(expectedPath);
       assert.deepEqual(readContent, chunkData);
     } finally {
-      config.chunkSize = origChunkSize;
+      runtime.config.chunkSize = origChunkSize;
     }
   });
 });

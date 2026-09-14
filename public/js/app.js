@@ -10,6 +10,13 @@ import { transferEngine } from './transfer.js';
 import { createElement, getFileSvg, showModal, closeModal, showQrModal, showToast } from './ui.js';
 import { formatFileSize, formatRelativeTime } from './utils.js';
 import { initializeHostSession, hostHeaders } from './host-session.js';
+import {
+  UNAUTHORIZED_EVENT,
+  apiFetch,
+  getSessionToken,
+  resetUnauthorizedNotification,
+  setSessionToken,
+} from './api.js';
 
 class App {
   constructor() {
@@ -55,11 +62,17 @@ class App {
 
     // Connect WebSocket
     connection.connect();
+
+    // PIN gate: opened on demand or when the server rejects an unauthenticated request
+    window.addEventListener(UNAUTHORIZED_EVENT, () => this._showPinGate());
+    if (this.serverInfo?.pinRequired && !getSessionToken()) {
+      this._showPinGate();
+    }
   }
 
   async _fetchServerInfo() {
     try {
-      const res = await fetch('/api/info');
+      const res = await apiFetch('/api/info');
       const json = await res.json();
       if (json.success && json.data) {
         this.serverInfo = json.data;
@@ -524,7 +537,7 @@ class App {
     ]);
 
     const grid = createElement('div', { class: 'devices-grid' });
-    const localDeviceId = localStorage.getItem('utrans_device_id');
+    const localDeviceId = this.localDeviceId;
 
     if (this.connectedDevices.length === 0) {
       const serverName = this.serverInfo?.serverName || 'Host PC';
@@ -544,13 +557,13 @@ class App {
     }
 
     this.connectedDevices.forEach((dev) => {
-      const isCurrent = dev.deviceId === localDeviceId;
+      const isCurrent = Boolean(localDeviceId) && dev.id === localDeviceId;
 
       const card = createElement('div', { class: 'device-card' }, [
         createElement('div', { class: 'device-avatar' }, [this._getPlatformIcon(dev.platform)]),
         createElement('div', { class: 'device-info' }, [
           createElement('div', { class: 'device-name' }, [
-            document.createTextNode(dev.deviceName || 'Peer Device'),
+            document.createTextNode(dev.label || 'Peer Device'),
             isCurrent && createElement('span', { class: 'device-badge-current' }, 'This Device'),
           ]),
           createElement(
@@ -610,8 +623,9 @@ class App {
       navigator.vibrate([100, 50, 100]);
     }
 
-    const sender = pending.senderDevice || {};
-    const senderTitle = sender.deviceName || 'Mobile Device';
+    // Sender label is client-reported; treat it as a label, not identity.
+    const sender = pending.sender || {};
+    const senderTitle = sender.label || 'A device';
 
     const content = createElement('div', { class: 'approval-modal-body' }, [
       createElement('div', { class: 'approval-icon' }, [
@@ -670,7 +684,7 @@ class App {
 
   async _submitApprovalDecision(transferId, action) {
     try {
-      const res = await fetch('/api/upload/decision', {
+      const res = await apiFetch('/api/upload/decision', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...hostHeaders() },
         body: JSON.stringify({ transferId, action }),
@@ -695,7 +709,7 @@ class App {
   async _loadPendingApprovals() {
     if (!this.isHost) return;
     try {
-      const res = await fetch('/api/upload/pending', { headers: hostHeaders() });
+      const res = await apiFetch('/api/upload/pending', { headers: hostHeaders() });
       if (!res.ok) return;
       const body = await res.json();
       this.pendingApprovals = body.data || [];
@@ -703,6 +717,88 @@ class App {
     } catch {
       // Reconnect registration will retry the authoritative pending list.
     }
+  }
+
+  /**
+   * PIN gate: the host requires a PIN before clients may read or send files.
+   * Uses a raw fetch so a rejected PIN cannot re-trigger the unauthorized signal.
+   */
+  _showPinGate() {
+    if (this.pinModalOpen) return;
+    this.pinModalOpen = true;
+
+    const input = createElement('input', {
+      type: 'password',
+      inputmode: 'numeric',
+      autocomplete: 'off',
+      class: 'input pin-input',
+      placeholder: 'PIN from the host screen',
+      maxlength: '6',
+    });
+
+    const errorText = createElement('div', { class: 'pin-error' }, '');
+
+    const submitBtn = createElement(
+      'button',
+      { class: 'btn btn--primary', type: 'button' },
+      'Connect'
+    );
+
+    const submit = async () => {
+      const pin = input.value.trim();
+      if (!pin) {
+        errorText.textContent = 'Enter the PIN shown on the host computer.';
+        return;
+      }
+
+      submitBtn.disabled = true;
+      try {
+        const res = await fetch('/api/auth', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ pin }),
+        });
+        const body = await res.json().catch(() => ({}));
+
+        if (res.ok && body?.data?.token && body.data.token !== 'bypass') {
+          setSessionToken(body.data.token);
+          resetUnauthorizedNotification();
+          this.pinModalOpen = false;
+          closeModal();
+          showToast({ type: 'success', message: 'Connected to the host session' });
+          connection.reconnect();
+          this.fileBrowser?.loadFiles();
+          return;
+        }
+
+        errorText.textContent =
+          res.status === 429
+            ? 'Too many attempts. Try again in 5 minutes.'
+            : 'Wrong PIN. Check the host screen.';
+      } catch {
+        errorText.textContent = 'Could not reach the host.';
+      } finally {
+        submitBtn.disabled = false;
+      }
+    };
+
+    input.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') submit();
+    });
+    submitBtn.addEventListener('click', submit);
+
+    const content = createElement('div', { class: 'pin-gate' }, [
+      createElement(
+        'p',
+        {},
+        'This host requires a PIN before files can be listed, sent or downloaded.'
+      ),
+      input,
+      errorText,
+    ]);
+
+    showModal({ title: 'Host PIN required', contentNode: content, actions: [submitBtn] });
+    input.focus();
   }
 
   /* ==========================================================================
@@ -803,9 +899,9 @@ class App {
     connection.on('device:join', (data) => {
       if (data && data.device) {
         this.connectedDevices = this.connectedDevices
-          .filter((d) => d.deviceId !== data.device.deviceId)
+          .filter((d) => d.id !== data.device.id)
           .concat(data.device);
-        showToast(`${data.device.deviceName} joined the network`, 'info');
+        showToast(`${data.device.label} joined the network`, 'info');
         if (this.currentView === 'devices') {
           this._renderDevicesView();
         }
@@ -814,8 +910,8 @@ class App {
 
     connection.on('device:leave', (data) => {
       if (data && data.deviceId) {
-        this.connectedDevices = this.connectedDevices.filter((d) => d.deviceId !== data.deviceId);
-        showToast(`${data.deviceName || 'A device'} left`, 'warning');
+        this.connectedDevices = this.connectedDevices.filter((d) => d.id !== data.deviceId);
+        showToast(`${data.label || 'A device'} left`, 'warning');
         if (this.currentView === 'devices') {
           this._renderDevicesView();
         }
@@ -834,8 +930,13 @@ class App {
 
     connection.on('client:registered', (data) => {
       this.isHost = data?.device?.isHost === true;
+      // Server-issued identity for this connection; used only to flag "This Device".
+      this.localDeviceId = data?.device?.id || this.localDeviceId;
       this._loadPendingApprovals();
     });
+
+    // Server refused the socket because this client holds no valid capability.
+    connection.on('client:rejected', () => this._showPinGate());
 
     // Transfer status updates from WS
     connection.on('transfer:complete', (data) => {

@@ -9,6 +9,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { startServer } from '../src/server.js';
+import { writeInstanceFile } from '../src/utils/instance-file.js';
 import { logger } from '../src/utils/logger.js';
 
 function printHelp() {
@@ -67,9 +68,30 @@ async function main() {
   }
 
   try {
-    await startServer({ initialPaths: files, port });
+    const { runtime } = await startServer({ initialPaths: files, port });
+    writeInstanceFile({ port: runtime.port, pid: process.pid, tempDir: runtime.config.tempDir });
+
+    // The CLI owns the process lifecycle: no signal handling inside the server module.
+    let stopping = false;
+    const shutdown = async (signal) => {
+      if (stopping) return;
+      stopping = true;
+      logger.info(`Received ${signal}, shutting down gracefully...`);
+      const result = await runtime.stop({ timeoutMs: 5000 });
+      if (result.timedOut) {
+        logger.warn('Shutdown deadline reached; some connections were closed forcefully');
+      }
+      logger.info('UniversalTrans shutdown complete');
+      process.exit(0);
+    };
+    process.on('SIGINT', () => shutdown('SIGINT'));
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
   } catch (error) {
-    logger.error('Failed to start UniversalTrans', { error: error.message });
+    if (error?.code === 'PORT_IN_USE') {
+      console.error(`\n${error.message}\n`);
+    } else {
+      logger.error('Failed to start UniversalTrans', { error: error.message });
+    }
     process.exit(1);
   }
 }

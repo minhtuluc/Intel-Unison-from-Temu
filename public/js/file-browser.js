@@ -6,6 +6,7 @@
 
 import { createElement, getFileSvg, showImagePreviewModal, showToast } from './ui.js';
 import { debounce, formatRelativeTime } from './utils.js';
+import { apiFetch } from './api.js';
 
 export class FileBrowser {
   constructor(container) {
@@ -26,7 +27,7 @@ export class FileBrowser {
     this._render();
 
     try {
-      const res = await fetch('/api/shared');
+      const res = await apiFetch('/api/shared');
       const json = await res.json();
 
       if (json.success && json.data) {
@@ -360,7 +361,7 @@ export class FileBrowser {
 
   async _unstageFile(fileId) {
     try {
-      const res = await fetch(`/api/share/${fileId}`, { method: 'DELETE' });
+      const res = await apiFetch(`/api/share/${fileId}`, { method: 'DELETE' });
       const json = await res.json();
       if (json.success) {
         showToast({ type: 'success', message: 'File removed from shared list' });

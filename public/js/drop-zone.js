@@ -5,6 +5,7 @@
  */
 
 import { showToast } from './ui.js';
+import { apiFetch } from './api.js';
 
 export class DropZone {
   constructor(targetElement = document.body, onFilesShared = null) {
@@ -194,7 +195,7 @@ export class DropZone {
         formData.append('files', file);
       }
 
-      const res = await fetch('/api/share', {
+      const res = await apiFetch('/api/share', {
         method: 'POST',
         body: formData,
       });

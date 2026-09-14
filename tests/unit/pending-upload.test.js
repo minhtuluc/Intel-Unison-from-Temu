@@ -4,27 +4,23 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { PendingUploadService } from '../../src/services/pending-upload.js';
-import { config } from '../../src/config.js';
 
 describe('PendingUploadService (Unit)', () => {
   let service;
   let testTempDir;
   let testUploadDir;
-  let origUploadDir;
 
   beforeEach(async () => {
-    service = new PendingUploadService();
     testTempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'utrans-pending-test-'));
     testUploadDir = path.join(testTempDir, 'uploads');
     await fs.promises.mkdir(testUploadDir, { recursive: true });
-
-    origUploadDir = config.uploadDir;
-    config.uploadDir = testUploadDir;
+    service = new PendingUploadService({
+      config: { uploadDir: testUploadDir, tempDir: testTempDir },
+    });
   });
 
   afterEach(async () => {
     await service.cleanup();
-    config.uploadDir = origUploadDir;
     try {
       await fs.promises.rm(testTempDir, { recursive: true, force: true });
     } catch {
@@ -41,9 +37,9 @@ describe('PendingUploadService (Unit)', () => {
       fileSize: 14,
       mimeType: 'image/jpeg',
       tempPath: tempFile,
-      senderDevice: {
-        deviceId: 'dev_test_123',
-        deviceName: 'Pixel 8',
+      sender: {
+        ip: '192.168.1.42',
+        label: 'Pixel 8',
         platform: 'android',
       },
     });
@@ -51,8 +47,10 @@ describe('PendingUploadService (Unit)', () => {
     assert.ok(pending.transferId);
     assert.equal(pending.fileName, 'sample_photo.jpg');
     assert.equal(pending.fileSize, 14);
-    assert.equal(pending.senderDevice.deviceName, 'Pixel 8');
-    assert.equal(pending.senderDevice.platform, 'android');
+    assert.equal(pending.sender.label, 'Pixel 8');
+    assert.equal(pending.sender.ip, '192.168.1.42');
+    assert.equal(pending.sender.labelUntrusted, true);
+    assert.equal(pending.sender.platform, 'android');
     assert.equal(pending.tempPath, undefined, 'tempPath must not be exposed');
     assert.equal(pending.timeoutId, undefined, 'timeoutId must not be exposed');
 
@@ -88,9 +86,12 @@ describe('PendingUploadService (Unit)', () => {
     const accepted = await service.accept(pending.transferId);
     assert.equal(accepted.transferId, pending.transferId);
     assert.equal(accepted.fileName, 'test_video.mp4');
-    assert.ok(fs.existsSync(accepted.filePath));
+    // UT-015: accept() no longer returns the host path.
+    assert.equal(accepted.filePath, undefined);
+    const savedPath = path.join(testUploadDir, 'test_video.mp4');
+    assert.ok(fs.existsSync(savedPath));
 
-    const content = await fs.promises.readFile(accepted.filePath, 'utf8');
+    const content = await fs.promises.readFile(savedPath, 'utf8');
     assert.equal(content, 'VIDEO_PAYLOAD_CONTENT');
     assert.equal(fs.existsSync(tempFile), false, 'Original temp file should have been moved');
     assert.equal(service.getPending(pending.transferId), null);
@@ -111,7 +112,8 @@ describe('PendingUploadService (Unit)', () => {
 
     const accepted = await service.accept(pending.transferId);
     assert.equal(accepted.fileName, 'document_(1).pdf');
-    assert.ok(fs.existsSync(accepted.filePath));
+    assert.equal(accepted.filePath, undefined);
+    assert.ok(fs.existsSync(path.join(testUploadDir, 'document_(1).pdf')));
     assert.ok(fs.existsSync(existingFile), 'Existing file must be preserved');
   });
 

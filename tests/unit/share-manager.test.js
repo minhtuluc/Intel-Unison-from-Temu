@@ -1,18 +1,24 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { ShareManager } from '../../src/services/share-manager.js';
 
 describe('ShareManager Service', () => {
   let shareManager;
-  const testDir = path.resolve('temp/test_share_manager');
-  const fileA = path.join(testDir, 'sample_a.txt');
-  const fileB = path.join(testDir, 'sample_b.jpg');
-  const subDir = path.join(testDir, 'subfolder');
-  const fileC = path.join(subDir, 'sample_c.mp4');
+  let testDir;
+  let fileA;
+  let fileB;
+  let subDir;
+  let fileC;
 
   beforeEach(async () => {
+    testDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'utrans-share-test-'));
+    fileA = path.join(testDir, 'sample_a.txt');
+    fileB = path.join(testDir, 'sample_b.jpg');
+    subDir = path.join(testDir, 'subfolder');
+    fileC = path.join(subDir, 'sample_c.mp4');
     await fs.promises.mkdir(subDir, { recursive: true });
     await fs.promises.writeFile(fileA, 'Content of sample A');
     await fs.promises.writeFile(fileB, 'Fake JPEG image data');

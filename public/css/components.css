@@ -1047,3 +1047,41 @@
   font-size: 12px;
   flex-shrink: 0;
 }
+
+/* PIN gate (host requires a PIN before clients may transfer) */
+.pin-gate {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  min-width: min(320px, 70vw);
+}
+
+.pin-gate p {
+  margin: 0;
+  color: var(--text-secondary, #a7b0c0);
+  font-size: 0.9rem;
+  line-height: 1.5;
+}
+
+.pin-input {
+  width: 100%;
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--border-subtle, rgba(255, 255, 255, 0.12));
+  border-radius: 10px;
+  background: rgba(10, 14, 26, 0.6);
+  color: inherit;
+  font-size: 1.25rem;
+  letter-spacing: 0.4em;
+  text-align: center;
+}
+
+.pin-input:focus {
+  outline: none;
+  border-color: var(--accent-primary, #4f8cff);
+}
+
+.pin-error {
+  min-height: 1.1rem;
+  color: var(--danger, #ff6b6b);
+  font-size: 0.85rem;
+}
