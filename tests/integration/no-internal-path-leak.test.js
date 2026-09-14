@@ -18,7 +18,9 @@ describe('UT-015: no internal paths and no client-asserted identity', () => {
   const sockets = [];
 
   before(async () => {
-    root = await fs.mkdtemp(path.join(os.tmpdir(), 'utrans-no-leak-'));
+    // Canonical root: on Windows the temp directory can be reached through an 8.3
+    // short name, and the assertions below must not silently weaken.
+    root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'utrans-no-leak-')));
     runtime = createRuntime({
       tempDir: path.join(root, 'temp'),
       uploadDir: path.join(root, 'received'),
@@ -49,6 +51,11 @@ describe('UT-015: no internal paths and no client-asserted identity', () => {
   function assertNoHostPath(payload, label) {
     const text = JSON.stringify(payload);
     assert.equal(text.includes(root), false, `${label} leaks the temp/upload root`);
+    assert.equal(
+      text.includes(root.replace(/\\/g, '/')),
+      false,
+      `${label} leaks the temp/upload root with forward slashes`
+    );
     assert.equal(text.includes(runtime.config.uploadDir), false, `${label} leaks the upload dir`);
     assert.equal(text.includes(runtime.config.tempDir), false, `${label} leaks the temp dir`);
     assert.equal(

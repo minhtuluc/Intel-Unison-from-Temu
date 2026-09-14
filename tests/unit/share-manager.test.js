@@ -101,7 +101,9 @@ describe('ShareManager Service', () => {
 
       assert.ok(internal);
       assert.equal(internal.id, meta.id);
-      assert.equal(internal.path, path.resolve(fileB));
+      // The record stores the symlink-resolved path, so compare canonical paths:
+      // on Windows the temp directory may be reached through an 8.3 short name.
+      assert.equal(internal.path, await fs.promises.realpath(fileB));
     });
 
     it('should return null when getting non-existent fileId', () => {
