@@ -8,12 +8,14 @@ import { logger } from '../utils/logger.js';
 import { handleWsMessage, broadcastEvent } from './handlers.js';
 import { discoveryService } from '../services/discovery.js';
 
-export function setupWebSocket(server) {
+export function setupWebSocket(server, hostAuth) {
   const wss = new WebSocketServer({ server, path: '/ws' });
 
   wss.on('connection', (ws, req) => {
     ws.isAlive = true;
     ws._remoteIp = req.socket.remoteAddress;
+    ws.verifyHost = (token) => Boolean(hostAuth?.verify(req, token));
+    ws.isHost = false;
 
     logger.info('WebSocket client connected', { ip: ws._remoteIp });
 

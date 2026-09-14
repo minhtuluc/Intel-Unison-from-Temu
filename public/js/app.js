@@ -9,6 +9,7 @@ import { DropZone } from './drop-zone.js';
 import { transferEngine } from './transfer.js';
 import { createElement, getFileSvg, showModal, closeModal, showQrModal, showToast } from './ui.js';
 import { formatFileSize, formatRelativeTime } from './utils.js';
+import { initializeHostSession, hostHeaders } from './host-session.js';
 
 class App {
   constructor() {
@@ -21,9 +22,12 @@ class App {
     this.connectedDevices = [];
     this.wakeLockSentinel = null;
     this.deferredPrompt = null;
+    this.isHost = false;
+    this.pendingApprovals = [];
   }
 
   async init() {
+    initializeHostSession();
     this.mainContainer = document.getElementById('main-view');
     this.fileBrowser = new FileBrowser(this.mainContainer);
 
@@ -600,7 +604,7 @@ class App {
      PC Approval Modal Flow
      ========================================================================== */
   _showApprovalModal(pending) {
-    if (!pending) return;
+    if (!pending || !this.isHost) return;
 
     if (navigator.vibrate) {
       navigator.vibrate([100, 50, 100]);
@@ -668,7 +672,7 @@ class App {
     try {
       const res = await fetch('/api/upload/decision', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...hostHeaders() },
         body: JSON.stringify({ transferId, action }),
       });
 
@@ -677,12 +681,27 @@ class App {
       }
 
       if (action === 'accept') {
-        showToast('File accepted and saved to Downloads!', 'success');
+        showToast({ message: 'File accepted and saved to Downloads!', type: 'success' });
       } else {
-        showToast('File transfer declined', 'warning');
+        showToast({ message: 'File transfer declined', type: 'warning' });
       }
     } catch (err) {
-      showToast(`Error processing transfer: ${err.message}`, 'danger');
+      showToast({ message: `Error processing transfer: ${err.message}`, type: 'danger' });
+    } finally {
+      await this._loadPendingApprovals();
+    }
+  }
+
+  async _loadPendingApprovals() {
+    if (!this.isHost) return;
+    try {
+      const res = await fetch('/api/upload/pending', { headers: hostHeaders() });
+      if (!res.ok) return;
+      const body = await res.json();
+      this.pendingApprovals = body.data || [];
+      if (this.pendingApprovals.length) this._showApprovalModal(this.pendingApprovals[0]);
+    } catch {
+      // Reconnect registration will retry the authoritative pending list.
     }
   }
 
@@ -805,18 +824,34 @@ class App {
 
     // PC Approval Modal trigger
     connection.on('upload:request', (data) => {
-      if (data && data.pending) {
-        this._showApprovalModal(data.pending);
+      if (this.isHost && data?.pending) {
+        if (!this.pendingApprovals.some((p) => p.transferId === data.pending.transferId)) {
+          this.pendingApprovals.push(data.pending);
+        }
+        this._showApprovalModal(this.pendingApprovals[0]);
       }
+    });
+
+    connection.on('client:registered', (data) => {
+      this.isHost = data?.device?.isHost === true;
+      this._loadPendingApprovals();
     });
 
     // Transfer status updates from WS
     connection.on('transfer:complete', (data) => {
       transferEngine.handleWebSocketEvent('transfer:complete', data);
+      if (this.isHost) {
+        closeModal();
+        this._loadPendingApprovals();
+      }
     });
 
     connection.on('transfer:rejected', (data) => {
       transferEngine.handleWebSocketEvent('transfer:rejected', data);
+      if (this.isHost) {
+        closeModal();
+        this._loadPendingApprovals();
+      }
     });
   }
 

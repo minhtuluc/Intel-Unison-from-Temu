@@ -1,18 +1,24 @@
 # UniversalTrans ⚡
 
+## Cập nhật quyền host và kế hoạch phát triển
+
+Chỉ phiên host đã xác thực được xem danh sách chờ và Accept/Decline. Chạy `npm start` và dùng browser do launcher mở; QR/public URL dành cho client. Khi không tự mở browser, dùng liên kết `Host approval URL` riêng được in ở terminal trên máy host. Không chia sẻ liên kết riêng này. Sau restart cần mở lại phiên host.
+
+Mô hình hiện tại truyền qua host, chưa có P2P trực tiếp giữa client. Xem [báo cáo và roadmap](REPORT-ROADMAP.md), [quy chuẩn agent](AGENTS.md) và [quality system](docs/agents/quality.md). Chạy `npm run quality` trên Node 22/24 để kiểm tra lint, format, test và coverage. Các tuyên bố reliability bên dưới cần đối chiếu các giới hạn còn mở trong báo cáo.
+
 <p align="center">
   <img src="public/favicon.svg" alt="UniversalTrans Logo" width="96" height="96" />
 </p>
 
 <p align="center">
   <strong>AirDrop-style bidirectional file transfer between PC (Windows, Linux) and mobile devices (Android, iOS, iPadOS) over local Wi-Fi.</strong><br>
-  <em>100% LAN point-to-point • Zero cloud dependencies • Max Wi-Fi 5/6 throughput • Production-grade reliability.</em>
+  <em>100% LAN qua máy host • Zero cloud dependencies • Hiện đang trong giai đoạn hardening.</em>
 </p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/node-%3E%3D20.0.0-brightgreen" alt="Node Version" />
-  <img src="https://img.shields.io/badge/tests-139%20passed-success" alt="Tests" />
-  <img src="https://img.shields.io/badge/coverage-83.34%25-blue" alt="Coverage" />
+  <img src="https://img.shields.io/badge/tests-143%20passed-success" alt="Tests" />
+  <img src="https://img.shields.io/badge/coverage-83.49%25-blue" alt="Coverage" />
   <img src="https://img.shields.io/badge/port-8080%20default-orange" alt="Port 8080" />
   <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License" />
   <img src="https://img.shields.io/badge/pwa-standalone%20ready-purple" alt="PWA Ready" />
@@ -37,13 +43,13 @@
 
 ## 🚀 Tính năng nổi bật (Highlights)
 
-- ⚡ **Tốc độ tối đa mạng nội bộ (Point-to-Point LAN)**: Truyền dữ liệu trực tiếp qua Wi-Fi nội bộ (Wi-Fi 5 / Wi-Fi 6), không gửi dữ liệu ra ngoài Internet, không qua bên thứ ba, không bị bóp băng thông.
+- ⚡ **Truyền qua mạng nội bộ**: Dữ liệu đi qua máy host trên Wi-Fi LAN, không đi qua cloud. Đây chưa phải truyền P2P trực tiếp giữa hai client.
 - 📱 **Tương thích toàn diện đa nền tảng**:
   - **PC Host**: Windows 10/11, Linux (Ubuntu, Debian, Fedora, Arch...).
   - **Thiết bị di động**: Android (Chrome PWA), iPhone & iPad (Safari Standalone PWA).
 - 🔒 **Bảo vệ an toàn PC (PC Upload Approval Flow)**: Khi điện thoại gửi file lên, PC **luôn luôn** hiển thị popup xác nhận `Accept` / `Decline` trước khi lưu vào ổ cứng. Tự động dọn dẹp file tạm sau 5 phút (TTL) nếu không có phản hồi.
 - 🛡️ **Tự động chống ghi đè (Anti-collision Rename)**: Tự động đổi tên `file_(1).ext` nếu file đã tồn tại trên PC.
-- 📂 **Hỗ trợ tệp tin siêu lớn (10GB+)**: Cơ chế phân mảnh tệp **Chunked Upload 10MB** kèm Pause / Resume / Retry tự động với exponential backoff khi mạng chập chờn.
+- 📂 **Tệp lớn đến giới hạn cấu hình**: Mặc định tối đa 10 GiB với chunk 10 MiB. Pause / Resume / Retry cần tiếp tục được harden theo roadmap.
 - 🖐️ **Kéo thả thư mục đệ quy & Dán ảnh Clipboard**: Hỗ trợ kéo thả cả thư mục (kể cả sub-folder lồng nhau) từ PC hoặc bấm **`Ctrl+V`** để chia sẻ ảnh chụp màn hình ngay tức thì.
 - 💡 **Screen Wake Lock & Tab Guard**: Tự động giữ sáng màn hình thiết bị khi đang truyền file và cảnh báo chống đóng tab dở dang (`beforeunload`).
 - 🎨 **Giao diện hiện đại Dark Glassmorphism**: Không dùng framework nặng, 100% Vanilla JS & Vanilla CSS hiệu năng cao, siêu mượt mà.
@@ -161,10 +167,10 @@ utrans -p 9090
 Dự án được xây dựng theo chuẩn **Quality Gates** nghiêm ngặt với 100% test passing:
 
 ```bash
-# Chạy toàn bộ 139 automated tests (Unit + Integration + Security)
+# Chạy toàn bộ automated tests (Unit + Integration + Security)
 npm run test:all
 
-# Đo độ phủ mã nguồn (Target >80%, thực tế: 83.34%)
+# Đo độ phủ mã nguồn (tham chiếu kết quả mới nhất từ npm run quality)
 npm run test:coverage
 
 # Kiểm tra cú pháp chuẩn ESLint (0 errors)

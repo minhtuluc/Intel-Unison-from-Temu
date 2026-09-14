@@ -15,6 +15,7 @@ import { broadcastEvent } from '../websocket/handlers.js';
 import { config } from '../config.js';
 import { AppError } from '../middleware/error-handler.js';
 import { sanitizeFileName } from '../utils/file-utils.js';
+import { requireHost } from '../middleware/host-auth.js';
 
 export const transferRouter = Router();
 
@@ -304,7 +305,7 @@ transferRouter.post('/api/upload/complete', async (req, res, next) => {
  * GET /api/upload/pending
  * Returns list of pending file transfers awaiting PC user approval.
  */
-transferRouter.get('/api/upload/pending', (_req, res) => {
+transferRouter.get('/api/upload/pending', requireHost, (_req, res) => {
   res.json({
     success: true,
     data: pendingUploadManager.listPending(),
@@ -315,7 +316,7 @@ transferRouter.get('/api/upload/pending', (_req, res) => {
  * POST /api/upload/decision
  * PC user accepts or declines a pending upload.
  */
-transferRouter.post('/api/upload/decision', async (req, res, next) => {
+transferRouter.post('/api/upload/decision', requireHost, async (req, res, next) => {
   try {
     const { transferId, action } = req.body || {};
     if (!transferId || !action) {

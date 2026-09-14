@@ -21,6 +21,7 @@ import { shareManager } from './services/share-manager.js';
 import { chunkedUploadManager } from './services/chunked-upload.js';
 import { pendingUploadManager } from './services/pending-upload.js';
 import { setupWebSocket } from './websocket/index.js';
+import { createHostAuth } from './middleware/host-auth.js';
 
 /**
  * Creates and configures the Express application instance.
@@ -30,6 +31,7 @@ import { setupWebSocket } from './websocket/index.js';
 export function createServer(customConfig = {}) {
   const app = express();
   const _cfg = { ...appConfig, ...customConfig };
+  app.locals.hostAuth = createHostAuth();
 
   // Security: hide framework banner and set defensive headers
   app.disable('x-powered-by');
@@ -117,8 +119,8 @@ export async function startServer(options = {}) {
   // Determine host: bind LAN IP by default, allow localhost
   const lanIp = getLanIp();
   const host = options.host || (options.localOnly ? '127.0.0.1' : lanIp || '127.0.0.1');
-  const port = options.port || cfg.port;
-  const url = `http://${host}:${port}`;
+  const port = options.port ?? appConfig.port;
+  let url;
 
   // Ensure directories exist
   await fs.promises.mkdir(cfg.uploadDir, { recursive: true });
@@ -134,7 +136,9 @@ export async function startServer(options = {}) {
     const server = app.listen(port, host, async (err) => {
       if (err) return reject(err);
 
-      const wss = setupWebSocket(server);
+      url = `http://${host}:${server.address().port}`;
+      const hostUrl = `${url}/#host-token=${app.locals.hostAuth.token}`;
+      const wss = setupWebSocket(server, app.locals.hostAuth);
       app.set('wss', wss);
 
       logger.info(`UniversalTrans server running at ${url}`);
@@ -149,13 +153,16 @@ export async function startServer(options = {}) {
       } catch {
         console.log(`Connect URL: ${url}`);
       }
+      if (options.noBrowser || !cfg.autoOpenBrowser) {
+        console.log(`Host approval URL (private; do not share): ${hostUrl}`);
+      }
 
       // Auto-open browser on PC if configured
       if (cfg.autoOpenBrowser && !options.noBrowser) {
         try {
-          await open(url);
+          await open(hostUrl);
         } catch {
-          // Ignore if open browser fails (e.g. in headless environment)
+          console.log(`Host approval URL (private; do not share): ${hostUrl}`);
         }
       }
 
@@ -186,5 +193,6 @@ export async function startServer(options = {}) {
 
       resolve({ server, app, url, wss });
     });
+    server.once('error', reject);
   });
 }

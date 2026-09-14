@@ -19,15 +19,16 @@ export function handleWsMessage(wss, ws, rawMessage) {
 
   switch (event) {
     case 'client:register': {
-      const { deviceId, deviceName, platform, isHost } = data || {};
+      const { deviceId, deviceName, platform, hostToken } = data || {};
       if (!deviceId) return;
 
+      ws.isHost = Boolean(ws.verifyHost?.(hostToken));
       ws.deviceId = deviceId;
       const deviceRecord = discoveryService.addDevice(deviceId, {
         deviceName,
         platform,
         ip: ws._remoteIp || '127.0.0.1',
-        isHost: Boolean(isHost),
+        isHost: ws.isHost,
       });
 
       // Send registered ack to current client with all current devices
@@ -91,6 +92,7 @@ export function broadcastEvent(wss, event, data, excludeWs = null) {
   });
 
   for (const client of wss.clients) {
+    if (event === 'upload:request' && !client.isHost) continue;
     if (client !== excludeWs && client.readyState === 1 /* OPEN */) {
       try {
         client.send(payload);

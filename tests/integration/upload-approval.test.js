@@ -14,6 +14,7 @@ describe('Upload Approval & Decision Integration Tests', () => {
 
   let origUploadDir;
   let origTempDir;
+  let hostHeaders;
 
   before(async () => {
     tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'utrans-approval-test-'));
@@ -35,6 +36,7 @@ describe('Upload Approval & Decision Integration Tests', () => {
 
     const addr = serverInstance.server.address();
     baseUrl = `http://127.0.0.1:${addr.port}`;
+    hostHeaders = { 'X-Host-Token': serverInstance.app.locals.hostAuth.token };
   });
 
   after(async () => {
@@ -89,7 +91,7 @@ describe('Upload Approval & Decision Integration Tests', () => {
     );
 
     // 2. PC fetches pending list
-    const pendingRes = await fetch(`${baseUrl}/api/upload/pending`);
+    const pendingRes = await fetch(`${baseUrl}/api/upload/pending`, { headers: hostHeaders });
     assert.equal(pendingRes.status, 200);
     const pendingList = await pendingRes.json();
     assert.ok(pendingList.data.some((p) => p.transferId === transferId));
@@ -97,7 +99,7 @@ describe('Upload Approval & Decision Integration Tests', () => {
     // 3. PC clicks Accept
     const decisionRes = await fetch(`${baseUrl}/api/upload/decision`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...hostHeaders },
       body: JSON.stringify({
         transferId,
         action: 'accept',
@@ -115,7 +117,7 @@ describe('Upload Approval & Decision Integration Tests', () => {
     assert.equal(savedContent, payload);
 
     // Pending list is now cleared of this item
-    const pendingResAfter = await fetch(`${baseUrl}/api/upload/pending`);
+    const pendingResAfter = await fetch(`${baseUrl}/api/upload/pending`, { headers: hostHeaders });
     const pendingListAfter = await pendingResAfter.json();
     assert.ok(!pendingListAfter.data.some((p) => p.transferId === transferId));
   });
@@ -136,7 +138,7 @@ describe('Upload Approval & Decision Integration Tests', () => {
     // PC declines
     const decisionRes = await fetch(`${baseUrl}/api/upload/decision`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...hostHeaders },
       body: JSON.stringify({
         transferId,
         action: 'decline',
@@ -206,7 +208,7 @@ describe('Upload Approval & Decision Integration Tests', () => {
       // PC accepts
       await fetch(`${baseUrl}/api/upload/decision`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...hostHeaders },
         body: JSON.stringify({ transferId, action: 'accept' }),
       });
 

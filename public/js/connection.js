@@ -4,6 +4,8 @@
  * heartbeat ping-pong, and event dispatching.
  */
 
+import { hostHeaders } from './host-session.js';
+
 export class ConnectionManager {
   constructor() {
     this.ws = null;
@@ -186,6 +188,7 @@ export class ConnectionManager {
     }
 
     this.send('client:register', {
+      hostToken: hostHeaders()['X-Host-Token'],
       deviceId,
       deviceName,
       platform,

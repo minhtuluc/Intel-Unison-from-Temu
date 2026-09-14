@@ -11,6 +11,9 @@
     "node": ">=20.0.0"
   },
   "scripts": {
+    "quality": "node scripts/quality.js",
+    "test:security": "node --test tests/integration/host-authorization.test.js tests/integration/upload-approval.test.js tests/integration/security.test.js",
+    "format:check": "prettier --check src/ tests/ bin/ public/js/ public/sw.js scripts/quality.js AGENTS.md CONTEXT.md REPORT-ROADMAP.md docs/ .github/",
     "start": "node bin/utrans.js",
     "dev": "nodemon bin/utrans.js",
     "test": "node --test \"tests/unit/**/*.test.js\"",

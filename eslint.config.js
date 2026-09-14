@@ -29,6 +29,10 @@ export default [
     },
   },
   {
+    files: ['public/sw.js'],
+    languageOptions: { globals: { ...globals.serviceworker } },
+  },
+  {
     ignores: ['node_modules/', 'coverage/', 'temp/', '.temp/', 'dist/'],
   },
 ];

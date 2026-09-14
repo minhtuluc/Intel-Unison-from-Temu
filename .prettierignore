@@ -3,6 +3,5 @@ coverage/
 temp/
 .temp/
 package-lock.json
-docs/
 .agents/
 implementation_plan.md
