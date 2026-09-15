@@ -238,7 +238,6 @@ export class ShareManager {
     const stagingDir = path.join(tempDir, 'staging');
     try {
       const entries = await fs.promises.readdir(stagingDir, { withFileTypes: true });
-      const now = Date.now();
       const activePaths = new Set();
       for (const f of this.stagedFiles.values()) {
         if (!f.path) continue;
@@ -278,7 +277,7 @@ export class ShareManager {
         if (!isTracked) {
           try {
             const stat = await fs.promises.stat(fullPath);
-            if (now - stat.mtimeMs >= olderThanMs) {
+            if (olderThanMs <= 0 || Date.now() - stat.mtimeMs >= olderThanMs) {
               await fs.promises.unlink(fullPath);
               logger.info('Swept orphaned staging file', { file: entry.name });
             }

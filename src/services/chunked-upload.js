@@ -325,7 +325,6 @@ export class ChunkedUploadManager {
   async sweepOrphans(olderThanMs = this.config.uploadExpiry) {
     try {
       const entries = await fs.promises.readdir(this.tempDir, { withFileTypes: true });
-      const now = Date.now();
 
       for (const entry of entries) {
         if (!entry.isDirectory()) continue;
@@ -333,7 +332,7 @@ export class ChunkedUploadManager {
           const fullPath = path.join(this.tempDir, entry.name);
           try {
             const stat = await fs.promises.stat(fullPath);
-            if (now - stat.mtimeMs >= olderThanMs) {
+            if (olderThanMs <= 0 || Date.now() - stat.mtimeMs >= olderThanMs) {
               await fs.promises.rm(fullPath, { recursive: true, force: true });
               logger.info('Swept orphaned chunk session directory', { dir: entry.name });
             }

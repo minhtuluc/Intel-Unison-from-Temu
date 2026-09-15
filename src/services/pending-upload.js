@@ -250,7 +250,6 @@ export class PendingUploadService {
     const pendingDir = path.join(this.config.tempDir, 'pending');
     try {
       const entries = await fs.promises.readdir(pendingDir, { withFileTypes: true });
-      const now = Date.now();
       const activePaths = new Set();
       for (const r of this.pending.values()) {
         if (!r.tempPath) continue;
@@ -290,7 +289,7 @@ export class PendingUploadService {
         if (!isTracked) {
           try {
             const stat = await fs.promises.stat(fullPath);
-            if (now - stat.mtimeMs >= olderThanMs) {
+            if (olderThanMs <= 0 || Date.now() - stat.mtimeMs >= olderThanMs) {
               await fs.promises.unlink(fullPath);
               logger.info('Swept orphaned pending file', { path: entry.name });
             }
