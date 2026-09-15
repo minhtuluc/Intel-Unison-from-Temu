@@ -13,7 +13,7 @@ import { initializeHostSession, hostHeaders } from './host-session.js';
 import {
   UNAUTHORIZED_EVENT,
   apiFetch,
-  getSessionToken,
+  getHostToken,
   resetUnauthorizedNotification,
   setSessionToken,
 } from './api.js';
@@ -57,17 +57,32 @@ class App {
     // Fetch initial server info
     await this._fetchServerInfo();
 
+    // If this browser instance holds host capability, exchange for a session cookie
+    // so media URLs and data APIs work seamlessly without PIN.
+    if (getHostToken()) {
+      try {
+        const res = await apiFetch('/api/auth/host-session', { method: 'POST' });
+        const json = await res.json();
+        if (json.success && json.data?.token) {
+          setSessionToken(json.data.token);
+        }
+      } catch {
+        // Fall back to host headers
+      }
+    }
+
     // Route to initial view from URL hash
     this._handleRoute();
 
     // Connect WebSocket
     connection.connect();
 
-    // PIN gate: opened on demand or when the server rejects an unauthenticated request
-    window.addEventListener(UNAUTHORIZED_EVENT, () => this._showPinGate());
-    if (this.serverInfo?.pinRequired && !getSessionToken()) {
-      this._showPinGate();
-    }
+    // PIN gate: opened on demand when an unauthenticated request is rejected
+    window.addEventListener(UNAUTHORIZED_EVENT, () => {
+      if (!getHostToken()) {
+        this._showPinGate();
+      }
+    });
   }
 
   async _fetchServerInfo() {
@@ -936,7 +951,11 @@ class App {
     });
 
     // Server refused the socket because this client holds no valid capability.
-    connection.on('client:rejected', () => this._showPinGate());
+    connection.on('client:rejected', () => {
+      if (!getHostToken()) {
+        this._showPinGate();
+      }
+    });
 
     // Transfer status updates from WS
     connection.on('transfer:complete', (data) => {

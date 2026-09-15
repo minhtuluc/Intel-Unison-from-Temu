@@ -5,10 +5,26 @@
  */
 
 export const SESSION_STORAGE_KEY = 'utrans_session_token';
+export const HOST_STORAGE_KEY = 'utrans_host_token';
 export const UNAUTHORIZED_EVENT = 'utrans:unauthorized';
 
 function defaultStorage() {
   return typeof sessionStorage === 'undefined' ? null : sessionStorage;
+}
+
+function isSameOriginRequest(url) {
+  if (!url || typeof url !== 'string') return false;
+  if (url.startsWith('/') && !url.startsWith('//')) return true;
+  if (typeof window !== 'undefined' && window.location?.origin) {
+    try {
+      const parsed = new URL(url, window.location.origin);
+      return parsed.origin === window.location.origin;
+    } catch {
+      return false;
+    }
+  }
+  // In non-browser environments where relative paths are used
+  return !url.includes('://');
 }
 
 /**
@@ -26,11 +42,21 @@ export function createApiClient({
     return storage?.getItem(SESSION_STORAGE_KEY) || '';
   }
 
+  function getHostToken() {
+    return storage?.getItem(HOST_STORAGE_KEY) || '';
+  }
+
   async function apiFetch(url, options = {}) {
     const headers = new Headers(options.headers || {});
-    const token = getToken();
-    if (token) {
-      headers.set('X-Session-Token', token);
+    if (isSameOriginRequest(url)) {
+      const token = getToken();
+      if (token && !headers.has('X-Session-Token')) {
+        headers.set('X-Session-Token', token);
+      }
+      const hostToken = getHostToken();
+      if (hostToken && !headers.has('X-Host-Token')) {
+        headers.set('X-Host-Token', hostToken);
+      }
     }
 
     const response = await doFetch(url, { ...options, headers });
@@ -50,12 +76,19 @@ export function createApiClient({
   return {
     apiFetch,
     getToken,
+    getHostToken,
     setToken(token) {
       if (token) storage?.setItem(SESSION_STORAGE_KEY, token);
     },
     clearToken() {
       storage?.removeItem(SESSION_STORAGE_KEY);
       notified = false;
+    },
+    setHostToken(token) {
+      if (token) storage?.setItem(HOST_STORAGE_KEY, token);
+    },
+    clearHostToken() {
+      storage?.removeItem(HOST_STORAGE_KEY);
     },
     resetUnauthorizedNotification() {
       notified = false;
@@ -93,6 +126,18 @@ export function setSessionToken(token) {
 
 export function clearSessionToken() {
   apiClient().clearToken();
+}
+
+export function getHostToken() {
+  return apiClient().getHostToken();
+}
+
+export function setHostToken(token) {
+  apiClient().setHostToken(token);
+}
+
+export function clearHostToken() {
+  apiClient().clearHostToken();
 }
 
 export function resetUnauthorizedNotification() {

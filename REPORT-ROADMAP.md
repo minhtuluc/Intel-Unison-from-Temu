@@ -59,7 +59,7 @@ Phát hiện thêm khi kiểm chứng và đã sửa trong lượt này: `/api/s
 
 Review độc lập trên diff M1 phát hiện 7 vấn đề trong chính bản vá này (1 bypass P0 qua content-type, 1 đường phóng đại RAM ở chunk upload, rò rỉ registry, config session sai kiểu, giới hạn multipart bỏ qua runtime, WS bỏ qua cookie phiên, script Windows có thể kill nhầm PID). Tất cả đã sửa kèm test hồi quy; chi tiết ở mục "Sửa đổi sau review" trong ADR-0002.
 
-Bằng chứng gate cuối lượt M1: `npm run quality` pass trên Node 22.23.1 / Linux — 195/195 test, lint và format sạch, coverage 93,13% line / 88,89% branch / 93,80% function. Kiểm chứng browser thủ công bằng headless Chrome (CDP): cổng PIN hiện khi bật PIN, sai PIN báo lỗi và không lưu token, đúng PIN mở được danh sách file đã stage, bốn view render không lỗi console. Chưa chạy Node 24, Windows, CI, điện thoại thật.
+Bằng chứng gate cuối lượt M1: sau khi khắc phục triệt để 5 lỗi review (R1–R5), `npm run quality` pass trên Node 22.23.1 / Linux — 204/204 automated tests pass, lint và format sạch, coverage 93,50% line / 88,37% branch / 93,49% function. Kiểm chứng browser thủ công bằng headless Chrome (CDP): cổng PIN hiện khi bật PIN, sai PIN báo lỗi và không lưu token, đúng PIN mở được danh sách file đã stage, bốn view render không lỗi console. Đã thêm regression test suite tại seam HTTP/WS thật khóa chặt R1–R5 và junction fallback cho Windows. Chưa chạy Node 24, Windows, CI, điện thoại thật.
 
 ## 3. Bằng chứng và giới hạn audit
 

@@ -27,7 +27,19 @@ describe('UT-003: source path staging requires host authority', () => {
     await fs.writeFile(outsideFile, 'outside-allowlist');
     await fs.writeFile(insideFile, 'inside-allowlist');
     symlinkPath = path.join(allowedDir, 'link-to-secret.txt');
-    await fs.symlink(outsideFile, symlinkPath);
+    try {
+      await fs.symlink(outsideFile, symlinkPath);
+    } catch {
+      // On Windows without Developer Mode, file symlinks require elevation (EPERM).
+      // Fall back to a directory junction, which Windows permits for unprivileged users.
+      try {
+        const linkDir = path.join(allowedDir, 'link-to-outside');
+        await fs.symlink(outsideDir, linkDir, 'junction');
+        symlinkPath = path.join(linkDir, 'secret.txt');
+      } catch {
+        symlinkPath = null;
+      }
+    }
 
     runtime = createRuntime({
       tempDir: path.join(root, 'temp'),
@@ -42,10 +54,12 @@ describe('UT-003: source path staging requires host authority', () => {
   });
 
   after(async () => {
-    await new Promise((resolve) => server.close(resolve));
-    runtime.shareManager.clear();
-    await runtime.pendingUploadManager.cleanup();
-    await fs.rm(root, { recursive: true, force: true });
+    if (server) await new Promise((resolve) => server.close(resolve));
+    if (runtime) {
+      runtime.shareManager.clear();
+      await runtime.pendingUploadManager.cleanup();
+    }
+    if (root) await fs.rm(root, { recursive: true, force: true });
   });
 
   async function shareJson(paths, headers = {}) {

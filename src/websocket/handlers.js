@@ -22,6 +22,7 @@ export function handleWsMessage(wss, ws, rawMessage) {
 
       const session = ws.verifySession?.(sessionToken);
       ws.isHost = Boolean(ws.verifyHost?.(hostToken));
+      ws.sessionToken = session ? (typeof session === 'object' ? session.token : session) : null;
       ws.authorized = Boolean(ws.isHost || session || !ws.pinRequired);
 
       if (!ws.authorized) {
@@ -108,7 +109,11 @@ export function broadcastEvent(wss, event, data, excludeWs = null) {
 
   for (const client of wss.clients) {
     // Unauthenticated sockets receive nothing while a PIN policy is active.
-    if (client.authorized === false) continue;
+    if (typeof client.isAuthorized === 'function') {
+      if (!client.isAuthorized()) continue;
+    } else if (client.authorized === false) {
+      continue;
+    }
     if (event === 'upload:request' && !client.isHost) continue;
     if (client !== excludeWs && client.readyState === 1 /* OPEN */) {
       try {

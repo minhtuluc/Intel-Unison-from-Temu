@@ -86,6 +86,35 @@ describe('API client: session header and unauthorized signalling', () => {
     assert.equal(client.getToken(), '');
   });
 
+  it('stores, retrieves and clears host token', () => {
+    const storage = memoryStorage();
+    const client = createApiClient({ storage, fetchImpl: async () => ({ status: 200 }) });
+
+    client.setHostToken('h'.repeat(64));
+    assert.equal(client.getHostToken(), 'h'.repeat(64));
+
+    client.clearHostToken();
+    assert.equal(client.getHostToken(), '');
+  });
+
+  it('attaches host token on same-origin requests', async () => {
+    const storage = memoryStorage({ utrans_host_token: 'h'.repeat(64) });
+    const { fetchImpl, calls } = recordingFetch();
+    const client = createApiClient({ storage, fetchImpl });
+
+    await client.apiFetch('/api/shared');
+    assert.equal(calls[0].options.headers.get('X-Host-Token'), 'h'.repeat(64));
+  });
+
+  it('does not attach host token on cross-origin requests', async () => {
+    const storage = memoryStorage({ utrans_host_token: 'h'.repeat(64) });
+    const { fetchImpl, calls } = recordingFetch();
+    const client = createApiClient({ storage, fetchImpl });
+
+    await client.apiFetch('https://external-service.com/api', {});
+    assert.equal(calls[0].options.headers.get('X-Host-Token'), null);
+  });
+
   it('exposes the event name the app listens on', () => {
     assert.equal(UNAUTHORIZED_EVENT, 'utrans:unauthorized');
   });

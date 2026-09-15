@@ -55,9 +55,35 @@ export function createSessionStore({
   ttlMs = DEFAULT_TTL_MS,
   maxSessions = DEFAULT_MAX_SESSIONS,
   now = Date.now,
+  onRevoke,
+  onRevokeAll,
 } = {}) {
   /** @type {Map<string, {token: string, ip: string, createdAt: number, expiresAt: number}>} */
   const sessions = new Map();
+  const revokeListeners = new Set();
+  if (onRevoke) revokeListeners.add(onRevoke);
+  const revokeAllListeners = new Set();
+  if (onRevokeAll) revokeAllListeners.add(onRevokeAll);
+
+  function notifyRevoke(token) {
+    for (const listener of revokeListeners) {
+      try {
+        listener(token);
+      } catch {
+        // Ignore listener error
+      }
+    }
+  }
+
+  function notifyRevokeAll() {
+    for (const listener of revokeAllListeners) {
+      try {
+        listener();
+      } catch {
+        // Ignore listener error
+      }
+    }
+  }
 
   function sweep() {
     const current = now();
@@ -65,6 +91,7 @@ export function createSessionStore({
     for (const [token, session] of sessions) {
       if (session.expiresAt <= current) {
         sessions.delete(token);
+        notifyRevoke(token);
         removed += 1;
       }
     }
@@ -77,6 +104,7 @@ export function createSessionStore({
       const oldest = [...sessions.entries()].sort((a, b) => a[1].createdAt - b[1].createdAt)[0];
       if (!oldest) break;
       sessions.delete(oldest[0]);
+      notifyRevoke(oldest[0]);
     }
 
     const createdAt = now();
@@ -97,6 +125,7 @@ export function createSessionStore({
     if (!session) return null;
     if (session.expiresAt <= now()) {
       sessions.delete(token);
+      notifyRevoke(token);
       return null;
     }
     return { ...session };
@@ -104,16 +133,36 @@ export function createSessionStore({
 
   function revoke(token) {
     if (typeof token !== 'string') return false;
-    return sessions.delete(token);
+    const deleted = sessions.delete(token);
+    if (deleted) {
+      notifyRevoke(token);
+    }
+    return deleted;
   }
 
   function revokeAll() {
     const count = sessions.size;
     sessions.clear();
+    notifyRevokeAll();
     return count;
   }
 
-  return { issue, verify, revoke, revokeAll, sweep, size: () => sessions.size };
+  return {
+    issue,
+    verify,
+    revoke,
+    revokeAll,
+    sweep,
+    size: () => sessions.size,
+    onRevoke: (listener) => {
+      revokeListeners.add(listener);
+      return () => revokeListeners.delete(listener);
+    },
+    onRevokeAll: (listener) => {
+      revokeAllListeners.add(listener);
+      return () => revokeAllListeners.delete(listener);
+    },
+  };
 }
 
 /**

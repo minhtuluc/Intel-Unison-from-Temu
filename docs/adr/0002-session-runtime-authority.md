@@ -36,6 +36,11 @@ Review độc lập trên diff M1 tìm ra các lỗi trong chính bản vá này
 5. **`maxFileSize` của runtime bị bỏ qua ở nhánh multipart.** Multer cho staging được tạo lúc load module với `DEFAULT_CONFIG`; nay tạo theo runtime (WeakMap) và trả 413 khi vượt. Cùng test với mục 2.
 6. **WebSocket bỏ qua cookie phiên.** Tab thứ hai giữ cookie hợp lệ vẫn bị `client:rejected` rồi mở lại cổng PIN. Nay handshake đọc cookie và dùng làm session cho `client:register`. Test: `tests/integration/session-authorization.test.js`.
 7. **Script dừng trên Windows có thể kill nhầm PID tái sử dụng.** `stop-server.bat`/`start-server.bat` nay đối chiếu PID trong file instance với PID đang giữ port (`netstat -ano`) trước khi `taskkill`; không khớp thì báo và chỉ xoá file instance. Chưa smoke trên Windows.
+8. **Thu hồi / hết hạn session ngắt quyền và đóng kết nối WebSocket (R1, P1).** `createSessionStore` phát sự kiện thu hồi; WS server đóng socket client tương ứng với mã 1008; `broadcastEvent` kiểm tra `isAuthorized()` động trước khi phát sự kiện bảo vệ; re-register với token cũ bị từ chối `client:rejected`. Test: `tests/integration/m1-review-regression.test.js`.
+9. **Lỗi thứ tự XMLHttpRequest khi gửi chunk có PIN token (R2, P1).** `public/js/transfer.js` gọi `xhr.open()` trước `xhr.setRequestHeader()`, đồng thời bổ sung truyền `X-Host-Token`/`X-Session-Token` cho cả simple upload và chunked upload.
+10. **Frontend host capability cho API dữ liệu và session cookie (R3, P1).** Route `POST /api/auth/host-session` cấp session cookie cho host chính chủ kết nối từ loopback; `apiFetch` tự động gắn `X-Host-Token` cho các request cùng origin; UI chỉ mở cổng PIN khi thực sự gặp lỗi 401 hoặc bị từ chối kết nối.
+11. **Simple upload tuân thủ `maxFileSize` của runtime (R4, P2).** Multer cho simple upload cache per-runtime qua WeakMap theo `min(runtime.config.maxFileSize, 100 MiB)` và trả 413 `FILE_TOO_LARGE` có cấu trúc, dọn sạch pending rác khi bị từ chối.
+12. **Deadline shutdown bao phủ toàn bộ vòng đời cleanup (R5, P2).** `runtime.stop({timeoutMs})` áp dụng deadline cho cả các tác vụ dọn dẹp đĩa và session; kết thúc trong thời hạn hữu hạn và trả đúng `{ stopped: false, timedOut: true }` nếu cleanup bị chậm hoặc treo.
 
 ## Consequences
 

@@ -2,7 +2,7 @@
 
 ## Lệnh bàn giao
 
-`npm ci` rồi `npm run quality` trên Node 22 hoặc 24. Lượt M1 chạy trên Node 22.23.1 / Linux: 181 test pass, coverage 91,7% line — chưa chạy Node 24, Windows hay CI trong lượt đó. Runner thực thi lint, format và toàn bộ test với coverage thresholds; bước lỗi trả exit code khác 0. Test nhận UTRANS_UPLOAD_DIR/UTRANS_TEMP_DIR riêng để tránh ghi vào Downloads của người dùng. Không dùng runner này để bật ứng dụng thật.
+`npm ci` rồi `npm run quality` trên Node 22 hoặc 24. Lượt M1 sau khi hoàn thành sửa các lỗi review (R1–R5): 204 automated tests pass, coverage 93,50% line / 88,37% branch / 93,49% function — tách biệt automated test Node với kiểm thử browser E2E và thiết bị thật. Runner thực thi lint, format và toàn bộ test với coverage thresholds; bước lỗi trả exit code khác 0. Test nhận UTRANS_UPLOAD_DIR/UTRANS_TEMP_DIR riêng để tránh ghi vào Downloads của người dùng. Không dùng runner này để bật ứng dụng thật.
 
 CI: `.github/workflows/quality.yml`, Windows và Ubuntu × Node 22/24, timeout 15 phút, chỉ quyền đọc repo. Workflow được tạo local; kết quả CI chỉ có sau khi push. Người quản trị cần bật branch protection yêu cầu tất cả job Quality thành công; file YAML không tự bật branch protection.
 

@@ -181,3 +181,22 @@ infoRouter.post('/api/auth/revoke-all', requireHost, (req, res) => {
   res.setHeader('Set-Cookie', buildClearedSessionCookie());
   res.json({ success: true, data: { revoked } });
 });
+
+/**
+ * POST /api/auth/host-session
+ * Host-only: exchanges verified host capability for a session cookie and token,
+ * allowing browser host to render media/downloads and use data APIs without PIN.
+ */
+infoRouter.post('/api/auth/host-session', requireHost, (req, res) => {
+  const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
+  const issued = req.app.locals.sessions.issue(clientIp);
+  res.setHeader('Set-Cookie', buildSessionCookie(issued.token, Math.floor(issued.ttlMs / 1000)));
+  res.json({
+    success: true,
+    data: {
+      token: issued.token,
+      expiresAt: issued.expiresAt,
+      expiresIn: Math.floor(issued.ttlMs / 1000),
+    },
+  });
+});

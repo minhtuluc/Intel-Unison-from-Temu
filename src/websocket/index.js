@@ -14,6 +14,34 @@ export function setupWebSocket(server, auth = {}) {
   const { hostAuth, sessions, pinRequired = false, discovery = new DiscoveryService() } = auth;
   const wss = new WebSocketServer({ server, path: '/ws' });
 
+  sessions?.onRevoke?.((revokedToken) => {
+    for (const client of wss.clients) {
+      if (client.isHost) continue;
+      if (client.sessionToken === revokedToken || client.cookieToken === revokedToken) {
+        client.authorized = false;
+        client.sessionToken = null;
+        try {
+          client.close(1008, 'Session revoked');
+        } catch {
+          // Ignore close error
+        }
+      }
+    }
+  });
+
+  sessions?.onRevokeAll?.(() => {
+    for (const client of wss.clients) {
+      if (client.isHost) continue;
+      client.authorized = false;
+      client.sessionToken = null;
+      try {
+        client.close(1008, 'Session revoked');
+      } catch {
+        // Ignore close error
+      }
+    }
+  });
+
   wss.on('connection', (ws, req) => {
     ws.isAlive = true;
     ws.connectionId = randomUUID();
@@ -24,10 +52,28 @@ export function setupWebSocket(server, auth = {}) {
     ws.pinRequired = Boolean(pinRequired);
     // Without a PIN every LAN client keeps the previous open behaviour.
     ws.authorized = !ws.pinRequired;
-    // Browsers cannot set headers on a WebSocket handshake, so the HttpOnly session
-    // cookie is accepted as well: a second tab must not be locked out by the PIN gate.
-    const cookieSession = sessions?.verify(extractSessionCookie(req)) ? true : false;
-    ws.verifySession = (token) => Boolean(sessions?.verify(token) || cookieSession);
+    ws.cookieToken = extractSessionCookie(req);
+    ws.sessionToken = null;
+
+    ws.verifySession = (token) => {
+      if (!sessions) return null;
+      const candidate = token || ws.cookieToken;
+      if (!candidate) return null;
+      return sessions.verify(candidate);
+    };
+
+    ws.isAuthorized = () => {
+      if (!ws.pinRequired) return true;
+      if (ws.isHost) return true;
+      if (!ws.authorized || !ws.sessionToken) return false;
+      const session = sessions?.verify(ws.sessionToken);
+      if (!session) {
+        ws.authorized = false;
+        ws.sessionToken = null;
+        return false;
+      }
+      return true;
+    };
 
     logger.info('WebSocket client connected', { ip: ws._remoteIp });
 

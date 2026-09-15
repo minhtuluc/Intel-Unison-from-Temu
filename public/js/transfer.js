@@ -5,7 +5,7 @@
  */
 
 import { formatFileSize, formatEta } from './utils.js';
-import { apiFetch, getSessionToken } from './api.js';
+import { apiFetch, getSessionToken, getHostToken } from './api.js';
 
 export class TransferEngine {
   constructor(options = {}) {
@@ -212,6 +212,10 @@ export class TransferEngine {
       formData.append('files', task.file, task.name);
 
       xhr.open('POST', '/api/upload');
+      const sessionToken = getSessionToken();
+      if (sessionToken) xhr.setRequestHeader('X-Session-Token', sessionToken);
+      const hostToken = getHostToken();
+      if (hostToken) xhr.setRequestHeader('X-Host-Token', hostToken);
       // The server derives identity itself; only the display label is reported.
       xhr.setRequestHeader('X-Device-Name', this._getDeviceName());
       xhr.setRequestHeader('X-Platform', this._getPlatform());
@@ -346,9 +350,11 @@ export class TransferEngine {
       formData.append('chunkIndex', String(chunkIndex));
       formData.append('chunk', chunkBlob, `chunk_${chunkIndex}`);
 
-      const token = getSessionToken();
-      if (token) xhr.setRequestHeader('X-Session-Token', token);
       xhr.open('POST', '/api/upload/chunk');
+      const sessionToken = getSessionToken();
+      if (sessionToken) xhr.setRequestHeader('X-Session-Token', sessionToken);
+      const hostToken = getHostToken();
+      if (hostToken) xhr.setRequestHeader('X-Host-Token', hostToken);
       xhr.send(formData);
     });
   }

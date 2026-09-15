@@ -100,13 +100,36 @@ export function createRuntime(options = {}) {
           });
         }
 
-        try {
-          runtime.shareManager.clear();
-          await runtime.chunkedUploadManager.cleanup();
-          await runtime.pendingUploadManager.cleanup();
-          runtime.sessions.revokeAll();
-        } catch (err) {
-          logger.warn('Runtime cleanup reported an error', { error: err.message });
+        const remainingMs = deadline - Date.now();
+        if (remainingMs <= 0) {
+          timedOut = true;
+        } else {
+          try {
+            await Promise.race([
+              (async () => {
+                runtime.shareManager.clear();
+                await runtime.chunkedUploadManager.cleanup();
+                await runtime.pendingUploadManager.cleanup();
+                runtime.sessions.revokeAll();
+              })(),
+              new Promise((_, reject) => {
+                const timer = setTimeout(() => {
+                  timedOut = true;
+                  reject(new Error('Cleanup timed out'));
+                }, remainingMs);
+                timer.unref?.();
+              }),
+            ]);
+          } catch (err) {
+            if (Date.now() >= deadline) {
+              timedOut = true;
+            }
+            logger.warn('Runtime cleanup reported an error', { error: err.message });
+          }
+        }
+
+        if (Date.now() >= deadline) {
+          timedOut = true;
         }
 
         removeInstanceFile(runtime.port);

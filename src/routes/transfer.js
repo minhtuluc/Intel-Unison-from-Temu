@@ -61,10 +61,51 @@ const simpleUploadStorage = multer.diskStorage({
   },
 });
 
-const simpleUpload = multer({
-  storage: simpleUploadStorage,
-  limits: { fileSize: 100 * 1024 * 1024 }, // 100MB limit for simple upload
-});
+const SIMPLE_UPLOAD_CEILING = 100 * 1024 * 1024;
+const simpleUploads = new WeakMap();
+
+function simpleUploadFor(runtime) {
+  let upload = simpleUploads.get(runtime);
+  if (!upload) {
+    const limit = Math.min(runtime.config.maxFileSize, SIMPLE_UPLOAD_CEILING);
+    upload = multer({
+      storage: simpleUploadStorage,
+      limits: { fileSize: limit },
+    });
+    simpleUploads.set(runtime, upload);
+  }
+  return upload;
+}
+
+/** Parses simple multipart uploads and reports oversized files as 413. */
+function parseSimpleUpload(req, res, next) {
+  const runtime = req.app.locals.runtime;
+  const limit = Math.min(runtime.config.maxFileSize, SIMPLE_UPLOAD_CEILING);
+  simpleUploadFor(runtime).array('files')(req, res, async (err) => {
+    if (!err) return next();
+    if (err.code === 'LIMIT_FILE_SIZE') {
+      if (req.files && Array.isArray(req.files)) {
+        for (const file of req.files) {
+          if (file.path) {
+            try {
+              await fs.promises.unlink(file.path);
+            } catch {
+              // Ignore unlink error
+            }
+          }
+        }
+      }
+      return next(
+        new AppError(
+          'FILE_TOO_LARGE',
+          413,
+          `File exceeds the maximum allowed size (${limit} bytes)`
+        )
+      );
+    }
+    return next(err);
+  });
+}
 
 /** Headroom above one chunk allowed by the transport layer. */
 const CHUNK_HEADROOM = 1024 * 1024;
@@ -184,7 +225,7 @@ transferRouter.get('/api/thumbnail/:fileId', (req, res) => {
  * POST /api/upload
  * Simple upload endpoint for single/multiple files (<100MB).
  */
-transferRouter.post('/api/upload', simpleUpload.array('files'), async (req, res, next) => {
+transferRouter.post('/api/upload', parseSimpleUpload, async (req, res, next) => {
   try {
     const files = req.files || [];
     if (files.length === 0) {
