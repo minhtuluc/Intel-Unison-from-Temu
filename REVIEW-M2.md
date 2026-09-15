@@ -1,5 +1,49 @@
 # Review M2 — Reliable transfer
 
+## Review vòng 3 — commit `526e8ef` (2026-09-15)
+
+### Kết luận: Request changes
+
+Bản sửa đã đóng được R5–R9: checksum frontend chạy incremental với bộ nhớ giới hạn và có cancellation; checksum trở thành input bắt buộc; simple upload claim slot trước khi parse body và reserve quota theo byte; startup reconcile dữ liệu tạm; complete tuần tự trả cùng outcome; Service Worker đã tăng cache version. `npm run quality` pass 287/287 trên Windows local.
+
+M2 vẫn chưa đủ điều kiện merge vì còn một lỗi ghi đè dữ liệu P1 tại đường simple upload và R10 mới chỉ chặn connection ID không tồn tại, chưa bind connection ID hợp lệ với session gửi request.
+
+### R11 — P1 / UT-008: hai simple upload cùng tên vẫn có thể ghi đè và dùng chung temp path
+
+Vị trí: `src/routes/transfer.js:86-103`.
+
+`SimpleUploadQuotaStorage` chọn tên bằng vòng `existsSync()` rồi mở file với `createWriteStream(finalPath)` mặc định. Check và create là hai thao tác tách rời; nhiều request đồng thời có thể cùng thấy đường dẫn chưa tồn tại rồi cùng mở nó ở chế độ truncate/write. Mỗi request sau đó vẫn tạo một pending record riêng, dù các record có thể trỏ tới cùng file vật lý và nội dung của ít nhất một upload đã bị ghi đè.
+
+Probe HTTP production gửi đồng thời 10 multipart request, cùng tên `same.bin` nhưng nội dung khác nhau. Cả 10 trả `201` và tạo 10 pending record, nhưng chỉ có 9 `internalPath` duy nhất và 9 file vật lý. Đây là mất dữ liệu im lặng, vi phạm trực tiếp acceptance UT-008 “cùng tên đồng thời không ghi đè”.
+
+Yêu cầu sửa: reserve tên/file nguyên tử bằng exclusive create (`wx`) và retry suffix khi nhận `EEXIST`, hoặc dùng primitive `reserveWritableFile` dùng chung với chunked upload. Chỉ tạo pending record sau khi stream của chính request đã hoàn tất trên file handle mà request đó sở hữu. Regression phải chạy nhiều request HTTP đồng thời cùng tên, nội dung phân biệt, rồi xác nhận số pending = số path duy nhất = số file và hash từng file khớp đúng một payload đầu vào.
+
+### R12 — P2 / UT-004: client cùng IP có thể mạo danh connection ID của session khác
+
+Vị trí: `src/routes/transfer.js:24-58`; regression hiện tại tại `tests/integration/m2-qc-review-regression.test.js:1228-1264`.
+
+Frontend gửi capability qua `X-Session-Token`, nhưng `resolveSender()` chỉ đọc Bearer token hoặc cookie. Điều kiện mismatch còn yêu cầu `reqToken` phải tồn tại, nên request có `X-Session-Token` hợp lệ của B và `X-Connection-Id` hợp lệ của A vẫn được chấp nhận nếu hai socket cùng IP. Upload bị ghi nhận là của A; terminal event sau accept/decline sẽ route sang A thay vì B.
+
+Probe production tạo hai PIN session và hai WebSocket connection riêng trên cùng loopback, rồi upload bằng session B nhưng header connection ID của A. Kết quả thực tế là `201`, trong khi policy phải reject `403` (hoặc server phải bỏ correlation giả và gắn đúng connection B).
+
+Regression R10 hiện chỉ thử ID giả không tồn tại. Test sanitize broadcast cũng assert `je.data?.connectionId`, trong khi schema thật là `je.data.device`; assertion đó không bảo vệ đúng field dù implementation hiện đã chủ động tạo `safeDevice`.
+
+Yêu cầu sửa: dùng cùng helper lấy session token chuẩn của middleware (`X-Session-Token`, cookie, Bearer nếu được hỗ trợ), bắt buộc capability của HTTP request khớp capability đã bind vào socket khi PIN bật, và fail closed nếu một phía thiếu token. Thêm test hai session/two WS thật: B gửi connection ID của A phải bị reject và A không nhận terminal event. Sửa assertion broadcast thành `je.data?.device?.connectionId`.
+
+### Bằng chứng vòng 3
+
+- Commit review: `526e8ef`; diff so với báo cáo vòng 2 gồm 21 file, +1.198/-123 dòng.
+- `npm run quality`: lint/format pass; 287/287 test pass, 86 suite, không fail/cancel/skip/todo. Coverage: 88,20% line / 79,69% branch / 84,84% function.
+- `git diff --check c855a55..526e8ef`: pass.
+- Probe bổ sung dùng HTTP, multipart, PIN session và WebSocket production; fixture nằm trong temp riêng và đã cleanup. Same-name concurrency: 10 response `201`, 10 pending, 9 unique path/file. Cross-session spoof: hai session/connection khác nhau, response `201` thay vì `403`.
+- Chưa xác minh: GitHub Actions của commit này, Linux local, browser/device thật, payload nhiều GiB, peak RAM/thời gian hash thực tế, ENOSPC/EACCES thật và installer.
+
+### Điều kiện review vòng 4
+
+Sửa R11 và R12 trên cùng nhánh, bổ sung regression tại HTTP/WS production seam và giữ toàn bộ regression R1–R10. Không merge M2 chỉ dựa vào 287 test hiện tại.
+
+---
+
 ## Review vòng 2 — commit `8f6607d` (2026-09-15)
 
 ### Kết luận: Request changes
