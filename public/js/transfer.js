@@ -4,20 +4,65 @@
  * with rolling 5s speed calculation, ETA estimation, pause/resume, and PC approval tracking.
  */
 
-import { formatFileSize, formatEta } from './utils.js';
+import { formatFileSize, formatEta, IncrementalSha256 } from './utils.js';
 import { apiFetch, getSessionToken, getHostToken } from './api.js';
+
+/**
+ * Computes whole-file SHA-256 digest incrementally with bounded RAM (<= 2MB).
+ * Never calls file.arrayBuffer() on the entire file. Supports cancellation via AbortSignal.
+ * @param {Blob|File} file
+ * @param {{ signal?: AbortSignal, sliceSize?: number }} [options]
+ * @returns {Promise<string>} 64-character lowercase hex string
+ */
+export async function computeFileSha256(file, { signal = null, sliceSize = 2 * 1024 * 1024 } = {}) {
+  if (!file || typeof file.slice !== 'function') {
+    throw new Error('Invalid file or blob provided for checksum calculation');
+  }
+
+  const hasher = new IncrementalSha256();
+  let offset = 0;
+  const totalSize = file.size;
+
+  while (offset < totalSize) {
+    if (signal?.aborted) {
+      throw new DOMException('Aborted', 'AbortError');
+    }
+    const end = Math.min(offset + sliceSize, totalSize);
+    const slice = file.slice(offset, end);
+    let chunkBytes;
+    if (typeof slice?.arrayBuffer === 'function') {
+      const buffer = await slice.arrayBuffer();
+      chunkBytes = new Uint8Array(buffer);
+    } else if (slice instanceof Uint8Array) {
+      chunkBytes = slice;
+    } else if (ArrayBuffer.isView(slice)) {
+      chunkBytes = new Uint8Array(slice.buffer, slice.byteOffset, slice.byteLength);
+    } else if (slice instanceof ArrayBuffer) {
+      chunkBytes = new Uint8Array(slice);
+    } else {
+      chunkBytes = new Uint8Array(await new Blob([slice]).arrayBuffer());
+    }
+    hasher.update(chunkBytes);
+    offset = end;
+  }
+
+  return hasher.digest('hex');
+}
 
 export class TransferEngine {
   constructor(options = {}) {
     this.maxConcurrent = options.maxConcurrent || 3;
     this.chunkSize = options.chunkSize || 10 * 1024 * 1024; // 10MB default
     this.maxRetries = options.maxRetries || 3;
+    this.connectionId = options.connectionId || null;
 
     this.queue = [];
     this.activeTransfers = new Map();
+    this.awaitingTransfers = new Map();
     this.pausedTransfers = new Map();
     this.completedTransfers = [];
     this.failedTransfers = [];
+    this.pendingWsDecisions = new Map();
 
     this.listeners = new Map();
   }
@@ -85,6 +130,8 @@ export class TransferEngine {
         createdAt: Date.now(),
         error: null,
         xhr: null,
+        abortController: null,
+        backoffTimer: null,
       };
 
       this.queue.push(task);
@@ -120,6 +167,7 @@ export class TransferEngine {
             task.status === 'cancelled'
           ) {
             this.activeTransfers.delete(task.id);
+            this.awaitingTransfers.delete(task.id);
             this._emit('queue:updated', this.getStatus());
             this._processQueue();
           }
@@ -170,9 +218,23 @@ export class TransferEngine {
             task.speed = 0;
             task.speedFormatted = '0 B/s';
             task.etaFormatted = 'Awaiting PC...';
+            this.activeTransfers.delete(task.id);
+            this.awaitingTransfers.set(task.id, task);
             this._emit('task:awaiting_approval', task);
+
+            if (this.pendingWsDecisions.has(task.transferId)) {
+              const { event, data } = this.pendingWsDecisions.get(task.transferId);
+              this.pendingWsDecisions.delete(task.transferId);
+              this.handleWebSocketEvent(event, data);
+            } else {
+              this._emit('queue:updated', this.getStatus());
+              this._processQueue();
+            }
           } else {
+            this.activeTransfers.delete(task.id);
             this._markCompleted(task);
+            this._emit('queue:updated', this.getStatus());
+            this._processQueue();
           }
           resolve(task);
         } else {
@@ -190,11 +252,13 @@ export class TransferEngine {
 
       xhr.onerror = () => {
         task.xhr = null;
-        if (task.status === 'cancelled') return resolve(task);
+        if (task.status === 'cancelled' || task.status === 'paused') return resolve(task);
         if (task.retries < this.maxRetries) {
           task.retries++;
           const delay = Math.pow(2, task.retries) * 500;
-          setTimeout(() => {
+          task.backoffTimer = setTimeout(() => {
+            task.backoffTimer = null;
+            if (task.status === 'cancelled' || task.status === 'paused') return resolve(task);
             this._uploadSingle(task).then(resolve).catch(reject);
           }, delay);
         } else {
@@ -219,6 +283,9 @@ export class TransferEngine {
       // The server derives identity itself; only the display label is reported.
       xhr.setRequestHeader('X-Device-Name', this._getDeviceName());
       xhr.setRequestHeader('X-Platform', this._getPlatform());
+      const connectionId =
+        this.connectionId || (typeof window !== 'undefined' ? window.utransConnectionId : null);
+      if (connectionId) xhr.setRequestHeader('X-Connection-Id', connectionId);
       xhr.send(formData);
     });
   }
@@ -228,17 +295,45 @@ export class TransferEngine {
    */
   async _uploadChunked(task) {
     try {
+      task.abortController = new AbortController();
+
       // Step 1: Init if not already initialized
       if (!task.uploadId) {
+        if (task.status === 'paused' || task.status === 'cancelled') return task;
+
+        let checksum;
+        try {
+          checksum = await computeFileSha256(task.file, {
+            signal: task.abortController.signal,
+          });
+        } catch (err) {
+          if (
+            task.status === 'paused' ||
+            task.status === 'cancelled' ||
+            err.name === 'AbortError'
+          ) {
+            return task;
+          }
+          throw err;
+        }
+        const connectionId =
+          this.connectionId || (typeof window !== 'undefined' ? window.utransConnectionId : null);
+        const headers = { 'Content-Type': 'application/json' };
+        if (connectionId) headers['X-Connection-Id'] = connectionId;
+
         const initRes = await apiFetch('/api/upload/init', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers,
+          signal: task.abortController.signal,
           body: JSON.stringify({
             fileName: task.name,
             fileSize: task.size,
             mimeType: task.type,
+            checksum,
           }),
         });
+
+        if (task.status === 'paused' || task.status === 'cancelled') return task;
 
         if (!initRes.ok) {
           throw new Error(`Init chunked upload failed: ${initRes.status}`);
@@ -267,15 +362,38 @@ export class TransferEngine {
         let chunkRetries = 0;
 
         while (!chunkSuccess && chunkRetries <= this.maxRetries) {
+          if (task.status === 'paused' || task.status === 'cancelled') {
+            return task;
+          }
+
           try {
             await this._uploadChunkWithProgress(task, idx, chunkBlob);
             chunkSuccess = true;
           } catch (err) {
+            if (task.status === 'paused' || task.status === 'cancelled') {
+              return task;
+            }
             chunkRetries++;
             if (chunkRetries > this.maxRetries) {
               throw err;
             }
-            await new Promise((r) => setTimeout(r, Math.pow(2, chunkRetries) * 500));
+            const delay = Math.pow(2, chunkRetries) * 500;
+            await new Promise((resolve) => {
+              task.backoffTimer = setTimeout(resolve, delay);
+              task.abortController?.signal?.addEventListener(
+                'abort',
+                () => {
+                  clearTimeout(task.backoffTimer);
+                  task.backoffTimer = null;
+                  resolve();
+                },
+                { once: true }
+              );
+            });
+            task.backoffTimer = null;
+            if (task.status === 'paused' || task.status === 'cancelled') {
+              return task;
+            }
           }
         }
 
@@ -286,16 +404,26 @@ export class TransferEngine {
         this._emit('task:progress', task);
       }
 
+      if (task.status === 'paused' || task.status === 'cancelled') return task;
+
       // Step 3: Complete upload
+      const connectionId =
+        this.connectionId || (typeof window !== 'undefined' ? window.utransConnectionId : null);
+      const compHeaders = {
+        'Content-Type': 'application/json',
+        'X-Device-Name': this._getDeviceName(),
+        'X-Platform': this._getPlatform(),
+      };
+      if (connectionId) compHeaders['X-Connection-Id'] = connectionId;
+
       const compRes = await apiFetch('/api/upload/complete', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Device-Name': this._getDeviceName(),
-          'X-Platform': this._getPlatform(),
-        },
+        headers: compHeaders,
+        signal: task.abortController.signal,
         body: JSON.stringify({ uploadId: task.uploadId }),
       });
+
+      if (task.status === 'paused' || task.status === 'cancelled') return task;
 
       if (!compRes.ok) {
         throw new Error(`Complete chunked upload failed: ${compRes.status}`);
@@ -309,15 +437,40 @@ export class TransferEngine {
         task.speed = 0;
         task.speedFormatted = '0 B/s';
         task.etaFormatted = 'Awaiting PC...';
+        this.activeTransfers.delete(task.id);
+        this.awaitingTransfers.set(task.id, task);
         this._emit('task:awaiting_approval', task);
+
+        if (this.pendingWsDecisions.has(task.transferId)) {
+          const { event, data } = this.pendingWsDecisions.get(task.transferId);
+          this.pendingWsDecisions.delete(task.transferId);
+          this.handleWebSocketEvent(event, data);
+        } else {
+          this._emit('queue:updated', this.getStatus());
+          this._processQueue();
+        }
       } else {
+        this.activeTransfers.delete(task.id);
         this._markCompleted(task);
+        this._emit('queue:updated', this.getStatus());
+        this._processQueue();
       }
 
       return task;
     } catch (err) {
+      if (task.status === 'paused' || task.status === 'cancelled') {
+        return task;
+      }
       this._markError(task, err.message);
       throw err;
+    } finally {
+      if (task.abortController) {
+        task.abortController = null;
+      }
+      if (task.backoffTimer) {
+        clearTimeout(task.backoffTimer);
+        task.backoffTimer = null;
+      }
     }
   }
 
@@ -326,8 +479,22 @@ export class TransferEngine {
       const xhr = new XMLHttpRequest();
       task.xhr = xhr;
 
+      const abortHandler = () => {
+        try {
+          xhr.abort();
+        } catch {
+          // ignore
+        }
+      };
+      if (task.abortController?.signal) {
+        task.abortController.signal.addEventListener('abort', abortHandler, { once: true });
+      }
+
       xhr.onload = () => {
         task.xhr = null;
+        if (task.abortController?.signal) {
+          task.abortController.signal.removeEventListener('abort', abortHandler);
+        }
         if (xhr.status >= 200 && xhr.status < 300) {
           resolve();
         } else {
@@ -337,11 +504,17 @@ export class TransferEngine {
 
       xhr.onerror = () => {
         task.xhr = null;
+        if (task.abortController?.signal) {
+          task.abortController.signal.removeEventListener('abort', abortHandler);
+        }
         reject(new Error(`Chunk ${chunkIndex} network error`));
       };
 
       xhr.onabort = () => {
         task.xhr = null;
+        if (task.abortController?.signal) {
+          task.abortController.signal.removeEventListener('abort', abortHandler);
+        }
         reject(new Error('Chunk upload aborted'));
       };
 
@@ -390,6 +563,14 @@ export class TransferEngine {
     const task = this.activeTransfers.get(taskId);
     if (!task) return;
 
+    if (task.backoffTimer) {
+      clearTimeout(task.backoffTimer);
+      task.backoffTimer = null;
+    }
+    if (task.abortController) {
+      task.abortController.abort();
+      task.abortController = null;
+    }
     if (task.xhr) {
       task.xhr.abort();
       task.xhr = null;
@@ -421,7 +602,13 @@ export class TransferEngine {
     if (task.isChunked && task.uploadId) {
       try {
         const res = await apiFetch(`/api/upload/status/${task.uploadId}`);
-        if (res.ok) {
+        if (res.status === 404 || res.status === 410) {
+          // Session expired or cancelled on server; re-init from scratch
+          task.uploadId = null;
+          task.currentChunk = 0;
+          task.bytesUploaded = 0;
+          task.progress = 0;
+        } else if (res.ok) {
           const data = await res.json();
           if (data.data?.nextChunk !== null && data.data?.nextChunk !== undefined) {
             task.currentChunk = data.data.nextChunk;
@@ -446,8 +633,10 @@ export class TransferEngine {
   cancel(taskId) {
     let task = this.activeTransfers.get(taskId);
     if (task) {
-      if (task.xhr) task.xhr.abort();
       this.activeTransfers.delete(taskId);
+    } else if (this.awaitingTransfers.has(taskId)) {
+      task = this.awaitingTransfers.get(taskId);
+      this.awaitingTransfers.delete(taskId);
     } else if (this.pausedTransfers.has(taskId)) {
       task = this.pausedTransfers.get(taskId);
       this.pausedTransfers.delete(taskId);
@@ -459,6 +648,28 @@ export class TransferEngine {
     }
 
     if (task) {
+      if (task.backoffTimer) {
+        clearTimeout(task.backoffTimer);
+        task.backoffTimer = null;
+      }
+      if (task.abortController) {
+        task.abortController.abort();
+        task.abortController = null;
+      }
+      if (task.xhr) {
+        task.xhr.abort();
+        task.xhr = null;
+      }
+      if (task.isChunked && task.uploadId) {
+        apiFetch('/api/upload/cancel', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ uploadId: task.uploadId }),
+        }).catch(() => {});
+      }
+      if (task.transferId) {
+        this.pendingWsDecisions.delete(task.transferId);
+      }
       task.status = 'cancelled';
       task.speed = 0;
       task.speedFormatted = 'Cancelled';
@@ -468,7 +679,7 @@ export class TransferEngine {
     }
   }
 
-  retry(taskId) {
+  async retry(taskId) {
     const task = this.failedTransfers.find((t) => t.id === taskId);
     if (!task) return;
 
@@ -476,36 +687,150 @@ export class TransferEngine {
     task.retries = 0;
     task.status = 'queued';
     task.error = null;
+
+    if (task.isChunked && task.uploadId) {
+      try {
+        const res = await apiFetch(`/api/upload/status/${task.uploadId}`);
+        if (res.status === 404 || res.status === 410) {
+          task.uploadId = null;
+          task.currentChunk = 0;
+          task.bytesUploaded = 0;
+          task.progress = 0;
+        } else if (res.ok) {
+          const data = await res.json();
+          if (data.data?.nextChunk !== null && data.data?.nextChunk !== undefined) {
+            task.currentChunk = data.data.nextChunk;
+            task.bytesUploaded = task.currentChunk * task.chunkSize;
+            task.progress = Math.min(99, Math.round((task.bytesUploaded / task.size) * 100));
+          }
+        }
+      } catch {
+        task.uploadId = null;
+        task.currentChunk = 0;
+        task.bytesUploaded = 0;
+        task.progress = 0;
+      }
+    }
+
     this.queue.push(task);
     this._emit('queue:updated', this.getStatus());
     this._processQueue();
   }
 
+  _pruneWsDecisions() {
+    const now = Date.now();
+    const MAX_AGE_MS = 30000;
+    for (const [id, item] of this.pendingWsDecisions.entries()) {
+      if (now - (item.timestamp || 0) > MAX_AGE_MS) {
+        this.pendingWsDecisions.delete(id);
+      }
+    }
+    while (this.pendingWsDecisions.size > 50) {
+      const oldestKey = this.pendingWsDecisions.keys().next().value;
+      this.pendingWsDecisions.delete(oldestKey);
+    }
+  }
+
   /**
    * Matches WebSocket transfer completion / rejection events to pending client tasks.
-   * @param {object} eventData
+   * Buffers early decisions if received before HTTP response assigns transferId.
+   * @param {string} event
+   * @param {object} data
    */
   handleWebSocketEvent(event, data) {
     const { transferId } = data || {};
     if (!transferId) return;
 
     // Search active or awaiting approval tasks
-    for (const task of this.activeTransfers.values()) {
-      if (task.transferId === transferId) {
-        if (event === 'transfer:complete') {
-          this._markCompleted(task);
-        } else if (event === 'transfer:rejected') {
-          this._markError(task, 'Declined by PC user');
-        }
-        this.activeTransfers.delete(task.id);
-        this._emit('queue:updated', this.getStatus());
-        this._processQueue();
-        return;
+    let task = null;
+    for (const t of this.awaitingTransfers.values()) {
+      if (t.transferId === transferId) {
+        task = t;
+        break;
       }
     }
+    if (!task) {
+      for (const t of this.activeTransfers.values()) {
+        if (t.transferId === transferId) {
+          task = t;
+          break;
+        }
+      }
+    }
+
+    if (!task) {
+      // Only buffer WS decisions if there is an active uploading task awaiting transferId
+      const hasUploadingTaskPendingId = Array.from(this.activeTransfers.values()).some(
+        (t) => t.status === 'uploading' && !t.transferId
+      );
+      if (hasUploadingTaskPendingId) {
+        this._pruneWsDecisions();
+        if (this.pendingWsDecisions.size < 50) {
+          this.pendingWsDecisions.set(transferId, { event, data, timestamp: Date.now() });
+        }
+      }
+      return;
+    }
+
+    this.activeTransfers.delete(task.id);
+    this.awaitingTransfers.delete(task.id);
+    this.pendingWsDecisions.delete(transferId);
+
+    if (event === 'transfer:complete') {
+      this._markCompleted(task);
+    } else if (event === 'transfer:rejected') {
+      const reason =
+        data.reason === 'TIMEOUT' || data.reason === 'EXPIRED'
+          ? 'Approval timed out'
+          : 'Declined by PC user';
+      this._markError(task, reason);
+    } else if (event === 'transfer:expired') {
+      this._markError(task, 'Approval timed out');
+    }
+
+    this._emit('queue:updated', this.getStatus());
+    this._processQueue();
+  }
+
+  /**
+   * Polls the server status of awaiting transfers on WebSocket reconnect.
+   */
+  async reconcileAwaitingTransfers() {
+    if (this.awaitingTransfers.size === 0) return;
+
+    for (const task of Array.from(this.awaitingTransfers.values())) {
+      if (!task.transferId) continue;
+      try {
+        const res = await apiFetch(`/api/upload/pending/${task.transferId}`);
+        if (res.ok) {
+          const json = await res.json();
+          const info = json.data;
+          if (info.status === 'completed') {
+            this.awaitingTransfers.delete(task.id);
+            this._markCompleted(task);
+          } else if (info.status === 'rejected') {
+            this.awaitingTransfers.delete(task.id);
+            this._markError(task, 'Declined by PC user');
+          } else if (info.status === 'expired') {
+            this.awaitingTransfers.delete(task.id);
+            this._markError(task, 'Approval timed out');
+          }
+        } else if (res.status === 404) {
+          this.awaitingTransfers.delete(task.id);
+          this._markError(task, 'Approval timed out');
+        }
+      } catch {
+        // Will retry on next reconnect
+      }
+    }
+    this._emit('queue:updated', this.getStatus());
+    this._processQueue();
   }
 
   _markCompleted(task) {
+    if (task.transferId) {
+      this.pendingWsDecisions.delete(task.transferId);
+    }
     task.status = 'completed';
     task.progress = 100;
     task.speed = 0;
@@ -517,6 +842,9 @@ export class TransferEngine {
   }
 
   _markError(task, errorMessage) {
+    if (task.transferId) {
+      this.pendingWsDecisions.delete(task.transferId);
+    }
     task.status = 'error';
     task.error = errorMessage;
     task.speed = 0;
@@ -530,6 +858,7 @@ export class TransferEngine {
     return {
       active: [
         ...Array.from(this.activeTransfers.values()),
+        ...Array.from(this.awaitingTransfers.values()),
         ...Array.from(this.pausedTransfers.values()),
       ],
       queued: [...this.queue],

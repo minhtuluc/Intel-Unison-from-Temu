@@ -31,6 +31,7 @@ export function createServer(runtimeOrOptions = {}) {
   const runtime = isRuntime(runtimeOrOptions) ? runtimeOrOptions : createRuntime(runtimeOrOptions);
 
   app.locals.runtime = runtime;
+  runtime.app = app;
   app.locals.hostAuth = runtime.hostAuth;
   app.locals.sessions = runtime.sessions;
   app.locals.pinRequired = runtime.pinRequired;
@@ -148,6 +149,9 @@ export async function startServer(options = {}) {
     logger.info('Staging initial files from command line', { count: initialPaths.length });
     await runtime.shareManager.addFiles(initialPaths);
   }
+
+  // Reconcile disk usage with quota tracker before accepting uploads
+  await runtime.reconcileDiskQuota();
 
   return new Promise((resolve, reject) => {
     const server = app.listen(port, host, async (err) => {

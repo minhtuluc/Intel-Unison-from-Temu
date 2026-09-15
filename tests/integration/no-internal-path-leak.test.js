@@ -8,6 +8,7 @@ import { once } from 'node:events';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import WebSocket from 'ws';
 import { createRuntime } from '../../src/runtime.js';
 import { createServer } from '../../src/server.js';
@@ -92,10 +93,11 @@ describe('UT-015: no internal paths and no client-asserted identity', () => {
   });
 
   it('omits internal paths from the chunked upload flow', async () => {
+    const checksum = crypto.createHash('sha256').update('12345678').digest('hex');
     const init = await fetch(`${base}/api/upload/init`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ fileName: 'chunked-leak.bin', fileSize: 8 }),
+      body: JSON.stringify({ fileName: 'chunked-leak.bin', fileSize: 8, checksum }),
     });
     const { uploadId } = (await init.json()).data;
 

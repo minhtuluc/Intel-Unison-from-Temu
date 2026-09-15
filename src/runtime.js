@@ -6,6 +6,7 @@
  * `app.locals.runtime`, so two runtimes can run side by side without shared state.
  */
 
+import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig } from './config.js';
 import { removeInstanceFile } from './utils/instance-file.js';
@@ -14,8 +15,10 @@ import { ShareManager } from './services/share-manager.js';
 import { ChunkedUploadManager } from './services/chunked-upload.js';
 import { PendingUploadService } from './services/pending-upload.js';
 import { DiscoveryService } from './services/discovery.js';
+import { StorageQuotaTracker } from './services/storage-quota.js';
 import { createHostAuth } from './middleware/host-auth.js';
 import { createSessionStore } from './middleware/session-auth.js';
+import { sendTransferTerminalEvent } from './websocket/handlers.js';
 
 /** Static assets live with the package, never relative to the process cwd. */
 export const PUBLIC_DIR = fileURLToPath(new URL('../public', import.meta.url));
@@ -25,18 +28,36 @@ export const PUBLIC_DIR = fileURLToPath(new URL('../public', import.meta.url));
  */
 export function createRuntime(options = {}) {
   const config = loadConfig(options);
+  const quotaTracker = new StorageQuotaTracker(config.storageQuota);
+  config.quotaTracker = quotaTracker;
+
+  // Reconcile existing disk usage from chunks and pending directories
+  const chunksDir = path.join(config.tempDir, 'chunks');
+  const pendingDir = path.join(config.tempDir, 'pending');
+  quotaTracker.reconcileFromDiskSync([chunksDir, pendingDir]);
 
   const runtime = {
     config,
     publicDir: options.publicDir || PUBLIC_DIR,
+    quotaTracker,
     shareManager: new ShareManager(),
     chunkedUploadManager: new ChunkedUploadManager(config),
-    pendingUploadManager: new PendingUploadService({ config }),
-    discovery: new DiscoveryService(),
+    pendingUploadManager: new PendingUploadService({ config, quotaTracker }),
+    discovery: new DiscoveryService({ maxConnectedDevices: config.maxConnectedDevices }),
     hostAuth: createHostAuth(),
     sessions: createSessionStore({ ttlMs: config.sessionTtlMs, maxSessions: config.maxSessions }),
     pinRequired: Boolean(config.pin),
     listenPort: null,
+    inFlightSimpleUploads: 0,
+    getActiveTransferCount() {
+      let chunkCount = 0;
+      for (const session of runtime.chunkedUploadManager.sessions.values()) {
+        if (session.status === 'uploading' || session.status === 'completing') {
+          chunkCount++;
+        }
+      }
+      return chunkCount + runtime.inFlightSimpleUploads;
+    },
     /**
      * Records the port the HTTP listener actually bound to (matters for port 0).
      * @param {number} port
@@ -56,6 +77,29 @@ export function createRuntime(options = {}) {
     },
 
     /**
+     * Sweeps expired sessions and orphaned temp files across all managers.
+     * @param {{ olderThanMs?: number }} [options]
+     */
+    async sweepAll({ olderThanMs } = {}) {
+      await Promise.allSettled([
+        runtime.chunkedUploadManager.cleanup(),
+        runtime.chunkedUploadManager.sweepOrphans(olderThanMs),
+        runtime.pendingUploadManager.sweepOrphans(olderThanMs),
+        runtime.shareManager.sweepOrphans(runtime.config.tempDir, olderThanMs),
+      ]);
+    },
+
+    /**
+     * Re-scans disk for chunks and pending uploads to align quota allocation.
+     * @returns {Promise<number>}
+     */
+    async reconcileDiskQuota() {
+      const chunks = path.join(runtime.config.tempDir, 'chunks');
+      const pending = path.join(runtime.config.tempDir, 'pending');
+      return await quotaTracker.reconcileFromDisk([chunks, pending]);
+    },
+
+    /**
      * Stops everything this runtime owns within a deadline. Never calls process.exit
      * and never leaves WebSocket clients pinning the HTTP server open.
      * @param {{ timeoutMs?: number }} [options]
@@ -65,6 +109,11 @@ export function createRuntime(options = {}) {
       if (runtime.stoppingPromise) return runtime.stoppingPromise;
 
       runtime.stoppingPromise = (async () => {
+        if (runtime.sweepInterval) {
+          clearInterval(runtime.sweepInterval);
+          runtime.sweepInterval = null;
+        }
+
         const deadline = Date.now() + timeoutMs;
         let timedOut = false;
 
@@ -158,6 +207,34 @@ export function createRuntime(options = {}) {
 
       return runtime.stoppingPromise;
     },
+  };
+
+  // Background periodic sweeper for orphaned temp files
+  const sweepInterval = setInterval(
+    () => {
+      runtime.sweepAll().catch(() => {});
+    },
+    5 * 60 * 1000
+  );
+  if (sweepInterval.unref) sweepInterval.unref();
+  runtime.sweepInterval = sweepInterval;
+
+  // Run startup sweep in background
+  runtime.sweepAll().catch(() => {});
+
+  runtime.pendingUploadManager.onTimeout = ({ transferId, sender }) => {
+    const wss = runtime.wss || runtime.app?.get('wss');
+    if (wss) {
+      sendTransferTerminalEvent(
+        wss,
+        'transfer:expired',
+        {
+          transferId,
+          reason: 'TIMEOUT',
+        },
+        sender
+      );
+    }
   };
 
   return runtime;

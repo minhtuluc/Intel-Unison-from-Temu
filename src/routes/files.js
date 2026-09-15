@@ -108,7 +108,7 @@ filesRouter.post('/api/share', hostOnlyForSourcePaths, (req, res, next) => {
         const { shareManager } = req.app.locals.runtime;
         const shared = [];
         for (const file of uploadedFiles) {
-          const meta = await shareManager.addFile(file.path, file.originalname);
+          const meta = await shareManager.addFile(file.path, file.originalname, true);
           shared.push(meta);
         }
 

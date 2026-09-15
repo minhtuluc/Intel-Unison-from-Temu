@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { ChunkedUploadManager } from '../../src/services/chunked-upload.js';
 
 describe('ChunkedUploadManager Service', () => {
@@ -27,6 +28,9 @@ describe('ChunkedUploadManager Service', () => {
     });
   });
 
+  const defaultHash = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
+  const sampleHash = (content) => crypto.createHash('sha256').update(content).digest('hex');
+
   afterEach(async () => {
     await fs.promises.rm(rootDir, { recursive: true, force: true });
   });
@@ -36,6 +40,7 @@ describe('ChunkedUploadManager Service', () => {
       const init = await manager.initUpload({
         fileName: 'large_data.bin',
         fileSize: 2500, // Needs 3 chunks of 1024 bytes
+        checksum: defaultHash,
       });
 
       assert.ok(init.uploadId.startsWith('up_'));
@@ -56,17 +61,47 @@ describe('ChunkedUploadManager Service', () => {
         { code: 'FILE_TOO_LARGE', statusCode: 413 }
       );
     });
+
+    it('should enforce maxSessions limit with 429 TOO_MANY_SESSIONS', async () => {
+      const tinyManager = new ChunkedUploadManager({
+        tempDir: testTempDir,
+        uploadDir: testUploadDir,
+        chunkSize: 1024,
+        maxFileSize: 10 * 1024 * 1024,
+        maxSessions: 2,
+        uploadExpiry: 60000,
+      });
+
+      await tinyManager.initUpload({
+        fileName: 'file1.bin',
+        fileSize: 1024,
+        checksum: defaultHash,
+      });
+      await tinyManager.initUpload({
+        fileName: 'file2.bin',
+        fileSize: 1024,
+        checksum: defaultHash,
+      });
+
+      await assert.rejects(
+        () =>
+          tinyManager.initUpload({ fileName: 'file3.bin', fileSize: 1024, checksum: defaultHash }),
+        { code: 'TOO_MANY_SESSIONS', statusCode: 429 }
+      );
+    });
   });
 
   describe('addChunk() & getStatus()', () => {
     it('should store chunks and track received progress', async () => {
+      const chunk0 = Buffer.alloc(1024, 'A');
+      const chunk1 = Buffer.alloc(1024, 'B');
+      const fullChecksum = sampleHash(Buffer.concat([chunk0, chunk1]));
+
       const init = await manager.initUpload({
         fileName: 'transfer.bin',
         fileSize: 2048, // 2 chunks
+        checksum: fullChecksum,
       });
-
-      const chunk0 = Buffer.alloc(1024, 'A');
-      const chunk1 = Buffer.alloc(1024, 'B');
 
       const res0 = await manager.addChunk(init.uploadId, 0, chunk0);
       assert.equal(res0.chunkIndex, 0);
@@ -86,6 +121,7 @@ describe('ChunkedUploadManager Service', () => {
       const init = await manager.initUpload({
         fileName: 'transfer.bin',
         fileSize: 1024, // 1 chunk
+        checksum: defaultHash,
       });
 
       await assert.rejects(() => manager.addChunk(init.uploadId, 5, Buffer.from('data')), {
@@ -100,17 +136,54 @@ describe('ChunkedUploadManager Service', () => {
         statusCode: 410,
       });
     });
+
+    it('should reject chunk when byte length does not match expected size', async () => {
+      const init = await manager.initUpload({
+        fileName: 'transfer.bin',
+        fileSize: 2048, // 2 chunks of 1024
+        checksum: defaultHash,
+      });
+
+      // Pass only 500 bytes for chunk 0 when 1024 is expected
+      await assert.rejects(() => manager.addChunk(init.uploadId, 0, Buffer.alloc(500)), {
+        code: 'CHUNK_SIZE_MISMATCH',
+        statusCode: 400,
+      });
+    });
+
+    it('should verify optional SHA-256 chunk checksum when provided', async () => {
+      const init = await manager.initUpload({
+        fileName: 'transfer.bin',
+        fileSize: 1024,
+        checksum: defaultHash,
+      });
+
+      const chunkData = Buffer.alloc(1024, 'Z');
+      const correctHash = crypto.createHash('sha256').update(chunkData).digest('hex');
+      const wrongHash = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+
+      // Checksum mismatch
+      await assert.rejects(() => manager.addChunk(init.uploadId, 0, chunkData, wrongHash), {
+        code: 'CHECKSUM_MISMATCH',
+        statusCode: 400,
+      });
+
+      // Correct checksum
+      const res = await manager.addChunk(init.uploadId, 0, chunkData, correctHash);
+      assert.equal(res.chunkIndex, 0);
+    });
   });
 
   describe('complete()', () => {
     it('should merge all chunks sequentially and output full file to uploadDir', async () => {
+      const content = Buffer.from('Hello Universe!');
       const init = await manager.initUpload({
         fileName: 'final_merged.txt',
         fileSize: 15,
+        checksum: sampleHash(content),
       });
 
       // 15 bytes in 1KB chunkSize -> 1 chunk
-      const content = Buffer.from('Hello Universe!');
       await manager.addChunk(init.uploadId, 0, content);
 
       const result = await manager.complete(init.uploadId);
@@ -125,6 +198,7 @@ describe('ChunkedUploadManager Service', () => {
       const init = await manager.initUpload({
         fileName: 'incomplete.bin',
         fileSize: 3000, // 3 chunks
+        checksum: defaultHash,
       });
 
       await manager.addChunk(init.uploadId, 0, Buffer.alloc(1024));
@@ -134,6 +208,26 @@ describe('ChunkedUploadManager Service', () => {
         statusCode: 400,
       });
     });
+
+    it('should detect file size corruption during complete() and reject with FILE_CORRUPTED', async () => {
+      const init = await manager.initUpload({
+        fileName: 'corrupt.bin',
+        fileSize: 2048,
+        checksum: defaultHash,
+      });
+
+      await manager.addChunk(init.uploadId, 0, Buffer.alloc(1024, 'A'));
+      await manager.addChunk(init.uploadId, 1, Buffer.alloc(1024, 'B'));
+
+      // Tamper with chunk_1 on disk to truncate it
+      const chunk1Path = path.join(testTempDir, 'chunks', init.uploadId, 'chunk_1');
+      await fs.promises.writeFile(chunk1Path, Buffer.alloc(500, 'B'));
+
+      await assert.rejects(() => manager.complete(init.uploadId), {
+        code: 'FILE_CORRUPTED',
+        statusCode: 500,
+      });
+    });
   });
 
   describe('cleanup()', () => {
@@ -141,6 +235,7 @@ describe('ChunkedUploadManager Service', () => {
       const init = await manager.initUpload({
         fileName: 'expired.bin',
         fileSize: 1024,
+        checksum: defaultHash,
       });
 
       // Wait for session to expire (expiry was set to 1000ms in test setup)
@@ -148,6 +243,55 @@ describe('ChunkedUploadManager Service', () => {
 
       await manager.cleanup();
       assert.equal(manager.sessions.has(init.uploadId), false);
+    });
+  });
+
+  describe('cancelUpload()', () => {
+    it('should cancel active session and immediately delete chunk files from disk', async () => {
+      const init = await manager.initUpload({
+        fileName: 'to_cancel.bin',
+        fileSize: 2048,
+        checksum: defaultHash,
+      });
+
+      await manager.addChunk(init.uploadId, 0, Buffer.alloc(1024));
+      const sessionDir = path.join(testTempDir, 'chunks', init.uploadId);
+      assert.ok(fs.existsSync(sessionDir));
+
+      const cancelled = await manager.cancelUpload(init.uploadId);
+      assert.equal(cancelled, true);
+      assert.equal(manager.sessions.has(init.uploadId), false);
+      assert.equal(
+        fs.existsSync(sessionDir),
+        false,
+        'Session temp dir must be deleted immediately'
+      );
+    });
+
+    it('should return false when cancelling non-existent uploadId', async () => {
+      const cancelled = await manager.cancelUpload('up_non_existent');
+      assert.equal(cancelled, false);
+    });
+  });
+
+  describe('sweepOrphans()', () => {
+    it('should sweep orphaned chunk session directories not in memory', async () => {
+      const chunksDir = path.join(testTempDir, 'chunks');
+      const orphanDir = path.join(chunksDir, 'up_orphan_session');
+      await fs.promises.mkdir(orphanDir, { recursive: true });
+      await fs.promises.writeFile(path.join(orphanDir, 'chunk_0'), 'orphan');
+
+      const init = await manager.initUpload({
+        fileName: 'active.bin',
+        fileSize: 1024,
+        checksum: defaultHash,
+      });
+      const activeDir = path.join(chunksDir, init.uploadId);
+
+      await manager.sweepOrphans(0);
+
+      assert.equal(fs.existsSync(orphanDir), false, 'Orphaned chunk folder must be swept');
+      assert.equal(fs.existsSync(activeDir), true, 'Active chunk folder must be kept');
     });
   });
 });

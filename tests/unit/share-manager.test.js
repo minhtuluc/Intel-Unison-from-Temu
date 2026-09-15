@@ -144,5 +144,65 @@ describe('ShareManager Service', () => {
       assert.equal(list.fileCount, 0);
       assert.equal(list.totalSize, 0);
     });
+
+    it('should never delete CLI or host source files on removeFile or clear', async () => {
+      const meta = await shareManager.addFile(fileA, null, false);
+      assert.ok(fs.existsSync(fileA));
+
+      shareManager.removeFile(meta.id);
+      assert.ok(fs.existsSync(fileA), 'Source file must remain intact on disk after removeFile');
+
+      await shareManager.addFile(fileB, null, false);
+      shareManager.clear();
+      assert.ok(fs.existsSync(fileB), 'Source file must remain intact on disk after clear');
+    });
+
+    it('should delete temporary files on removeFile and clear when isTemp is true', async () => {
+      const tempUploadFile = path.join(testDir, 'temp_upload.txt');
+      await fs.promises.writeFile(tempUploadFile, 'Temporary upload payload');
+
+      const meta = await shareManager.addFile(tempUploadFile, 'temp_upload.txt', true);
+      assert.ok(fs.existsSync(tempUploadFile));
+
+      shareManager.removeFile(meta.id);
+      // Allow async unlink to settle
+      await new Promise((r) => setTimeout(r, 20));
+      assert.equal(
+        fs.existsSync(tempUploadFile),
+        false,
+        'Temp upload file should be removed on removeFile'
+      );
+
+      const tempUploadFile2 = path.join(testDir, 'temp_upload2.txt');
+      await fs.promises.writeFile(tempUploadFile2, 'Temporary upload payload 2');
+      await shareManager.addFile(tempUploadFile2, 'temp_upload2.txt', true);
+
+      shareManager.clear();
+      await new Promise((r) => setTimeout(r, 20));
+      assert.equal(
+        fs.existsSync(tempUploadFile2),
+        false,
+        'Temp upload file should be removed on clear'
+      );
+    });
+  });
+
+  describe('sweepOrphans()', () => {
+    it('should sweep orphaned staging files not tracked in stagedFiles', async () => {
+      const stagingDir = path.join(testDir, 'staging');
+      await fs.promises.mkdir(stagingDir, { recursive: true });
+
+      const orphanFile = path.join(stagingDir, 'orphan.txt');
+      await fs.promises.writeFile(orphanFile, 'abandoned staging file');
+
+      const activeFile = path.join(stagingDir, 'active.txt');
+      await fs.promises.writeFile(activeFile, 'active staging file');
+      await shareManager.addFile(activeFile, 'active.txt', true);
+
+      await shareManager.sweepOrphans(testDir, 0);
+
+      assert.equal(fs.existsSync(orphanFile), false, 'Orphaned staging file should be swept');
+      assert.equal(fs.existsSync(activeFile), true, 'Tracked staging file must be preserved');
+    });
   });
 });

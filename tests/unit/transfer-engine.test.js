@@ -122,4 +122,332 @@ describe('TransferEngine (Unit)', () => {
     assert.equal(task.error, 'Declined by PC user');
     assert.equal(engine.failedTransfers.length, 1);
   });
+
+  it('UT-004: should decouple active uploading slots from awaiting_approval tasks', async () => {
+    const engine2 = new TransferEngine({ maxConcurrent: 2 });
+    const uploadResolvers = [];
+
+    engine2._startUpload = (task) => {
+      return new Promise((resolve) => {
+        uploadResolvers.push({ task, resolve });
+      });
+    };
+
+    const files = [
+      { name: 'f1.txt', size: 100 },
+      { name: 'f2.txt', size: 100 },
+      { name: 'f3.txt', size: 100 },
+      { name: 'f4.txt', size: 100 },
+      { name: 'f5.txt', size: 100 },
+    ];
+
+    engine2.addFiles(files);
+    assert.equal(engine2.activeTransfers.size, 2);
+    assert.equal(engine2.queue.length, 3);
+
+    // Simulate f1 and f2 finishing byte upload and entering awaiting_approval
+    const { task: t1, resolve: r1 } = uploadResolvers[0];
+    const { task: t2, resolve: r2 } = uploadResolvers[1];
+
+    t1.transferId = 'tx_1';
+    t1.status = 'awaiting_approval';
+    engine2.activeTransfers.delete(t1.id);
+    engine2.awaitingTransfers.set(t1.id, t1);
+    r1(t1);
+    engine2._processQueue();
+
+    t2.transferId = 'tx_2';
+    t2.status = 'awaiting_approval';
+    engine2.activeTransfers.delete(t2.id);
+    engine2.awaitingTransfers.set(t2.id, t2);
+    r2(t2);
+    engine2._processQueue();
+
+    // Now f1 & f2 are awaiting approval, and f3 & f4 should immediately be uploading!
+    assert.equal(engine2.awaitingTransfers.size, 2);
+    assert.equal(engine2.activeTransfers.size, 2);
+    assert.equal(engine2.queue.length, 1);
+
+    const activeNames = Array.from(engine2.activeTransfers.values()).map((t) => t.name);
+    assert.deepEqual(activeNames, ['f3.txt', 'f4.txt']);
+
+    // When f3 finishes uploading bytes and awaits approval, f5 should start uploading
+    const { task: t3, resolve: r3 } = uploadResolvers[2];
+    t3.transferId = 'tx_3';
+    t3.status = 'awaiting_approval';
+    engine2.activeTransfers.delete(t3.id);
+    engine2.awaitingTransfers.set(t3.id, t3);
+    r3(t3);
+    engine2._processQueue();
+
+    assert.equal(engine2.awaitingTransfers.size, 3);
+    assert.equal(engine2.activeTransfers.size, 2);
+    assert.equal(engine2.queue.length, 0);
+    const updatedActiveNames = Array.from(engine2.activeTransfers.values()).map((t) => t.name);
+    assert.deepEqual(updatedActiveNames, ['f4.txt', 'f5.txt']);
+  });
+
+  it('UT-004: should buffer WebSocket event if it arrives before HTTP response sets transferId', () => {
+    // 1. Task is uploading, but HTTP response has not yet assigned transferId
+    const task = {
+      id: 'task_pending_early',
+      name: 'fast.png',
+      size: 500,
+      status: 'uploading',
+    };
+    engine.activeTransfers.set(task.id, task);
+
+    // 2. WS event arrives early
+    engine.handleWebSocketEvent('transfer:complete', { transferId: 'early_tx_100' });
+    assert.equal(engine.pendingWsDecisions.has('early_tx_100'), true);
+
+    // 3. HTTP response returns later and sets task.transferId
+    // Simulate HTTP response completion handler logic
+    task.transferId = 'early_tx_100';
+    task.status = 'awaiting_approval';
+    engine.activeTransfers.delete(task.id);
+    engine.awaitingTransfers.set(task.id, task);
+
+    if (engine.pendingWsDecisions.has(task.transferId)) {
+      const { event, data } = engine.pendingWsDecisions.get(task.transferId);
+      engine.pendingWsDecisions.delete(task.transferId);
+      engine.handleWebSocketEvent(event, data);
+    }
+
+    assert.equal(task.status, 'completed');
+    assert.equal(engine.completedTransfers.length, 1);
+    assert.equal(engine.awaitingTransfers.has(task.id), false);
+    assert.equal(engine.pendingWsDecisions.has('early_tx_100'), false);
+  });
+
+  it('UT-004: should handle transfer:expired and transfer:rejected TIMEOUT terminal events', () => {
+    const task1 = {
+      id: 't_exp_1',
+      name: 'expired1.txt',
+      size: 10,
+      status: 'awaiting_approval',
+      transferId: 'tx_exp_1',
+    };
+    const task2 = {
+      id: 't_exp_2',
+      name: 'expired2.txt',
+      size: 20,
+      status: 'awaiting_approval',
+      transferId: 'tx_exp_2',
+    };
+
+    engine.awaitingTransfers.set(task1.id, task1);
+    engine.awaitingTransfers.set(task2.id, task2);
+
+    // transfer:expired
+    engine.handleWebSocketEvent('transfer:expired', { transferId: 'tx_exp_1' });
+    assert.equal(task1.status, 'error');
+    assert.equal(task1.error, 'Approval timed out');
+    assert.equal(engine.awaitingTransfers.has(task1.id), false);
+
+    // transfer:rejected with reason: 'TIMEOUT'
+    engine.handleWebSocketEvent('transfer:rejected', {
+      transferId: 'tx_exp_2',
+      reason: 'TIMEOUT',
+    });
+    assert.equal(task2.status, 'error');
+    assert.equal(task2.error, 'Approval timed out');
+    assert.equal(engine.awaitingTransfers.has(task2.id), false);
+  });
+
+  it('UT-004: should reconcile awaiting transfers against server on reconnect', async () => {
+    const origFetch = globalThis.fetch;
+    try {
+      const task = {
+        id: 't_recon',
+        name: 'recon.txt',
+        size: 50,
+        status: 'awaiting_approval',
+        transferId: 'tx_recon_99',
+      };
+      engine.awaitingTransfers.set(task.id, task);
+
+      // 1. Mock server reports completed
+      globalThis.fetch = async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          success: true,
+          data: { status: 'completed', fileName: 'recon.txt', size: 50 },
+        }),
+      });
+
+      await engine.reconcileAwaitingTransfers();
+      assert.equal(task.status, 'completed');
+      assert.equal(engine.awaitingTransfers.has(task.id), false);
+      assert.equal(engine.completedTransfers.length, 1);
+
+      // 2. Mock server reports 404 (expired / purged)
+      const task404 = {
+        id: 't_recon_404',
+        name: 'lost.txt',
+        size: 50,
+        status: 'awaiting_approval',
+        transferId: 'tx_lost_404',
+      };
+      engine.awaitingTransfers.set(task404.id, task404);
+
+      globalThis.fetch = async () => ({
+        ok: false,
+        status: 404,
+        json: async () => ({ error: { code: 'TRANSFER_NOT_FOUND' } }),
+      });
+
+      await engine.reconcileAwaitingTransfers();
+      assert.equal(task404.status, 'error');
+      assert.equal(task404.error, 'Approval timed out');
+      assert.equal(engine.awaitingTransfers.has(task404.id), false);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  it('UT-009: should pause and not trigger chunk retry backoff loop', async () => {
+    const origFetch = globalThis.fetch;
+    try {
+      globalThis.fetch = async (url) => {
+        if (url.includes('/api/upload/init')) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              success: true,
+              data: { uploadId: 'up_pause_test', chunkSize: 10, totalChunks: 3 },
+            }),
+          };
+        }
+        return { ok: true, status: 200, json: async () => ({}) };
+      };
+
+      const largeFile = {
+        name: 'test_large.bin',
+        size: 30,
+        type: 'application/octet-stream',
+        slice: () => new Uint8Array(10),
+      };
+
+      const task = {
+        id: 't_chunk_pause',
+        file: largeFile,
+        name: largeFile.name,
+        size: largeFile.size,
+        type: largeFile.type,
+        status: 'uploading',
+        isChunked: true,
+        uploadId: null,
+        transferId: null,
+        currentChunk: 0,
+        totalChunks: 3,
+        chunkSize: 10,
+        retries: 0,
+        speedSamples: [],
+        xhr: null,
+        abortController: null,
+        backoffTimer: null,
+      };
+
+      engine.activeTransfers.set(task.id, task);
+
+      let chunkAttempts = 0;
+      engine._uploadChunkWithProgress = async () => {
+        chunkAttempts++;
+        // Pause while inside chunk attempt
+        engine.pause(task.id);
+        throw new Error('Chunk upload aborted');
+      };
+
+      await engine._uploadChunked(task);
+
+      assert.equal(task.status, 'paused');
+      // Must not retry chunk upload!
+      assert.equal(chunkAttempts, 1);
+      assert.equal(engine.pausedTransfers.has(task.id), true);
+      assert.equal(engine.activeTransfers.has(task.id), false);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  it('UT-009: should cancel during backoff delay and notify server', async () => {
+    const origFetch = globalThis.fetch;
+    let cancelCalled = false;
+    let cancelPayload = null;
+
+    try {
+      globalThis.fetch = async (url, options) => {
+        if (url.includes('/api/upload/cancel')) {
+          cancelCalled = true;
+          cancelPayload = JSON.parse(options.body);
+          return { ok: true, status: 200, json: async () => ({ success: true }) };
+        }
+        return { ok: true, status: 200, json: async () => ({}) };
+      };
+
+      const task = {
+        id: 't_cancel_backoff',
+        name: 'doc.zip',
+        size: 1000,
+        status: 'uploading',
+        isChunked: true,
+        uploadId: 'up_to_cancel',
+        backoffTimer: setTimeout(() => {}, 10000),
+        abortController: new AbortController(),
+      };
+      engine.activeTransfers.set(task.id, task);
+
+      engine.cancel(task.id);
+
+      assert.equal(task.status, 'cancelled');
+      assert.equal(task.backoffTimer, null);
+      assert.equal(engine.activeTransfers.has(task.id), false);
+      assert.equal(cancelCalled, true);
+      assert.deepEqual(cancelPayload, { uploadId: 'up_to_cancel' });
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  it('UT-009: should re-initialize session on resume if server session expired (404/410)', async () => {
+    const origFetch = globalThis.fetch;
+    try {
+      // Server returns 410 Gone for expired session status
+      globalThis.fetch = async () => ({
+        ok: false,
+        status: 410,
+        json: async () => ({ error: { code: 'SESSION_EXPIRED' } }),
+      });
+
+      const task = {
+        id: 't_resume_expired',
+        name: 'video.mkv',
+        size: 200 * 1024 * 1024,
+        isChunked: true,
+        uploadId: 'up_expired_123',
+        currentChunk: 5,
+        bytesUploaded: 50 * 1024 * 1024,
+        progress: 25,
+        status: 'paused',
+      };
+      engine.pausedTransfers.set(task.id, task);
+
+      // Prevent upload start when queued
+      engine._startUpload = async () => {};
+
+      await engine.resume(task.id);
+
+      assert.equal(task.uploadId, null);
+      assert.equal(task.currentChunk, 0);
+      assert.equal(task.bytesUploaded, 0);
+      assert.equal(task.progress, 0);
+      assert.equal(task.status, 'uploading');
+      assert.ok(engine.activeTransfers.has(task.id));
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
 });

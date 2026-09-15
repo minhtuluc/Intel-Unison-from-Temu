@@ -41,7 +41,11 @@ describe('Upload limits are per runtime and enforced before buffering', () => {
     const init = await fetch(`${base}/api/upload/init`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ fileName: 'big.bin', fileSize: 2048 }),
+      body: JSON.stringify({
+        fileName: 'big.bin',
+        fileSize: 2048,
+        checksum: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+      }),
     });
     assert.equal(init.status, 200);
     const { uploadId } = (await init.json()).data;

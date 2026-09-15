@@ -8,58 +8,148 @@ import { Router } from 'express';
 import fs from 'node:fs';
 import path from 'node:path';
 import multer from 'multer';
-import { broadcastEvent } from '../websocket/handlers.js';
+import { broadcastEvent, sendTransferTerminalEvent } from '../websocket/handlers.js';
 import { AppError } from '../middleware/error-handler.js';
-import { sanitizeFileName } from '../utils/file-utils.js';
+import { parseRange, reserveWritableFile } from '../utils/file-utils.js';
 import { requireHost } from '../middleware/host-auth.js';
+import { extractSessionToken } from '../middleware/session-auth.js';
 
 export const transferRouter = Router();
 
 /**
- * Sender attribution for approvals. The IP is observed by the server; the display
- * name is whatever the client claimed and is marked untrusted for the host UI.
+ * Resolves and strictly validates sender attribution from request headers/body against
+ * observed connection state. Throws 403 INVALID_CONNECTION_ID if connectionId is spoofed
+ * or belongs to a different socket IP / session.
  * @param {import('express').Request} req
  */
-function describeSender(req) {
+function resolveSender(req) {
+  const connectionId = req.headers['x-connection-id'] || req.body?.connectionId || null;
+  const rawReqIp = req.ip || req.socket?.remoteAddress || 'unknown';
+  const cleanReqIp = rawReqIp.replace(/^::ffff:/, '');
+
+  if (connectionId) {
+    const wss = req.app.get('wss') || req.app.locals.runtime?.wss;
+    if (wss && wss.clients) {
+      let matchedClient = null;
+      for (const client of wss.clients) {
+        if (client.connectionId === connectionId) {
+          matchedClient = client;
+          break;
+        }
+      }
+      if (!matchedClient) {
+        throw new AppError('INVALID_CONNECTION_ID', 403, 'Connection ID not found or expired');
+      }
+
+      const clientIp = (matchedClient._remoteIp || '').replace(/^::ffff:/, '');
+      if (clientIp && cleanReqIp && cleanReqIp !== 'unknown' && clientIp !== cleanReqIp) {
+        throw new AppError('INVALID_CONNECTION_ID', 403, 'Connection ID does not match sender IP');
+      }
+
+      // If PIN is required (or socket is bound to a session), verify that session matches
+      const isPinRequired =
+        req.app.locals.pinRequired ?? req.app.locals.runtime?.pinRequired ?? false;
+      const hostAuth = req.app.locals.hostAuth || req.app.locals.runtime?.hostAuth;
+      const hostToken = req.headers['x-host-token'];
+      const isHostReq = Boolean(hostToken && hostAuth?.verify(req, hostToken));
+
+      if (!isHostReq && (isPinRequired || matchedClient.sessionToken)) {
+        const reqToken = extractSessionToken(req);
+        if (!reqToken || !matchedClient.sessionToken || matchedClient.sessionToken !== reqToken) {
+          throw new AppError(
+            'INVALID_CONNECTION_ID',
+            403,
+            'Connection ID belongs to a different session'
+          );
+        }
+      }
+    }
+  }
+
   return {
-    ip: req.ip || req.socket?.remoteAddress || 'unknown',
+    connectionId,
+    ip: rawReqIp,
     label: req.headers['x-device-name'] || req.body?.deviceName || 'Unknown device',
     labelUntrusted: true,
     platform: req.headers['x-platform'] || req.body?.platform || 'unknown',
   };
 }
 
-// Storage for simple upload (<100MB) staged in pending directory awaiting approval
-const simpleUploadStorage = multer.diskStorage({
-  destination: async (req, _file, cb) => {
-    const pendingDir = path.join(req.app.locals.runtime.config.tempDir, 'pending');
+/**
+ * Custom Multer storage engine that streams files to pending staging area while atomically
+ * enforcing quota reservations on each incoming byte and tracking created files for transaction rollback.
+ */
+class SimpleUploadQuotaStorage {
+  async _handleFile(req, file, cb) {
+    const runtime = req.app.locals.runtime;
+    const pendingDir = path.join(runtime.config.tempDir, 'pending');
+
+    let reserved;
     try {
-      await fs.promises.mkdir(pendingDir, { recursive: true });
-      cb(null, pendingDir);
+      reserved = await reserveWritableFile(pendingDir, file.originalname || 'unnamed');
     } catch (err) {
-      cb(err, pendingDir);
-    }
-  },
-  filename: (req, file, cb) => {
-    const cleanName = sanitizeFileName(file.originalname);
-    const pendingDir = path.join(req.app.locals.runtime.config.tempDir, 'pending');
-    let finalPath = path.join(pendingDir, cleanName);
-
-    if (!fs.existsSync(finalPath)) {
-      return cb(null, cleanName);
+      return cb(err);
     }
 
-    // Resolve name collisions safely in pending area
-    const ext = path.extname(cleanName);
-    const base = path.basename(cleanName, ext);
-    let counter = 1;
-    while (fs.existsSync(finalPath)) {
-      finalPath = path.join(pendingDir, `${base}_(${counter})${ext}`);
-      counter++;
+    const { fileName: finalName, filePath: finalPath, fileHandle } = reserved;
+
+    req._createdFiles = req._createdFiles || [];
+    const fileRecord = { path: finalPath, size: 0, reservedQuota: 0, fileHandle };
+    req._createdFiles.push(fileRecord);
+
+    const outStream = fileHandle.createWriteStream();
+    let bytesWritten = 0;
+    let aborted = false;
+
+    file.stream.on('data', (chunk) => {
+      bytesWritten += chunk.length;
+      fileRecord.size = bytesWritten;
+      if (runtime.quotaTracker) {
+        try {
+          runtime.quotaTracker.reserve(chunk.length);
+          fileRecord.reservedQuota += chunk.length;
+        } catch (quotaErr) {
+          aborted = true;
+          file.stream.unpipe?.();
+          file.stream.destroy?.();
+          outStream.destroy(quotaErr);
+        }
+      }
+    });
+
+    file.stream.on('error', (err) => {
+      if (!aborted) {
+        outStream.destroy(err);
+      }
+    });
+
+    outStream.on('error', (err) => {
+      cb(err);
+    });
+
+    outStream.on('finish', () => {
+      if (aborted) return;
+      cb(null, {
+        destination: pendingDir,
+        filename: finalName,
+        path: finalPath,
+        size: bytesWritten,
+      });
+    });
+
+    file.stream.pipe(outStream);
+  }
+
+  _removeFile(req, file, cb) {
+    if (file && file.path) {
+      fs.unlink(file.path, cb);
+    } else {
+      cb(null);
     }
-    cb(null, path.basename(finalPath));
-  },
-});
+  }
+}
+
+const simpleUploadStorage = new SimpleUploadQuotaStorage();
 
 const SIMPLE_UPLOAD_CEILING = 100 * 1024 * 1024;
 const simpleUploads = new WeakMap();
@@ -77,24 +167,87 @@ function simpleUploadFor(runtime) {
   return upload;
 }
 
-/** Parses simple multipart uploads and reports oversized files as 413. */
+/** Parses simple multipart uploads, enforces atomic concurrency slot and quota with batch rollback. */
 function parseSimpleUpload(req, res, next) {
   const runtime = req.app.locals.runtime;
+  if (runtime.getActiveTransferCount() >= runtime.config.maxConcurrentTransfers) {
+    return next(
+      new AppError(
+        'TOO_MANY_TRANSFERS',
+        429,
+        `Maximum concurrent transfers (${runtime.config.maxConcurrentTransfers}) reached. Try again later.`
+      )
+    );
+  }
+
+  // Pre-claim transfer slot before Multer parses and buffers body
+  runtime.inFlightSimpleUploads++;
+  let slotReleased = false;
+  const releaseSlot = () => {
+    if (!slotReleased) {
+      slotReleased = true;
+      runtime.inFlightSimpleUploads = Math.max(0, runtime.inFlightSimpleUploads - 1);
+    }
+  };
+
+  const cleanupCreatedFiles = async () => {
+    if (req._createdFiles && req._createdFiles.length > 0) {
+      const filesToClean = [...req._createdFiles];
+      req._createdFiles = [];
+      for (const item of filesToClean) {
+        if (item.fileHandle) {
+          try {
+            await item.fileHandle.close();
+          } catch {
+            // ignore handle close failure
+          }
+        }
+        try {
+          if (fs.existsSync(item.path)) {
+            await fs.promises.unlink(item.path);
+          }
+        } catch {
+          // ignore unlink failure
+        }
+        if (runtime.quotaTracker && item.reservedQuota > 0) {
+          runtime.quotaTracker.release(item.reservedQuota);
+          item.reservedQuota = 0;
+        }
+      }
+    }
+  };
+
+  res.on('finish', releaseSlot);
+  res.on('close', async () => {
+    releaseSlot();
+    if (!res.writableEnded) {
+      await cleanupCreatedFiles();
+    }
+  });
+
+  const contentLength = Number(req.headers['content-length'] || 0);
+  if (runtime.quotaTracker && contentLength > 0) {
+    const stats = runtime.quotaTracker.getStats();
+    if (contentLength > stats.available) {
+      releaseSlot();
+      return next(
+        new AppError(
+          'STORAGE_QUOTA_EXCEEDED',
+          507,
+          `Storage quota exceeded: required ${contentLength} bytes, available ${stats.available} bytes`
+        )
+      );
+    }
+  }
+
   const limit = Math.min(runtime.config.maxFileSize, SIMPLE_UPLOAD_CEILING);
   simpleUploadFor(runtime).array('files')(req, res, async (err) => {
     if (!err) return next();
+
+    releaseSlot();
+    await cleanupCreatedFiles();
+
     if (err.code === 'LIMIT_FILE_SIZE') {
-      if (req.files && Array.isArray(req.files)) {
-        for (const file of req.files) {
-          if (file.path) {
-            try {
-              await fs.promises.unlink(file.path);
-            } catch {
-              // Ignore unlink error
-            }
-          }
-        }
-      }
       return next(
         new AppError(
           'FILE_TOO_LARGE',
@@ -164,7 +317,7 @@ transferRouter.get('/api/download/:fileId', async (req, res, next) => {
     }
 
     const fileSize = stat.size;
-    const range = req.headers.range;
+    const rangeHeader = req.headers.range;
 
     // Standard headers
     res.setHeader('Content-Type', fileRecord.mimeType || 'application/octet-stream');
@@ -175,36 +328,46 @@ transferRouter.get('/api/download/:fileId', async (req, res, next) => {
       `attachment; filename="${encodeURIComponent(fileRecord.name)}"; filename*=UTF-8''${encodeURIComponent(fileRecord.name)}`
     );
 
-    if (range) {
-      // Range header format: "bytes=start-end"
-      const parts = range.replace(/bytes=/, '').split('-');
-      const start = parseInt(parts[0], 10);
-      const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+    let stream;
 
-      if (isNaN(start) || isNaN(end) || start < 0 || start > end || end >= fileSize) {
-        res.setHeader('Content-Range', `bytes */${fileSize}`);
-        return res.status(416).json({
-          success: false,
-          error: { code: 'RANGE_NOT_SATISFIABLE', message: 'Requested range not satisfiable' },
-        });
+    if (rangeHeader) {
+      const parsed = parseRange(rangeHeader, fileSize);
+      if (parsed) {
+        if (!parsed.satisfiable) {
+          res.setHeader('Content-Range', `bytes */${fileSize}`);
+          return res.status(416).json({
+            success: false,
+            error: { code: 'RANGE_NOT_SATISFIABLE', message: 'Requested range not satisfiable' },
+          });
+        }
+
+        res.status(206);
+        res.setHeader('Content-Range', `bytes ${parsed.start}-${parsed.end}/${fileSize}`);
+        res.setHeader('Content-Length', parsed.contentLength);
+
+        stream = fs.createReadStream(fileRecord.path, { start: parsed.start, end: parsed.end });
       }
+    }
 
-      const chunkSize = end - start + 1;
-      res.status(206);
-      res.setHeader('Content-Range', `bytes ${start}-${end}/${fileSize}`);
-      res.setHeader('Content-Length', chunkSize);
-
-      const stream = fs.createReadStream(fileRecord.path, { start, end });
-      stream.on('error', (err) => next(err));
-      stream.pipe(res);
-    } else {
+    if (!stream) {
       res.status(200);
       res.setHeader('Content-Length', fileSize);
-
-      const stream = fs.createReadStream(fileRecord.path);
-      stream.on('error', (err) => next(err));
-      stream.pipe(res);
+      stream = fs.createReadStream(fileRecord.path);
     }
+
+    res.on('close', () => {
+      stream.destroy();
+    });
+
+    stream.on('error', (err) => {
+      if (!res.headersSent) {
+        next(err);
+      } else {
+        res.destroy(err);
+      }
+    });
+
+    stream.pipe(res);
   } catch (error) {
     next(error);
   }
@@ -226,26 +389,28 @@ transferRouter.get('/api/thumbnail/:fileId', (req, res) => {
  * Simple upload endpoint for single/multiple files (<100MB).
  */
 transferRouter.post('/api/upload', parseSimpleUpload, async (req, res, next) => {
+  const runtime = req.app.locals.runtime;
   try {
     const files = req.files || [];
     if (files.length === 0) {
       throw new AppError('NO_FILES_UPLOADED', 400, 'No files provided in upload');
     }
 
-    // Sender attribution is observed by the server; the claimed name is a label only.
-    const sender = describeSender(req);
+    // Sender attribution is strictly verified against active connection and remote IP
+    const sender = resolveSender(req);
 
     const uploaded = [];
     const pending = [];
     const wss = req.app.get('wss');
 
     for (const f of files) {
-      const record = req.app.locals.runtime.pendingUploadManager.createPending({
+      const record = runtime.pendingUploadManager.createPending({
         fileName: f.originalname || f.filename,
         fileSize: f.size,
         mimeType: f.mimetype,
         tempPath: f.path,
         sender,
+        quotaAlreadyReserved: true,
       });
 
       uploaded.push({
@@ -265,6 +430,16 @@ transferRouter.post('/api/upload', parseSimpleUpload, async (req, res, next) => 
       data: { uploaded, pending },
     });
   } catch (error) {
+    if (req.files && Array.isArray(req.files)) {
+      for (const f of req.files) {
+        try {
+          if (fs.existsSync(f.path)) await fs.promises.unlink(f.path);
+        } catch {
+          // ignore unlink failure
+        }
+        if (runtime.quotaTracker) runtime.quotaTracker.release(f.size);
+      }
+    }
     next(error);
   }
 });
@@ -275,12 +450,29 @@ transferRouter.post('/api/upload', parseSimpleUpload, async (req, res, next) => 
  */
 transferRouter.post('/api/upload/init', async (req, res, next) => {
   try {
-    const { fileName, fileSize, mimeType } = req.body || {};
-    const result = await req.app.locals.runtime.chunkedUploadManager.initUpload({
+    const runtime = req.app.locals.runtime;
+    if (runtime.getActiveTransferCount() >= runtime.config.maxConcurrentTransfers) {
+      throw new AppError(
+        'TOO_MANY_TRANSFERS',
+        429,
+        `Maximum concurrent transfers (${runtime.config.maxConcurrentTransfers}) reached. Try again later.`
+      );
+    }
+
+    const sender = resolveSender(req);
+
+    const { fileName, fileSize, mimeType, checksum } = req.body || {};
+    const result = await runtime.chunkedUploadManager.initUpload({
       fileName,
       fileSize,
       mimeType,
+      checksum,
     });
+
+    const session = runtime.chunkedUploadManager.sessions.get(result.uploadId);
+    if (session) {
+      session.sender = sender;
+    }
 
     res.json({
       success: true,
@@ -297,10 +489,15 @@ transferRouter.post('/api/upload/init', async (req, res, next) => {
  */
 transferRouter.post('/api/upload/chunk', parseChunkUpload, async (req, res, next) => {
   try {
-    const { uploadId, chunkIndex } = req.body || {};
+    const { uploadId, chunkIndex, checksum } = req.body || {};
 
-    if (!uploadId || chunkIndex === undefined) {
+    if (!uploadId || chunkIndex === undefined || chunkIndex === null || chunkIndex === '') {
       throw new AppError('INVALID_INPUT', 400, 'uploadId and chunkIndex are required');
+    }
+
+    const idx = Number(chunkIndex);
+    if (!Number.isInteger(idx) || idx < 0) {
+      throw new AppError('INVALID_INPUT', 400, 'chunkIndex must be a non-negative integer');
     }
 
     if (!req.file || !req.file.buffer) {
@@ -318,8 +515,9 @@ transferRouter.post('/api/upload/chunk', parseChunkUpload, async (req, res, next
 
     const result = await runtime.chunkedUploadManager.addChunk(
       uploadId,
-      parseInt(chunkIndex, 10),
-      req.file.buffer
+      idx,
+      req.file.buffer,
+      checksum
     );
 
     res.json({
@@ -350,6 +548,27 @@ transferRouter.get('/api/upload/status/:uploadId', (req, res, next) => {
 });
 
 /**
+ * POST /api/upload/cancel
+ * Client cancels an active chunked upload session and cleans up temporary chunks.
+ */
+transferRouter.post('/api/upload/cancel', async (req, res, next) => {
+  try {
+    const { uploadId } = req.body || {};
+    if (!uploadId) {
+      throw new AppError('INVALID_INPUT', 400, 'uploadId is required');
+    }
+
+    const cancelled = await req.app.locals.runtime.chunkedUploadManager.cancelUpload(uploadId);
+    res.json({
+      success: true,
+      data: { uploadId, cancelled },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
  * POST /api/upload/complete
  * Merges all uploaded chunks into the pending staging file awaiting approval.
  */
@@ -361,11 +580,43 @@ transferRouter.post('/api/upload/complete', async (req, res, next) => {
     }
 
     const runtime = req.app.locals.runtime;
+    const existingOutcome = runtime.chunkedUploadManager.getCompletedOutcome(uploadId);
+    if (existingOutcome && existingOutcome.pending) {
+      return res.json({
+        success: true,
+        data: {
+          fileName: existingOutcome.fileName,
+          size: existingOutcome.size,
+          duration: existingOutcome.duration,
+          averageSpeed: existingOutcome.averageSpeed,
+          pending: existingOutcome.pending,
+          transferId: existingOutcome.transferId,
+        },
+      });
+    }
+
     const pendingDir = path.join(runtime.config.tempDir, 'pending');
     const result = await runtime.chunkedUploadManager.complete(uploadId, pendingDir);
+    if (result.pending) {
+      return res.json({
+        success: true,
+        data: {
+          fileName: result.fileName,
+          size: result.size,
+          duration: result.duration,
+          averageSpeed: result.averageSpeed,
+          pending: result.pending,
+          transferId: result.transferId,
+        },
+      });
+    }
 
-    // Sender attribution is observed by the server; the claimed name is a label only.
-    const sender = describeSender(req);
+    let sender;
+    if (req.headers['x-connection-id'] || req.body?.connectionId) {
+      sender = resolveSender(req);
+    } else {
+      sender = result.sender || resolveSender(req);
+    }
 
     const record = runtime.pendingUploadManager.createPending({
       fileName: result.fileName,
@@ -373,7 +624,20 @@ transferRouter.post('/api/upload/complete', async (req, res, next) => {
       mimeType: result.mimeType || 'application/octet-stream',
       tempPath: result.filePath,
       sender,
+      quotaAlreadyReserved: true,
     });
+
+    const outcomeData = {
+      fileName: result.fileName,
+      size: result.size,
+      duration: result.duration,
+      averageSpeed: result.averageSpeed,
+      pending: record,
+      transferId: record.transferId,
+      filePath: result.filePath,
+    };
+
+    runtime.chunkedUploadManager.recordCompletedOutcome(uploadId, outcomeData);
 
     const wss = req.app.get('wss');
     if (wss) {
@@ -383,12 +647,12 @@ transferRouter.post('/api/upload/complete', async (req, res, next) => {
     res.json({
       success: true,
       data: {
-        fileName: result.fileName,
-        size: result.size,
-        duration: result.duration,
-        averageSpeed: result.averageSpeed,
-        pending: record,
-        transferId: record.transferId,
+        fileName: outcomeData.fileName,
+        size: outcomeData.size,
+        duration: outcomeData.duration,
+        averageSpeed: outcomeData.averageSpeed,
+        pending: outcomeData.pending,
+        transferId: outcomeData.transferId,
       },
     });
   } catch (error) {
@@ -408,6 +672,23 @@ transferRouter.get('/api/upload/pending', requireHost, (req, res) => {
 });
 
 /**
+ * GET /api/upload/pending/:transferId
+ * Returns the status or outcome of a specific transfer (pending, completed, rejected, expired).
+ */
+transferRouter.get('/api/upload/pending/:transferId', (req, res) => {
+  const status = req.app.locals.runtime.pendingUploadManager.getTransferStatus(
+    req.params.transferId
+  );
+  if (!status) {
+    throw new AppError('TRANSFER_NOT_FOUND', 404, `Transfer ${req.params.transferId} not found`);
+  }
+  res.json({
+    success: true,
+    data: status,
+  });
+});
+
+/**
  * POST /api/upload/decision
  * PC user accepts or declines a pending upload.
  */
@@ -418,16 +699,24 @@ transferRouter.post('/api/upload/decision', requireHost, async (req, res, next) 
       throw new AppError('INVALID_INPUT', 400, 'transferId and action are required');
     }
 
+    const runtime = req.app.locals.runtime;
     const wss = req.app.get('wss');
+    const record = runtime.pendingUploadManager.getTransferRecord(transferId);
+    const sender = record?.sender || null;
 
     if (action === 'accept') {
-      const accepted = await req.app.locals.runtime.pendingUploadManager.accept(transferId);
+      const accepted = await runtime.pendingUploadManager.accept(transferId);
       if (wss) {
-        broadcastEvent(wss, 'transfer:complete', {
-          transferId,
-          fileName: accepted.fileName,
-          size: accepted.size,
-        });
+        sendTransferTerminalEvent(
+          wss,
+          'transfer:complete',
+          {
+            transferId,
+            fileName: accepted.fileName,
+            size: accepted.size,
+          },
+          sender
+        );
       }
       return res.json({
         success: true,
@@ -436,12 +725,17 @@ transferRouter.post('/api/upload/decision', requireHost, async (req, res, next) 
     }
 
     if (action === 'decline') {
-      const declined = await req.app.locals.runtime.pendingUploadManager.decline(transferId);
+      const declined = await runtime.pendingUploadManager.decline(transferId);
       if (wss) {
-        broadcastEvent(wss, 'transfer:rejected', {
-          transferId,
-          reason: 'REJECTED_BY_PC',
-        });
+        sendTransferTerminalEvent(
+          wss,
+          'transfer:rejected',
+          {
+            transferId,
+            reason: 'REJECTED_BY_PC',
+          },
+          sender
+        );
       }
       return res.json({
         success: true,

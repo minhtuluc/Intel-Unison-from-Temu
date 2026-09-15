@@ -91,6 +91,9 @@ class App {
       const json = await res.json();
       if (json.success && json.data) {
         this.serverInfo = json.data;
+        if (json.data.maxConcurrentTransfers) {
+          transferEngine.maxConcurrent = json.data.maxConcurrentTransfers;
+        }
         const nameEl = document.getElementById('header-server-name');
         if (nameEl) {
           nameEl.textContent = `${json.data.serverName} (${json.data.ip})`;
@@ -875,6 +878,7 @@ class App {
         if (status === 'CONNECTED') {
           dot.classList.add('connection-dot--connected');
           text.textContent = 'Online';
+          transferEngine.reconcileAwaitingTransfers();
         } else if (status === 'RECONNECTING') {
           dot.classList.add('connection-dot--reconnecting');
           text.textContent = 'Reconnecting';
@@ -947,6 +951,10 @@ class App {
       this.isHost = data?.device?.isHost === true;
       // Server-issued identity for this connection; used only to flag "This Device".
       this.localDeviceId = data?.device?.id || this.localDeviceId;
+      if (data?.connectionId) {
+        window.utransConnectionId = data.connectionId;
+        transferEngine.connectionId = data.connectionId;
+      }
       this._loadPendingApprovals();
     });
 
@@ -968,6 +976,14 @@ class App {
 
     connection.on('transfer:rejected', (data) => {
       transferEngine.handleWebSocketEvent('transfer:rejected', data);
+      if (this.isHost) {
+        closeModal();
+        this._loadPendingApprovals();
+      }
+    });
+
+    connection.on('transfer:expired', (data) => {
+      transferEngine.handleWebSocketEvent('transfer:expired', data);
       if (this.isHost) {
         closeModal();
         this._loadPendingApprovals();

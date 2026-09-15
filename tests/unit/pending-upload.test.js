@@ -159,4 +159,81 @@ describe('PendingUploadService (Unit)', () => {
     assert.equal(fs.existsSync(tempFile), false, 'Temp file should be deleted on TTL expiry');
     assert.equal(service.getPending(pending.transferId), null);
   });
+
+  it('preserves pending record and temp file when move fails (transactional accept for retry)', async () => {
+    // Point uploadDir to a regular file so mkdir/atomicMove fails
+    const blockerFile = path.join(testTempDir, 'blocked_dir');
+    await fs.promises.writeFile(blockerFile, 'BLOCKER');
+
+    const failingService = new PendingUploadService({
+      config: {
+        uploadDir: path.join(blockerFile, 'sub'), // Cannot create directory inside regular file
+        tempDir: testTempDir,
+      },
+    });
+
+    const tempFile = path.join(testTempDir, 'retryable.txt');
+    await fs.promises.writeFile(tempFile, 'RETRYABLE_CONTENT');
+
+    const pending = failingService.createPending({
+      fileName: 'retryable.txt',
+      fileSize: 17,
+      tempPath: tempFile,
+      ttlMs: 60000,
+    });
+
+    // Accept should throw because destination directory cannot be created
+    await assert.rejects(async () => {
+      await failingService.accept(pending.transferId);
+    });
+
+    // Record MUST still exist in pending map and temp file must be intact!
+    assert.ok(failingService.getPending(pending.transferId));
+    assert.ok(fs.existsSync(tempFile), 'Temporary file must be kept for retry');
+  });
+
+  it('rejects concurrent accept calls on the same transferId with 409 TRANSFER_IN_PROGRESS', async () => {
+    const tempFile = path.join(testTempDir, 'concurrent.bin');
+    await fs.promises.writeFile(tempFile, 'CONCURRENT_TEST');
+
+    const pending = service.createPending({
+      fileName: 'concurrent.bin',
+      fileSize: 15,
+      tempPath: tempFile,
+    });
+
+    // Run two accepts simultaneously
+    const p1 = service.accept(pending.transferId);
+    const p2 = service.accept(pending.transferId);
+
+    const results = await Promise.allSettled([p1, p2]);
+    const fulfilled = results.filter((r) => r.status === 'fulfilled');
+    const rejected = results.filter((r) => r.status === 'rejected');
+
+    assert.equal(fulfilled.length, 1);
+    assert.equal(rejected.length, 1);
+    assert.equal(rejected[0].reason.statusCode, 409);
+    assert.equal(rejected[0].reason.code, 'TRANSFER_IN_PROGRESS');
+  });
+
+  it('should sweep orphaned pending files in tempDir/pending', async () => {
+    const pendingDir = path.join(testTempDir, 'pending');
+    await fs.promises.mkdir(pendingDir, { recursive: true });
+
+    const orphanFile = path.join(pendingDir, 'orphan_pending.bin');
+    await fs.promises.writeFile(orphanFile, 'abandoned pending');
+
+    const activeTemp = path.join(pendingDir, 'active_pending.bin');
+    await fs.promises.writeFile(activeTemp, 'active pending');
+    service.createPending({
+      fileName: 'active.bin',
+      fileSize: 14,
+      tempPath: activeTemp,
+    });
+
+    await service.sweepOrphans(0);
+
+    assert.equal(fs.existsSync(orphanFile), false, 'Orphaned pending file should be swept');
+    assert.equal(fs.existsSync(activeTemp), true, 'Tracked pending file must be preserved');
+  });
 });

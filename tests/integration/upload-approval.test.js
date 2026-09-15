@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import crypto from 'node:crypto';
+import WebSocket from 'ws';
 import { startServer } from '../../src/server.js';
 
 describe('Upload Approval & Decision Integration Tests', () => {
@@ -153,6 +155,7 @@ describe('Upload Approval & Decision Integration Tests', () => {
 
     try {
       const chunkData = Buffer.from('Chunked_Payload_Data_123456'); // 27 bytes -> 2 chunks
+      const checksum = crypto.createHash('sha256').update(chunkData).digest('hex');
       const initRes = await fetch(`${baseUrl}/api/upload/init`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -160,6 +163,7 @@ describe('Upload Approval & Decision Integration Tests', () => {
           fileName: 'large_recording.mp4',
           fileSize: chunkData.length,
           mimeType: 'video/mp4',
+          checksum,
         }),
       });
 
@@ -211,5 +215,64 @@ describe('Upload Approval & Decision Integration Tests', () => {
     } finally {
       runtime.config.chunkSize = origChunkSize;
     }
+  });
+
+  it('should broadcast terminal event on TTL expiry and record outcome', async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${serverInstance.server.address().port}/ws`);
+    const receivedEvents = [];
+    ws.on('message', (raw) => {
+      try {
+        receivedEvents.push(JSON.parse(raw));
+      } catch {
+        // ignore
+      }
+    });
+    await new Promise((resolve) => ws.on('open', resolve));
+
+    ws.send(
+      JSON.stringify({
+        event: 'client:register',
+        data: { deviceName: 'TTL Observer', platform: 'linux' },
+      })
+    );
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    const tempFile = path.join(tempDir, 'short_ttl.tmp');
+    await fs.promises.writeFile(tempFile, 'TTL test data');
+    const record = runtime.pendingUploadManager.createPending({
+      fileName: 'short_ttl.txt',
+      fileSize: 13,
+      mimeType: 'text/plain',
+      tempPath: tempFile,
+      ttlMs: 150,
+    });
+
+    const statusPending = await fetch(`${baseUrl}/api/upload/pending/${record.transferId}`);
+    assert.equal(statusPending.status, 200);
+    const pendingJson = await statusPending.json();
+    assert.equal(pendingJson.data.status, 'pending');
+
+    // Wait for TTL to expire (250ms)
+    await new Promise((resolve) => setTimeout(resolve, 250));
+
+    // Verify temp file deleted on disk
+    assert.equal(fs.existsSync(tempFile), false);
+
+    // Verify endpoint returns expired outcome
+    const statusExpired = await fetch(`${baseUrl}/api/upload/pending/${record.transferId}`);
+    assert.equal(statusExpired.status, 200);
+    const expiredJson = await statusExpired.json();
+    assert.equal(expiredJson.data.status, 'expired');
+    assert.equal(expiredJson.data.reason, 'TIMEOUT');
+
+    // Verify WebSocket broadcast
+    const hasTimeoutEvent = receivedEvents.some(
+      (e) =>
+        (e.event === 'transfer:rejected' && e.data?.reason === 'TIMEOUT') ||
+        e.event === 'transfer:expired'
+    );
+    assert.ok(hasTimeoutEvent, 'Expected timeout/expiry event broadcast over WS');
+
+    ws.close();
   });
 });

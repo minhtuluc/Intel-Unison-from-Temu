@@ -34,4 +34,6 @@ local-downloads/
 
 # Internal agent documentation & planning files (local only)
 .agents/
+.claude/
+.commandcode/
 implementation_plan.md

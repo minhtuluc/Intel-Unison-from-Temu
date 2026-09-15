@@ -24,9 +24,10 @@ export class ShareManager {
    * Adds a single file to the staging area.
    * @param {string} filePath - Absolute or relative path to file
    * @param {string} [customName] - Optional custom display name
+   * @param {boolean} [isTemp] - True if file is temporary upload (cleaned up on unshare)
    * @returns {Promise<object>} Public file metadata
    */
-  async addFile(filePath, customName = null) {
+  async addFile(filePath, customName = null, isTemp = false) {
     if (!filePath || typeof filePath !== 'string') {
       throw new AppError('INVALID_PATH', 400, 'File path must be a non-empty string');
     }
@@ -83,6 +84,7 @@ export class ShareManager {
       sizeFormatted: formatFileSize(stat.size),
       mimeType,
       type,
+      isTemp: Boolean(isTemp),
       sharedAt: new Date().toISOString(),
       hasThumbnail: false,
     };
@@ -163,6 +165,8 @@ export class ShareManager {
 
   /**
    * Removes a file from the staging area.
+   * If the file was a temporary upload (isTemp), deletes it from disk.
+   * Source files are never deleted from disk.
    * @param {string} fileId
    * @returns {boolean} True if removed, false if not found
    */
@@ -175,6 +179,9 @@ export class ShareManager {
     this.stagedFiles.delete(fileId);
     if (file && file.path) {
       this.pathToId.delete(file.path);
+      if (file.isTemp) {
+        fs.promises.unlink(file.path).catch(() => {});
+      }
     }
 
     logger.info('File removed from staging', { fileId, name: file?.name });
@@ -208,11 +215,80 @@ export class ShareManager {
 
   /**
    * Clears all files from the staging area.
+   * Unlinks any temporary files owned by staging; source files are preserved.
    */
   clear() {
+    for (const file of this.stagedFiles.values()) {
+      if (file.isTemp && file.path) {
+        fs.promises.unlink(file.path).catch(() => {});
+      }
+    }
     this.stagedFiles.clear();
     this.pathToId.clear();
     logger.info('Staging area cleared');
+  }
+
+  /**
+   * Sweeps abandoned temporary files in staging directory that are not tracked in this.stagedFiles.
+   * @param {string} tempDir
+   * @param {number} [olderThanMs] Defaults to 1 hour
+   */
+  async sweepOrphans(tempDir, olderThanMs = 3600000) {
+    if (!tempDir) return;
+    const stagingDir = path.join(tempDir, 'staging');
+    try {
+      const entries = await fs.promises.readdir(stagingDir, { withFileTypes: true });
+      const activePaths = new Set();
+      for (const f of this.stagedFiles.values()) {
+        if (!f.path) continue;
+        const p = path.resolve(f.path);
+        activePaths.add(p);
+        if (process.platform === 'win32') {
+          activePaths.add(p.toLowerCase());
+        }
+        try {
+          const real = await fs.promises.realpath(p);
+          activePaths.add(real);
+          if (process.platform === 'win32') {
+            activePaths.add(real.toLowerCase());
+          }
+        } catch {
+          // Ignore if realpath fails
+        }
+      }
+
+      for (const entry of entries) {
+        if (!entry.isFile()) continue;
+        const fullPath = path.join(stagingDir, entry.name);
+        let realFullPath = fullPath;
+        try {
+          realFullPath = await fs.promises.realpath(fullPath);
+        } catch {
+          // Fallback to fullPath
+        }
+
+        const isTracked =
+          activePaths.has(fullPath) ||
+          activePaths.has(realFullPath) ||
+          (process.platform === 'win32' &&
+            (activePaths.has(fullPath.toLowerCase()) ||
+              activePaths.has(realFullPath.toLowerCase())));
+
+        if (!isTracked) {
+          try {
+            const stat = await fs.promises.stat(fullPath);
+            if (olderThanMs <= 0 || Date.now() - stat.mtimeMs >= olderThanMs) {
+              await fs.promises.unlink(fullPath);
+              logger.info('Swept orphaned staging file', { file: entry.name });
+            }
+          } catch {
+            // Ignore individual file error
+          }
+        }
+      }
+    } catch {
+      // Ignore if stagingDir does not exist yet
+    }
   }
 
   /**

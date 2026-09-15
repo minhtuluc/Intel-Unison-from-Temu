@@ -72,4 +72,131 @@ describe('Error Handler & AppError', () => {
     assert.equal(responseBody.error.code, 'SERVER_ERROR');
     assert.equal(responseBody.error.message, 'Internal Server Error');
   });
+
+  it('delegates to next(err) if headers have already been sent to avoid double-send crash', () => {
+    const error = new Error('Stream error after headers');
+    let nextCalledWith = null;
+    let statusCalled = false;
+
+    const mockRes = {
+      headersSent: true,
+      status() {
+        statusCalled = true;
+        return this;
+      },
+      json() {},
+    };
+
+    errorHandler(error, { originalUrl: '/api/download/123' }, mockRes, (err) => {
+      nextCalledWith = err;
+    });
+
+    assert.equal(nextCalledWith, error);
+    assert.equal(statusCalled, false);
+  });
+
+  it('maps body-parser JSON syntax error to 400 INVALID_JSON', () => {
+    const syntaxErr = new SyntaxError('Unexpected token } in JSON at position 12');
+    syntaxErr.status = 400;
+
+    let responseStatus = 0;
+    let responseBody = null;
+    const mockRes = {
+      status(code) {
+        responseStatus = code;
+        return this;
+      },
+      json(body) {
+        responseBody = body;
+        return this;
+      },
+    };
+
+    errorHandler(syntaxErr, { originalUrl: '/api/share' }, mockRes, () => {});
+
+    assert.equal(responseStatus, 400);
+    assert.equal(responseBody.success, false);
+    assert.equal(responseBody.error.code, 'INVALID_JSON');
+    assert.equal(responseBody.error.message, 'Malformed JSON body in request');
+  });
+
+  it('maps Multer LIMIT_FILE_SIZE to 413 FILE_TOO_LARGE', () => {
+    const multerErr = new Error('File too large');
+    multerErr.name = 'MulterError';
+    multerErr.code = 'LIMIT_FILE_SIZE';
+
+    let responseStatus = 0;
+    let responseBody = null;
+    const mockRes = {
+      status(code) {
+        responseStatus = code;
+        return this;
+      },
+      json(body) {
+        responseBody = body;
+        return this;
+      },
+    };
+
+    errorHandler(multerErr, { originalUrl: '/api/upload' }, mockRes, () => {});
+
+    assert.equal(responseStatus, 413);
+    assert.equal(responseBody.success, false);
+    assert.equal(responseBody.error.code, 'FILE_TOO_LARGE');
+  });
+
+  it('maps other Multer errors to 400 UNEXPECTED_FIELD or MULTIPART_ERROR', () => {
+    const unexpectedErr = new Error('Unexpected field');
+    unexpectedErr.name = 'MulterError';
+    unexpectedErr.code = 'LIMIT_UNEXPECTED_FILE';
+
+    let responseStatus = 0;
+    let responseBody = null;
+    const mockRes = {
+      status(code) {
+        responseStatus = code;
+        return this;
+      },
+      json(body) {
+        responseBody = body;
+        return this;
+      },
+    };
+
+    errorHandler(unexpectedErr, { originalUrl: '/api/upload' }, mockRes, () => {});
+
+    assert.equal(responseStatus, 400);
+    assert.equal(responseBody.error.code, 'UNEXPECTED_FIELD');
+
+    const genericMulterErr = new Error('Too many parts');
+    genericMulterErr.name = 'MulterError';
+    genericMulterErr.code = 'LIMIT_PART_COUNT';
+
+    errorHandler(genericMulterErr, { originalUrl: '/api/upload' }, mockRes, () => {});
+    assert.equal(responseStatus, 400);
+    assert.equal(responseBody.error.code, 'MULTIPART_ERROR');
+  });
+
+  it('maps entity.too.large error to 413 PAYLOAD_TOO_LARGE', () => {
+    const payloadErr = new Error('request entity too large');
+    payloadErr.status = 413;
+
+    let responseStatus = 0;
+    let responseBody = null;
+    const mockRes = {
+      status(code) {
+        responseStatus = code;
+        return this;
+      },
+      json(body) {
+        responseBody = body;
+        return this;
+      },
+    };
+
+    errorHandler(payloadErr, { originalUrl: '/api/upload' }, mockRes, () => {});
+
+    assert.equal(responseStatus, 413);
+    assert.equal(responseBody.error.code, 'PAYLOAD_TOO_LARGE');
+  });
 });

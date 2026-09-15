@@ -7,13 +7,15 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { AppError } from '../middleware/error-handler.js';
 
 export class DiscoveryService {
-  constructor() {
-    /** @type {Map<string, object>} deviceId (server-issued) -> device record */
+  constructor(options = {}) {
+    /** @type {Map<string, object>} deviceId -> device record */
     this.devices = new Map();
     /** @type {Map<string, string>} connectionId -> deviceId */
     this.connections = new Map();
+    this.maxConnectedDevices = Number(options.maxConnectedDevices || 20);
   }
 
   /**
@@ -34,6 +36,14 @@ export class DiscoveryService {
       existing.isHost = Boolean(info.isHost);
       existing.lastSeen = now;
       return { ...existing };
+    }
+
+    if (!info.isHost && this.devices.size >= this.maxConnectedDevices) {
+      throw new AppError(
+        'TOO_MANY_DEVICES',
+        429,
+        `Maximum connected devices (${this.maxConnectedDevices}) reached`
+      );
     }
 
     const device = {
@@ -82,7 +92,9 @@ export class DiscoveryService {
   }
 
   getDevices() {
-    return Array.from(this.devices.values()).map((device) => ({ ...device }));
+    return Array.from(this.devices.values()).map(({ connectionId: _c, ...device }) => ({
+      ...device,
+    }));
   }
 
   clear() {
