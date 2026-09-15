@@ -1,5 +1,36 @@
 # Review M2 — Reliable transfer
 
+## Review vòng 4 — commit `8fc3e4c` (2026-09-15)
+
+### Kết luận: Request changes
+
+R11 đã được sửa đúng bằng exclusive file reservation và regression kiểm tra đủ path/hash. R12 cũng chặn đúng client B dùng session B cùng connection ID của A, đồng thời assertion leak đã trỏ đúng schema `data.device.connectionId`. Tuy nhiên nhánh bypass dành cho host gọi sai API của authority, làm upload từ chính giao diện host trả 500. Vì đây là regression P1 trên luồng core, commit hiện tại chưa đủ điều kiện merge.
+
+### R13 — P1 / UT-004: host upload có connection ID luôn rơi vào 500
+
+Vị trí: `src/routes/transfer.js:51-55`; authority thật tại `src/middleware/host-auth.js:8-26`.
+
+`resolveSender()` gọi `hostAuth?.validate(hostToken)`, nhưng `createHostAuth()` chỉ cung cấp `verify(req, candidate)`. Khi frontend host gửi `X-Host-Token` cùng `X-Connection-Id`, biểu thức này gọi một method không tồn tại và ném `TypeError`. Lỗi xảy ra trước phần kiểm tra PIN nên ảnh hưởng cả cấu hình bật lẫn tắt PIN.
+
+Probe HTTP/WS production đã đăng ký socket host bằng capability thật, sau đó multipart upload đúng như `TransferEngine`: server trả `500 SERVER_ERROR`; log chỉ thẳng `hostAuth?.validate is not a function` tại `transfer.js:54`. Simple upload đã ghi payload tạm rồi mới gặp lỗi; catch hiện dọn lại file/quota, nhưng hành vi người dùng vẫn thất bại hoàn toàn. Chunked init đi qua cùng `resolveSender()` nên có cùng regression.
+
+Yêu cầu sửa: dùng đúng `hostAuth.verify(req, hostToken)` để giữ toàn bộ kiểm tra capability, loopback và Origin; không tạo một API `validate()` yếu hơn chỉ so token. Regression phải dùng host WebSocket đã đăng ký và request HTTP có cả host token/connection ID, bao phủ simple upload và chunked init/complete, với PIN bật và ít nhất một ca PIN tắt. Đồng thời giữ negative test client không thể dùng host token giả để bypass session binding.
+
+### Bằng chứng vòng 4
+
+- Commit review: `8fc3e4c`; thay đổi so với báo cáo vòng 3 gồm 3 file, +336/-93 dòng.
+- `npm run quality`: lint/format pass; 289/289 test pass, 88 suite, không fail/cancel/skip/todo. Coverage: 88,17% line / 79,97% branch / 84,79% function.
+- `git diff --check bb5b3d9..8fc3e4c`: pass.
+- Probe host thật dùng runtime, HTTP multipart và WebSocket production: response `500`; fixture temp riêng đã cleanup.
+- `REPORT-ROADMAP.md` đang tuyên bố đã giải quyết toàn bộ R1–R12 trong khi hàng UT-007 vẫn ghi `in-progress (M2)`. Chỉ đồng bộ trạng thái `done` sau khi R13 pass và acceptance UT-007 thực sự được nghiệm thu.
+- Chưa xác minh: GitHub Actions, Linux local, browser/device thật, payload nhiều GiB, ENOSPC/EACCES thật và installer.
+
+### Điều kiện review vòng 5
+
+Sửa R13 trên cùng nhánh, thêm regression host qua HTTP/WS production seam và giữ toàn bộ 289 test hiện tại. Không merge M2 khi host upload vẫn trả 500.
+
+---
+
 ## Review vòng 3 — commit `526e8ef` (2026-09-15)
 
 ### Kết luận: Request changes
