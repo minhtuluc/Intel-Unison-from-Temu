@@ -27,12 +27,46 @@ export class AppError extends Error {
  * Express error handling middleware.
  * Formats all errors into standard JSON API response.
  */
-export function errorHandler(err, req, res, _next) {
-  const isOperational = err instanceof AppError && err.isOperational;
-  const statusCode = isOperational ? err.statusCode : 500;
-  const code = isOperational ? err.code : 'SERVER_ERROR';
-  const message = isOperational ? err.message : 'Internal Server Error';
+export function errorHandler(err, req, res, next) {
+  if (res.headersSent) {
+    return next(err);
+  }
+
+  let isOperational = err instanceof AppError && err.isOperational;
+  let statusCode = isOperational ? err.statusCode : 500;
+  let code = isOperational ? err.code : 'SERVER_ERROR';
+  let message = isOperational ? err.message : 'Internal Server Error';
   const details = isOperational ? err.details : {};
+
+  // Map known client parsing / transport errors to structured operational errors
+  if (!isOperational) {
+    if (err instanceof SyntaxError && (err.status === 400 || err.type === 'entity.parse.failed')) {
+      isOperational = true;
+      statusCode = 400;
+      code = 'INVALID_JSON';
+      message = 'Malformed JSON body in request';
+    } else if (err.name === 'MulterError') {
+      isOperational = true;
+      if (err.code === 'LIMIT_FILE_SIZE') {
+        statusCode = 413;
+        code = 'FILE_TOO_LARGE';
+        message = err.message || 'File exceeds maximum allowed size';
+      } else if (err.code === 'LIMIT_UNEXPECTED_FILE') {
+        statusCode = 400;
+        code = 'UNEXPECTED_FIELD';
+        message = err.message || 'Unexpected field in upload';
+      } else {
+        statusCode = 400;
+        code = 'MULTIPART_ERROR';
+        message = err.message || 'Invalid multipart upload';
+      }
+    } else if (err.status === 413 || err.type === 'entity.too.large') {
+      isOperational = true;
+      statusCode = 413;
+      code = 'PAYLOAD_TOO_LARGE';
+      message = 'Payload exceeds maximum allowed size';
+    }
+  }
 
   if (!isOperational) {
     logger.error('Unhandled server error', {

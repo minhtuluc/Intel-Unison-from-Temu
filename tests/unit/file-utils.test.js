@@ -1,6 +1,11 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { formatFileSize, getFileType, sanitizeFileName } from '../../src/utils/file-utils.js';
+import {
+  formatFileSize,
+  getFileType,
+  sanitizeFileName,
+  parseRange,
+} from '../../src/utils/file-utils.js';
 
 describe('File Utilities', () => {
   describe('formatFileSize()', () => {
@@ -112,11 +117,116 @@ describe('File Utilities', () => {
       assert.ok(sanitized.endsWith('.mp4'));
     });
 
+    it('should truncate multi-byte UTF-8 names so byte length <= 255', () => {
+      // Each Vietnamese character here is 3 bytes in UTF-8
+      const multiByteBase = 'Tiếng_Việt_'.repeat(30);
+      const sanitized = sanitizeFileName(`${multiByteBase}.docx`);
+      assert.ok(Buffer.byteLength(sanitized, 'utf8') <= 255);
+      assert.ok(sanitized.endsWith('.docx'));
+    });
+
+    it('should prefix Windows reserved device names', () => {
+      assert.equal(sanitizeFileName('CON.txt'), '_CON.txt');
+      assert.equal(sanitizeFileName('aux.log'), '_aux.log');
+      assert.equal(sanitizeFileName('PRN'), '_PRN');
+      assert.equal(sanitizeFileName('NUL.tar.gz'), '_NUL.tar.gz');
+      assert.equal(sanitizeFileName('com1.zip'), '_com1.zip');
+      assert.equal(sanitizeFileName('lpt9.bin'), '_lpt9.bin');
+    });
+
+    it('should strip trailing dots and spaces', () => {
+      assert.equal(sanitizeFileName('document.txt...'), 'document.txt');
+      assert.equal(sanitizeFileName('invoice.pdf   '), 'invoice.pdf');
+      assert.equal(sanitizeFileName('my.file . . '), 'my.file');
+    });
+
     it('should provide fallback for empty or completely stripped names', () => {
       assert.equal(sanitizeFileName(''), 'unnamed_file');
       assert.equal(sanitizeFileName(null), 'unnamed_file');
       assert.equal(sanitizeFileName('///'), 'unnamed_file');
       assert.equal(sanitizeFileName('...'), 'unnamed_file');
+      assert.equal(sanitizeFileName('   '), 'unnamed_file');
+    });
+  });
+
+  describe('parseRange()', () => {
+    const FILE_SIZE = 1000;
+
+    it('should parse valid explicit range bytes=start-end', () => {
+      const parsed = parseRange('bytes=100-199', FILE_SIZE);
+      assert.deepEqual(parsed, {
+        satisfiable: true,
+        start: 100,
+        end: 199,
+        contentLength: 100,
+      });
+    });
+
+    it('should parse open-ended range bytes=start-', () => {
+      const parsed = parseRange('bytes=500-', FILE_SIZE);
+      assert.deepEqual(parsed, {
+        satisfiable: true,
+        start: 500,
+        end: 999,
+        contentLength: 500,
+      });
+    });
+
+    it('should parse suffix range bytes=-suffix', () => {
+      const parsed = parseRange('bytes=-200', FILE_SIZE);
+      assert.deepEqual(parsed, {
+        satisfiable: true,
+        start: 800,
+        end: 999,
+        contentLength: 200,
+      });
+    });
+
+    it('should clamp suffix range when suffix >= fileSize', () => {
+      const parsed = parseRange('bytes=-1500', FILE_SIZE);
+      assert.deepEqual(parsed, {
+        satisfiable: true,
+        start: 0,
+        end: 999,
+        contentLength: 1000,
+      });
+    });
+
+    it('should clamp end when end >= fileSize per RFC 9110', () => {
+      const parsed = parseRange('bytes=800-2000', FILE_SIZE);
+      assert.deepEqual(parsed, {
+        satisfiable: true,
+        start: 800,
+        end: 999,
+        contentLength: 200,
+      });
+    });
+
+    it('should return satisfiable: false when start >= fileSize', () => {
+      const parsed = parseRange('bytes=1000-1200', FILE_SIZE);
+      assert.deepEqual(parsed, { satisfiable: false });
+    });
+
+    it('should return satisfiable: false when end < start', () => {
+      const parsed = parseRange('bytes=500-400', FILE_SIZE);
+      assert.deepEqual(parsed, { satisfiable: false });
+    });
+
+    it('should return satisfiable: false for empty files (fileSize === 0)', () => {
+      const parsed = parseRange('bytes=0-0', 0);
+      assert.deepEqual(parsed, { satisfiable: false });
+    });
+
+    it('should return satisfiable: false for multi-range', () => {
+      const parsed = parseRange('bytes=0-10, 20-30', FILE_SIZE);
+      assert.deepEqual(parsed, { satisfiable: false });
+    });
+
+    it('should return null for non-bytes or missing range header', () => {
+      assert.equal(parseRange(null, FILE_SIZE), null);
+      assert.equal(parseRange('', FILE_SIZE), null);
+      assert.equal(parseRange('items=0-10', FILE_SIZE), null);
+      assert.equal(parseRange(undefined, FILE_SIZE), null);
     });
   });
 });

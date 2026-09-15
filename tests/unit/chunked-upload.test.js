@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { ChunkedUploadManager } from '../../src/services/chunked-upload.js';
 
 describe('ChunkedUploadManager Service', () => {
@@ -56,6 +57,25 @@ describe('ChunkedUploadManager Service', () => {
         { code: 'FILE_TOO_LARGE', statusCode: 413 }
       );
     });
+
+    it('should enforce maxSessions limit with 429 TOO_MANY_SESSIONS', async () => {
+      const tinyManager = new ChunkedUploadManager({
+        tempDir: testTempDir,
+        uploadDir: testUploadDir,
+        chunkSize: 1024,
+        maxFileSize: 10 * 1024 * 1024,
+        maxSessions: 2,
+        uploadExpiry: 60000,
+      });
+
+      await tinyManager.initUpload({ fileName: 'file1.bin', fileSize: 1024 });
+      await tinyManager.initUpload({ fileName: 'file2.bin', fileSize: 1024 });
+
+      await assert.rejects(
+        () => tinyManager.initUpload({ fileName: 'file3.bin', fileSize: 1024 }),
+        { code: 'TOO_MANY_SESSIONS', statusCode: 429 }
+      );
+    });
   });
 
   describe('addChunk() & getStatus()', () => {
@@ -100,6 +120,40 @@ describe('ChunkedUploadManager Service', () => {
         statusCode: 410,
       });
     });
+
+    it('should reject chunk when byte length does not match expected size', async () => {
+      const init = await manager.initUpload({
+        fileName: 'transfer.bin',
+        fileSize: 2048, // 2 chunks of 1024
+      });
+
+      // Pass only 500 bytes for chunk 0 when 1024 is expected
+      await assert.rejects(() => manager.addChunk(init.uploadId, 0, Buffer.alloc(500)), {
+        code: 'CHUNK_SIZE_MISMATCH',
+        statusCode: 400,
+      });
+    });
+
+    it('should verify optional SHA-256 chunk checksum when provided', async () => {
+      const init = await manager.initUpload({
+        fileName: 'transfer.bin',
+        fileSize: 1024,
+      });
+
+      const chunkData = Buffer.alloc(1024, 'Z');
+      const correctHash = crypto.createHash('sha256').update(chunkData).digest('hex');
+      const wrongHash = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+
+      // Checksum mismatch
+      await assert.rejects(() => manager.addChunk(init.uploadId, 0, chunkData, wrongHash), {
+        code: 'CHECKSUM_MISMATCH',
+        statusCode: 400,
+      });
+
+      // Correct checksum
+      const res = await manager.addChunk(init.uploadId, 0, chunkData, correctHash);
+      assert.equal(res.chunkIndex, 0);
+    });
   });
 
   describe('complete()', () => {
@@ -132,6 +186,25 @@ describe('ChunkedUploadManager Service', () => {
       await assert.rejects(() => manager.complete(init.uploadId), {
         code: 'CHUNK_MISSING',
         statusCode: 400,
+      });
+    });
+
+    it('should detect file size corruption during complete() and reject with FILE_CORRUPTED', async () => {
+      const init = await manager.initUpload({
+        fileName: 'corrupt.bin',
+        fileSize: 2048,
+      });
+
+      await manager.addChunk(init.uploadId, 0, Buffer.alloc(1024, 'A'));
+      await manager.addChunk(init.uploadId, 1, Buffer.alloc(1024, 'B'));
+
+      // Tamper with chunk_1 on disk to truncate it
+      const chunk1Path = path.join(testTempDir, 'chunks', init.uploadId, 'chunk_1');
+      await fs.promises.writeFile(chunk1Path, Buffer.alloc(500, 'B'));
+
+      await assert.rejects(() => manager.complete(init.uploadId), {
+        code: 'FILE_CORRUPTED',
+        statusCode: 500,
       });
     });
   });

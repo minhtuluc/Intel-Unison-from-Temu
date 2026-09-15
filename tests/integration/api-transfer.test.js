@@ -81,14 +81,72 @@ describe('Integration: API Transfer (Download & Upload)', () => {
       assert.equal(chunkText, 'ABCDEFGHIJ');
     });
 
-    it('should return 416 for invalid range values', async () => {
+    it('should support suffix Range header bytes=-10', async () => {
+      const meta = await runtime.shareManager.addFile(downloadSourceFile);
+
+      // Last 10 bytes of 40-byte file: index 30 to 39
+      const res = await fetch(`${baseUrl}/api/download/${meta.id}`, {
+        headers: { Range: 'bytes=-10' },
+      });
+
+      assert.equal(res.status, 206);
+      assert.equal(res.headers.get('content-range'), `bytes 30-39/${fileContent.length}`);
+      assert.equal(res.headers.get('content-length'), '10');
+      const text = await res.text();
+      assert.equal(text, '!@#$%^&*()');
+    });
+
+    it('should support open-ended Range header bytes=30-', async () => {
       const meta = await runtime.shareManager.addFile(downloadSourceFile);
 
       const res = await fetch(`${baseUrl}/api/download/${meta.id}`, {
-        headers: { Range: 'bytes=500-600' },
+        headers: { Range: 'bytes=30-' },
       });
 
-      assert.equal(res.status, 416);
+      assert.equal(res.status, 206);
+      assert.equal(res.headers.get('content-range'), `bytes 30-39/${fileContent.length}`);
+      assert.equal(res.headers.get('content-length'), '10');
+      const text = await res.text();
+      assert.equal(text, '!@#$%^&*()');
+    });
+
+    it('should clamp end to EOF when requested end >= fileSize', async () => {
+      const meta = await runtime.shareManager.addFile(downloadSourceFile);
+
+      const res = await fetch(`${baseUrl}/api/download/${meta.id}`, {
+        headers: { Range: 'bytes=30-1000' },
+      });
+
+      assert.equal(res.status, 206);
+      assert.equal(res.headers.get('content-range'), `bytes 30-39/${fileContent.length}`);
+      assert.equal(res.headers.get('content-length'), '10');
+      const text = await res.text();
+      assert.equal(text, '!@#$%^&*()');
+    });
+
+    it('should return 416 for invalid range values or inverted ranges', async () => {
+      const meta = await runtime.shareManager.addFile(downloadSourceFile);
+
+      const res1 = await fetch(`${baseUrl}/api/download/${meta.id}`, {
+        headers: { Range: 'bytes=500-600' },
+      });
+      assert.equal(res1.status, 416);
+      assert.equal(res1.headers.get('content-range'), `bytes */${fileContent.length}`);
+
+      const res2 = await fetch(`${baseUrl}/api/download/${meta.id}`, {
+        headers: { Range: 'bytes=30-10' },
+      });
+      assert.equal(res2.status, 416);
+    });
+
+    it('should fallback to 200 full content for malformed or non-bytes range', async () => {
+      const meta = await runtime.shareManager.addFile(downloadSourceFile);
+
+      const res = await fetch(`${baseUrl}/api/download/${meta.id}`, {
+        headers: { Range: 'characters=0-10' },
+      });
+      assert.equal(res.status, 200);
+      assert.equal(await res.text(), fileContent);
     });
   });
 
@@ -123,8 +181,8 @@ describe('Integration: API Transfer (Download & Upload)', () => {
       runtime.config.chunkSize = 20; // 20 bytes per chunk so 38 bytes creates 2 chunks
 
       try {
-        const testChunk1 = Buffer.from('Part1_Payload_Data_'); // 19 bytes
-        const testChunk2 = Buffer.from('Part2_Payload_Data!'); // 19 bytes
+        const testChunk1 = Buffer.from('Part1_Payload_Data__'); // 20 bytes (chunk 0)
+        const testChunk2 = Buffer.from('Part2_Payload_Data'); // 18 bytes (chunk 1 - terminal)
         const totalSize = testChunk1.length + testChunk2.length;
 
         // 1. Init

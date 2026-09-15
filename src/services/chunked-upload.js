@@ -6,6 +6,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { pipeline } from 'node:stream/promises';
 import { DEFAULT_CONFIG } from '../config.js';
 import { generateUploadId } from '../utils/id-generator.js';
@@ -27,6 +28,17 @@ export class ChunkedUploadManager {
    * @returns {Promise<{ uploadId: string, chunkSize: number, totalChunks: number, expiresAt: string }>}
    */
   async initUpload({ fileName, fileSize, mimeType = null }) {
+    await this.cleanup();
+
+    const maxSessions = this.config.maxSessions || 64;
+    if (this.sessions.size >= maxSessions) {
+      throw new AppError(
+        'TOO_MANY_SESSIONS',
+        429,
+        `Maximum concurrent upload sessions (${maxSessions}) reached. Try again later.`
+      );
+    }
+
     if (!fileName || typeof fileName !== 'string') {
       throw new AppError('INVALID_INPUT', 400, 'fileName must be provided');
     }
@@ -88,9 +100,10 @@ export class ChunkedUploadManager {
    * @param {string} uploadId
    * @param {number} chunkIndex
    * @param {Buffer} chunkBuffer
+   * @param {string} [checksum] Optional SHA-256 hex digest
    * @returns {Promise<{ chunkIndex: number, receivedChunks: number, totalChunks: number, progress: number }>}
    */
-  async addChunk(uploadId, chunkIndex, chunkBuffer) {
+  async addChunk(uploadId, chunkIndex, chunkBuffer, checksum = null) {
     const session = this.sessions.get(uploadId);
     if (!session) {
       throw new AppError('UPLOAD_EXPIRED', 410, 'Upload session not found or has expired');
@@ -107,6 +120,28 @@ export class ChunkedUploadManager {
 
     if (!chunkBuffer || !Buffer.isBuffer(chunkBuffer) || chunkBuffer.length === 0) {
       throw new AppError('CHUNK_INVALID', 400, 'Chunk data is empty or invalid');
+    }
+
+    // Verify chunk byte length against expected slice size
+    const isLastChunk = idx === session.totalChunks - 1;
+    const expectedSize = isLastChunk
+      ? session.fileSize - (session.totalChunks - 1) * session.chunkSize
+      : session.chunkSize;
+
+    if (chunkBuffer.length !== expectedSize) {
+      throw new AppError(
+        'CHUNK_SIZE_MISMATCH',
+        400,
+        `Chunk ${idx} length ${chunkBuffer.length} does not match expected length ${expectedSize}`
+      );
+    }
+
+    // Verify optional SHA-256 chunk checksum if provided
+    if (checksum && typeof checksum === 'string') {
+      const actualChecksum = crypto.createHash('sha256').update(chunkBuffer).digest('hex');
+      if (actualChecksum.toLowerCase() !== checksum.toLowerCase()) {
+        throw new AppError('CHECKSUM_MISMATCH', 400, `Checksum mismatch for chunk ${idx}`);
+      }
     }
 
     // Write chunk to isolated temporary file
@@ -162,7 +197,8 @@ export class ChunkedUploadManager {
    * Reassembles chunks into final file in upload directory and cleans up temp chunks.
    * Streams chunk files sequentially into destination file to minimize memory usage.
    * @param {string} uploadId
-   * @returns {Promise<{ fileName: string, filePath: string, size: number, duration: number, averageSpeed: string }>}
+   * @param {string} [targetDir] Destination directory
+   * @returns {Promise<{ fileName: string, filePath: string, size: number, mimeType: string, duration: number, averageSpeed: string }>}
    */
   async complete(uploadId, targetDir = this.config.uploadDir) {
     const session = this.sessions.get(uploadId);
@@ -209,6 +245,21 @@ export class ChunkedUploadManager {
       writeStream.end((err) => (err ? reject(err) : resolve()));
     });
 
+    // Integrity check: verify reassembled size equals declared fileSize
+    const stat = await fs.promises.stat(finalPath);
+    if (stat.size !== session.fileSize) {
+      try {
+        await fs.promises.unlink(finalPath);
+      } catch {
+        // Ignore unlink error
+      }
+      throw new AppError(
+        'FILE_CORRUPTED',
+        500,
+        `Reassembled file size (${stat.size}) does not match expected size (${session.fileSize})`
+      );
+    }
+
     // Cleanup session temporary chunks directory
     await fs.promises.rm(session.sessionDir, { recursive: true, force: true });
     this.sessions.delete(uploadId);
@@ -228,6 +279,7 @@ export class ChunkedUploadManager {
       fileName: finalFileName,
       filePath: finalPath,
       size: session.fileSize,
+      mimeType: session.mimeType,
       duration: parseFloat(duration.toFixed(1)),
       averageSpeed: `${speedMBs} MB/s`,
     };

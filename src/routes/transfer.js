@@ -10,7 +10,7 @@ import path from 'node:path';
 import multer from 'multer';
 import { broadcastEvent } from '../websocket/handlers.js';
 import { AppError } from '../middleware/error-handler.js';
-import { sanitizeFileName } from '../utils/file-utils.js';
+import { sanitizeFileName, parseRange } from '../utils/file-utils.js';
 import { requireHost } from '../middleware/host-auth.js';
 
 export const transferRouter = Router();
@@ -164,7 +164,7 @@ transferRouter.get('/api/download/:fileId', async (req, res, next) => {
     }
 
     const fileSize = stat.size;
-    const range = req.headers.range;
+    const rangeHeader = req.headers.range;
 
     // Standard headers
     res.setHeader('Content-Type', fileRecord.mimeType || 'application/octet-stream');
@@ -175,36 +175,46 @@ transferRouter.get('/api/download/:fileId', async (req, res, next) => {
       `attachment; filename="${encodeURIComponent(fileRecord.name)}"; filename*=UTF-8''${encodeURIComponent(fileRecord.name)}`
     );
 
-    if (range) {
-      // Range header format: "bytes=start-end"
-      const parts = range.replace(/bytes=/, '').split('-');
-      const start = parseInt(parts[0], 10);
-      const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+    let stream;
 
-      if (isNaN(start) || isNaN(end) || start < 0 || start > end || end >= fileSize) {
-        res.setHeader('Content-Range', `bytes */${fileSize}`);
-        return res.status(416).json({
-          success: false,
-          error: { code: 'RANGE_NOT_SATISFIABLE', message: 'Requested range not satisfiable' },
-        });
+    if (rangeHeader) {
+      const parsed = parseRange(rangeHeader, fileSize);
+      if (parsed) {
+        if (!parsed.satisfiable) {
+          res.setHeader('Content-Range', `bytes */${fileSize}`);
+          return res.status(416).json({
+            success: false,
+            error: { code: 'RANGE_NOT_SATISFIABLE', message: 'Requested range not satisfiable' },
+          });
+        }
+
+        res.status(206);
+        res.setHeader('Content-Range', `bytes ${parsed.start}-${parsed.end}/${fileSize}`);
+        res.setHeader('Content-Length', parsed.contentLength);
+
+        stream = fs.createReadStream(fileRecord.path, { start: parsed.start, end: parsed.end });
       }
+    }
 
-      const chunkSize = end - start + 1;
-      res.status(206);
-      res.setHeader('Content-Range', `bytes ${start}-${end}/${fileSize}`);
-      res.setHeader('Content-Length', chunkSize);
-
-      const stream = fs.createReadStream(fileRecord.path, { start, end });
-      stream.on('error', (err) => next(err));
-      stream.pipe(res);
-    } else {
+    if (!stream) {
       res.status(200);
       res.setHeader('Content-Length', fileSize);
-
-      const stream = fs.createReadStream(fileRecord.path);
-      stream.on('error', (err) => next(err));
-      stream.pipe(res);
+      stream = fs.createReadStream(fileRecord.path);
     }
+
+    res.on('close', () => {
+      stream.destroy();
+    });
+
+    stream.on('error', (err) => {
+      if (!res.headersSent) {
+        next(err);
+      } else {
+        res.destroy(err);
+      }
+    });
+
+    stream.pipe(res);
   } catch (error) {
     next(error);
   }
@@ -297,10 +307,15 @@ transferRouter.post('/api/upload/init', async (req, res, next) => {
  */
 transferRouter.post('/api/upload/chunk', parseChunkUpload, async (req, res, next) => {
   try {
-    const { uploadId, chunkIndex } = req.body || {};
+    const { uploadId, chunkIndex, checksum } = req.body || {};
 
-    if (!uploadId || chunkIndex === undefined) {
+    if (!uploadId || chunkIndex === undefined || chunkIndex === null || chunkIndex === '') {
       throw new AppError('INVALID_INPUT', 400, 'uploadId and chunkIndex are required');
+    }
+
+    const idx = Number(chunkIndex);
+    if (!Number.isInteger(idx) || idx < 0) {
+      throw new AppError('INVALID_INPUT', 400, 'chunkIndex must be a non-negative integer');
     }
 
     if (!req.file || !req.file.buffer) {
@@ -318,8 +333,9 @@ transferRouter.post('/api/upload/chunk', parseChunkUpload, async (req, res, next
 
     const result = await runtime.chunkedUploadManager.addChunk(
       uploadId,
-      parseInt(chunkIndex, 10),
-      req.file.buffer
+      idx,
+      req.file.buffer,
+      checksum
     );
 
     res.json({
