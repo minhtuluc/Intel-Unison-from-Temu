@@ -10,8 +10,9 @@ import path from 'node:path';
 import multer from 'multer';
 import { broadcastEvent, sendTransferTerminalEvent } from '../websocket/handlers.js';
 import { AppError } from '../middleware/error-handler.js';
-import { sanitizeFileName, parseRange } from '../utils/file-utils.js';
+import { parseRange, reserveWritableFile } from '../utils/file-utils.js';
 import { requireHost } from '../middleware/host-auth.js';
+import { extractSessionToken } from '../middleware/session-auth.js';
 
 export const transferRouter = Router();
 
@@ -45,13 +46,16 @@ function resolveSender(req) {
         throw new AppError('INVALID_CONNECTION_ID', 403, 'Connection ID does not match sender IP');
       }
 
-      // If PIN is required, verify that the session matches the connected socket
-      if (req.app.locals.pinRequired) {
-        const authHeader = req.headers.authorization || '';
-        const bearerToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
-        const cookieToken = req.cookies?.['utrans_session'];
-        const reqToken = bearerToken || cookieToken;
-        if (matchedClient.sessionToken && reqToken && matchedClient.sessionToken !== reqToken) {
+      // If PIN is required (or socket is bound to a session), verify that session matches
+      const isPinRequired =
+        req.app.locals.pinRequired ?? req.app.locals.runtime?.pinRequired ?? false;
+      const hostAuth = req.app.locals.hostAuth || req.app.locals.runtime?.hostAuth;
+      const hostToken = req.headers['x-host-token'];
+      const isHostReq = Boolean(hostToken && hostAuth?.validate(hostToken));
+
+      if (!isHostReq && (isPinRequired || matchedClient.sessionToken)) {
+        const reqToken = extractSessionToken(req);
+        if (!reqToken || !matchedClient.sessionToken || matchedClient.sessionToken !== reqToken) {
           throw new AppError(
             'INVALID_CONNECTION_ID',
             403,
@@ -76,71 +80,64 @@ function resolveSender(req) {
  * enforcing quota reservations on each incoming byte and tracking created files for transaction rollback.
  */
 class SimpleUploadQuotaStorage {
-  _handleFile(req, file, cb) {
+  async _handleFile(req, file, cb) {
     const runtime = req.app.locals.runtime;
     const pendingDir = path.join(runtime.config.tempDir, 'pending');
 
-    fs.mkdir(pendingDir, { recursive: true }, (mkdirErr) => {
-      if (mkdirErr) return cb(mkdirErr);
+    let reserved;
+    try {
+      reserved = await reserveWritableFile(pendingDir, file.originalname || 'unnamed');
+    } catch (err) {
+      return cb(err);
+    }
 
-      const cleanName = sanitizeFileName(file.originalname || 'unnamed');
-      const ext = path.extname(cleanName);
-      const base = path.basename(cleanName, ext);
-      let finalName = cleanName;
-      let finalPath = path.join(pendingDir, finalName);
-      let counter = 1;
-      while (fs.existsSync(finalPath)) {
-        finalName = `${base}_(${counter})${ext}`;
-        finalPath = path.join(pendingDir, finalName);
-        counter++;
+    const { fileName: finalName, filePath: finalPath, fileHandle } = reserved;
+
+    req._createdFiles = req._createdFiles || [];
+    const fileRecord = { path: finalPath, size: 0, reservedQuota: 0, fileHandle };
+    req._createdFiles.push(fileRecord);
+
+    const outStream = fileHandle.createWriteStream();
+    let bytesWritten = 0;
+    let aborted = false;
+
+    file.stream.on('data', (chunk) => {
+      bytesWritten += chunk.length;
+      fileRecord.size = bytesWritten;
+      if (runtime.quotaTracker) {
+        try {
+          runtime.quotaTracker.reserve(chunk.length);
+          fileRecord.reservedQuota += chunk.length;
+        } catch (quotaErr) {
+          aborted = true;
+          file.stream.unpipe?.();
+          file.stream.destroy?.();
+          outStream.destroy(quotaErr);
+        }
       }
-
-      req._createdFiles = req._createdFiles || [];
-      const fileRecord = { path: finalPath, size: 0, reservedQuota: 0 };
-      req._createdFiles.push(fileRecord);
-
-      const outStream = fs.createWriteStream(finalPath);
-      let bytesWritten = 0;
-      let aborted = false;
-
-      file.stream.on('data', (chunk) => {
-        bytesWritten += chunk.length;
-        fileRecord.size = bytesWritten;
-        if (runtime.quotaTracker) {
-          try {
-            runtime.quotaTracker.reserve(chunk.length);
-            fileRecord.reservedQuota += chunk.length;
-          } catch (quotaErr) {
-            aborted = true;
-            file.stream.unpipe?.();
-            file.stream.destroy?.();
-            outStream.destroy(quotaErr);
-          }
-        }
-      });
-
-      file.stream.on('error', (err) => {
-        if (!aborted) {
-          outStream.destroy(err);
-        }
-      });
-
-      outStream.on('error', (err) => {
-        cb(err);
-      });
-
-      outStream.on('finish', () => {
-        if (aborted) return;
-        cb(null, {
-          destination: pendingDir,
-          filename: finalName,
-          path: finalPath,
-          size: bytesWritten,
-        });
-      });
-
-      file.stream.pipe(outStream);
     });
+
+    file.stream.on('error', (err) => {
+      if (!aborted) {
+        outStream.destroy(err);
+      }
+    });
+
+    outStream.on('error', (err) => {
+      cb(err);
+    });
+
+    outStream.on('finish', () => {
+      if (aborted) return;
+      cb(null, {
+        destination: pendingDir,
+        filename: finalName,
+        path: finalPath,
+        size: bytesWritten,
+      });
+    });
+
+    file.stream.pipe(outStream);
   }
 
   _removeFile(req, file, cb) {
@@ -198,6 +195,13 @@ function parseSimpleUpload(req, res, next) {
       const filesToClean = [...req._createdFiles];
       req._createdFiles = [];
       for (const item of filesToClean) {
+        if (item.fileHandle) {
+          try {
+            await item.fileHandle.close();
+          } catch {
+            // ignore handle close failure
+          }
+        }
         try {
           if (fs.existsSync(item.path)) {
             await fs.promises.unlink(item.path);

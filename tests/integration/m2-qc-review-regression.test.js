@@ -9,7 +9,7 @@ import { startServer } from '../../src/server.js';
 import { TransferEngine, computeFileSha256 } from '../../public/js/transfer.js';
 import { IncrementalSha256 } from '../../public/js/utils.js';
 
-describe('M2 QC Review Regression Suite (R1 to R10)', () => {
+describe('M2 QC Review Regression Suite (R1 to R12)', () => {
   let tempDir;
   let uploadDir;
   let serverInstance;
@@ -1257,13 +1257,252 @@ describe('M2 QC Review Regression Suite (R1 to R10)', () => {
         const joinEvents = events.filter((e) => e.event === 'device:join');
         for (const je of joinEvents) {
           assert.equal(
-            je.data?.connectionId,
+            je.data?.device?.connectionId,
             undefined,
             'connectionId must NEVER be leaked in device:join payload'
           );
         }
       } finally {
         ws.close();
+      }
+    });
+  });
+
+  // ==========================================
+  // R11 — P1 / UT-008: Concurrent same-name simple uploads exclusive reservation & no overwrite
+  // ==========================================
+  describe('R11: Concurrent same-name simple uploads exclusive reservation and no overwrite', () => {
+    it('concurrently uploading 10 files with identical originalName preserves all 10 unique paths and payloads', async () => {
+      const sameNameDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'utrans-r11-samename-'));
+      const sameNameServer = await startServer({
+        port: 0,
+        host: '127.0.0.1',
+        noBrowser: true,
+        tempDir: sameNameDir,
+        uploadDir: path.join(sameNameDir, 'uploads'),
+        maxConcurrentTransfers: 20, // Allow all 10 to run concurrently
+      });
+
+      try {
+        const testUrl = `http://127.0.0.1:${sameNameServer.server.address().port}`;
+        const count = 10;
+        const payloads = [];
+        const expectedHashes = new Set();
+
+        for (let i = 0; i < count; i++) {
+          const data = Buffer.from(`Payload_${i}_${crypto.randomBytes(32).toString('hex')}`);
+          payloads.push(data);
+          expectedHashes.add(crypto.createHash('sha256').update(data).digest('hex'));
+        }
+
+        // Fire 10 uploads concurrently
+        const uploadPromises = payloads.map(async (buf, idx) => {
+          const form = new FormData();
+          form.append('files', new Blob([buf]), 'same.bin');
+          const res = await fetch(`${testUrl}/api/upload`, {
+            method: 'POST',
+            body: form,
+          });
+          assert.equal(res.status, 201, `Upload #${idx} must return 201`);
+          const json = await res.json();
+          return json.data.pending[0];
+        });
+
+        const pendingRecords = await Promise.all(uploadPromises);
+        assert.equal(pendingRecords.length, count, `Must have ${count} pending records`);
+
+        // 1. Verify all 10 pending records have unique transferIds and tempPaths
+        const uniqueTransferIds = new Set(pendingRecords.map((r) => r.transferId));
+        assert.equal(uniqueTransferIds.size, count, 'Every transferId must be unique');
+
+        const internalPaths = [];
+        for (const rec of pendingRecords) {
+          const internal = sameNameServer.runtime.pendingUploadManager.pending.get(rec.transferId);
+          assert.ok(internal, `Internal record for ${rec.transferId} must exist`);
+          internalPaths.push(internal.tempPath);
+        }
+
+        const uniquePaths = new Set(internalPaths);
+        assert.equal(
+          uniquePaths.size,
+          count,
+          `All ${count} internal temporary file paths must be strictly unique (no path sharing)`
+        );
+
+        // 2. Verify all 10 physical files exist on disk and their hashes match all distinct payloads
+        const actualHashes = new Set();
+        for (const filePath of internalPaths) {
+          assert.ok(fs.existsSync(filePath), `Physical file ${filePath} must exist on disk`);
+          const fileBytes = await fs.promises.readFile(filePath);
+          const hash = crypto.createHash('sha256').update(fileBytes).digest('hex');
+          actualHashes.add(hash);
+        }
+
+        assert.equal(
+          actualHashes.size,
+          count,
+          `Must have ${count} distinct physical file contents on disk (no data overwrite)`
+        );
+
+        // Verify the set of actual hashes exactly equals the expected hashes
+        for (const expHash of expectedHashes) {
+          assert.ok(
+            actualHashes.has(expHash),
+            `Expected payload hash ${expHash} must exist among saved files`
+          );
+        }
+      } finally {
+        if (sameNameServer?.wss) sameNameServer.wss.close();
+        if (sameNameServer?.server) {
+          await new Promise((r) => sameNameServer.server.close(r));
+        }
+        await fs.promises.rm(sameNameDir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  // ==========================================
+  // R12 — P2 / UT-004: Cross-session connectionId spoofing defense on same IP with PIN
+  // ==========================================
+  describe('R12: Cross-session connectionId spoofing defense on same IP with PIN', () => {
+    it('rejects client B attempting to use client A connectionId across separate PIN sessions on same IP', async () => {
+      const pinTestDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'utrans-r12-pin-'));
+      const pinUploadDir = path.join(pinTestDir, 'uploads');
+      await fs.promises.mkdir(pinUploadDir, { recursive: true });
+
+      const pinServer = await startServer({
+        port: 0,
+        host: '127.0.0.1',
+        noBrowser: true,
+        tempDir: pinTestDir,
+        uploadDir: pinUploadDir,
+        pin: '1234', // Enable PIN authentication
+      });
+
+      const pinUrl = `http://127.0.0.1:${pinServer.server.address().port}`;
+      const pinWsUrl = `ws://127.0.0.1:${pinServer.server.address().port}/ws`;
+
+      let wsA;
+      let wsB;
+
+      try {
+        // 1. Authenticate Session A
+        const authResA = await fetch(`${pinUrl}/api/auth`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ pin: '1234', deviceName: 'Client A' }),
+        });
+        assert.equal(authResA.status, 200);
+        const tokenA = (await authResA.json()).data.token;
+        assert.ok(tokenA);
+
+        // 2. Authenticate Session B
+        const authResB = await fetch(`${pinUrl}/api/auth`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ pin: '1234', deviceName: 'Client B' }),
+        });
+        assert.equal(authResB.status, 200);
+        const tokenB = (await authResB.json()).data.token;
+        assert.ok(tokenB);
+        assert.notEqual(tokenA, tokenB);
+
+        // 3. Connect WebSocket for Client A with tokenA
+        wsA = new WebSocket(pinWsUrl);
+        const eventsA = [];
+        wsA.on('message', (m) => eventsA.push(JSON.parse(m)));
+        await new Promise((r) => wsA.on('open', r));
+
+        wsA.send(
+          JSON.stringify({
+            event: 'client:register',
+            data: { deviceName: 'Client A Device', platform: 'linux', sessionToken: tokenA },
+          })
+        );
+        await new Promise((r) => setTimeout(r, 80));
+
+        const regA = eventsA.find((e) => e.event === 'client:registered');
+        assert.ok(regA?.data?.connectionId);
+        const connIdA = regA.data.connectionId;
+
+        // 4. Connect WebSocket for Client B with tokenB
+        wsB = new WebSocket(pinWsUrl);
+        const eventsB = [];
+        wsB.on('message', (m) => eventsB.push(JSON.parse(m)));
+        await new Promise((r) => wsB.on('open', r));
+
+        wsB.send(
+          JSON.stringify({
+            event: 'client:register',
+            data: { deviceName: 'Client B Device', platform: 'android', sessionToken: tokenB },
+          })
+        );
+        await new Promise((r) => setTimeout(r, 80));
+
+        const regB = eventsB.find((e) => e.event === 'client:registered');
+        assert.ok(regB?.data?.connectionId);
+        const connIdB = regB.data.connectionId;
+        assert.notEqual(connIdA, connIdB);
+
+        // 5. Spoof probe: Client B attempts upload using its sessionTokenB, but spoofing Client A's connectionId
+        const formSpoof = new FormData();
+        formSpoof.append('files', new Blob(['spoofed payload']), 'spoof.txt');
+
+        const spoofRes = await fetch(`${pinUrl}/api/upload`, {
+          method: 'POST',
+          headers: {
+            'X-Session-Token': tokenB, // Authenticated as B
+            'X-Connection-Id': connIdA, // Claiming to be A
+          },
+          body: formSpoof,
+        });
+
+        // Server MUST reject with 403 INVALID_CONNECTION_ID
+        assert.equal(spoofRes.status, 403, 'Cross-session spoofed connectionId must return 403');
+        const spoofJson = await spoofRes.json();
+        assert.equal(spoofJson.error.code, 'INVALID_CONNECTION_ID');
+
+        // 6. Fail-closed probe: Upload without session token claiming connectionIdA
+        const formNoToken = new FormData();
+        formNoToken.append('files', new Blob(['no token payload']), 'notoken.txt');
+
+        const noTokenRes = await fetch(`${pinUrl}/api/upload`, {
+          method: 'POST',
+          headers: {
+            'X-Connection-Id': connIdA,
+          },
+          body: formNoToken,
+        });
+        assert.ok([401, 403].includes(noTokenRes.status), 'Missing session token must be rejected');
+
+        // 7. Verify Client A never received any upload event or notification
+        assert.equal(
+          eventsA.filter((e) => e.event.startsWith('transfer:')).length,
+          0,
+          'Client A must receive zero transfer events from spoofed requests'
+        );
+
+        // 8. Legitimate upload: Client B uploads with its own tokenB and connectionIdB
+        const formLegit = new FormData();
+        formLegit.append('files', new Blob(['legitimate B payload']), 'legit_b.txt');
+
+        const legitRes = await fetch(`${pinUrl}/api/upload`, {
+          method: 'POST',
+          headers: {
+            'X-Session-Token': tokenB,
+            'X-Connection-Id': connIdB,
+          },
+          body: formLegit,
+        });
+        assert.equal(legitRes.status, 201, 'Legitimate client B upload must succeed with 201');
+      } finally {
+        if (wsA) wsA.close();
+        if (wsB) wsB.close();
+        if (pinServer?.wss) pinServer.wss.close();
+        if (pinServer?.server) {
+          await new Promise((r) => pinServer.server.close(r));
+        }
+        await fs.promises.rm(pinTestDir, { recursive: true, force: true });
       }
     });
   });
