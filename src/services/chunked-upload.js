@@ -7,15 +7,15 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { pipeline } from 'node:stream/promises';
-import { config } from '../config.js';
+import { DEFAULT_CONFIG } from '../config.js';
 import { generateUploadId } from '../utils/id-generator.js';
 import { sanitizeFileName, formatFileSize } from '../utils/file-utils.js';
 import { AppError } from '../middleware/error-handler.js';
 import { logger } from '../utils/logger.js';
 
 export class ChunkedUploadManager {
-  constructor(customConfig = null) {
-    this.config = customConfig || config;
+  constructor(customConfig = DEFAULT_CONFIG) {
+    this.config = customConfig || DEFAULT_CONFIG;
     this.tempDir = path.join(this.config.tempDir, 'chunks');
     /** @type {Map<string, object>} */
     this.sessions = new Map();
@@ -251,5 +251,3 @@ export class ChunkedUploadManager {
     }
   }
 }
-
-export const chunkedUploadManager = new ChunkedUploadManager();

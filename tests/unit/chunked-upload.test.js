@@ -1,15 +1,20 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { ChunkedUploadManager } from '../../src/services/chunked-upload.js';
 
 describe('ChunkedUploadManager Service', () => {
-  const testTempDir = path.resolve('temp/test_chunk_service');
-  const testUploadDir = path.resolve('temp/test_upload_out');
+  let testTempDir;
+  let testUploadDir;
+  let rootDir;
   let manager;
 
   beforeEach(async () => {
+    rootDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'utrans-chunk-test-'));
+    testTempDir = path.join(rootDir, 'temp');
+    testUploadDir = path.join(rootDir, 'uploads');
     await fs.promises.mkdir(testTempDir, { recursive: true });
     await fs.promises.mkdir(testUploadDir, { recursive: true });
 
@@ -23,8 +28,7 @@ describe('ChunkedUploadManager Service', () => {
   });
 
   afterEach(async () => {
-    await fs.promises.rm(testTempDir, { recursive: true, force: true });
-    await fs.promises.rm(testUploadDir, { recursive: true, force: true });
+    await fs.promises.rm(rootDir, { recursive: true, force: true });
   });
 
   describe('initUpload()', () => {

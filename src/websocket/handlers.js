@@ -3,7 +3,6 @@
  * Handles device registration, pings, and transfer event broadcasts.
  */
 
-import { discoveryService } from '../services/discovery.js';
 import { logger } from '../utils/logger.js';
 
 export function handleWsMessage(wss, ws, rawMessage) {
@@ -19,13 +18,33 @@ export function handleWsMessage(wss, ws, rawMessage) {
 
   switch (event) {
     case 'client:register': {
-      const { deviceId, deviceName, platform, hostToken } = data || {};
-      if (!deviceId) return;
+      const { deviceName, platform, hostToken, sessionToken } = data || {};
 
+      const session = ws.verifySession?.(sessionToken);
       ws.isHost = Boolean(ws.verifyHost?.(hostToken));
-      ws.deviceId = deviceId;
-      const deviceRecord = discoveryService.addDevice(deviceId, {
-        deviceName,
+      ws.sessionToken = session ? (typeof session === 'object' ? session.token : session) : null;
+      ws.authorized = Boolean(ws.isHost || session || !ws.pinRequired);
+
+      if (!ws.authorized) {
+        if (ws.readyState === 1) {
+          ws.send(
+            JSON.stringify({
+              event: 'client:rejected',
+              data: { reason: 'UNAUTHORIZED' },
+              timestamp: new Date().toISOString(),
+            })
+          );
+        }
+        logger.warn('Rejected WebSocket registration without valid capability', {
+          remoteIp: ws._remoteIp,
+        });
+        return;
+      }
+
+      // Identity is the connection, not the payload. Claimed name/platform are
+      // stored as untrusted display labels only.
+      const deviceRecord = ws.discovery.addConnection(ws.connectionId, {
+        label: deviceName,
         platform,
         ip: ws._remoteIp || '127.0.0.1',
         isHost: ws.isHost,
@@ -37,9 +56,8 @@ export function handleWsMessage(wss, ws, rawMessage) {
           JSON.stringify({
             event: 'client:registered',
             data: {
-              deviceId,
               device: deviceRecord,
-              devices: discoveryService.getDevices(),
+              devices: ws.discovery.getDevices(),
             },
             timestamp: new Date().toISOString(),
           })
@@ -49,17 +67,15 @@ export function handleWsMessage(wss, ws, rawMessage) {
       // Broadcast device:join to other clients
       broadcastEvent(wss, 'device:join', { device: deviceRecord }, ws);
       logger.info('Device registered via WebSocket', {
-        deviceId,
-        deviceName: deviceRecord.deviceName,
+        deviceId: deviceRecord.id,
+        label: deviceRecord.label,
         platform: deviceRecord.platform,
       });
       break;
     }
 
     case 'client:ping': {
-      if (ws.deviceId) {
-        discoveryService.touch(ws.deviceId);
-      }
+      ws.discovery.touchConnection(ws.connectionId);
       ws.isAlive = true;
       if (ws.readyState === 1) {
         ws.send(
@@ -67,7 +83,7 @@ export function handleWsMessage(wss, ws, rawMessage) {
             event: 'server:pong',
             data: {
               timestamp: Date.now(),
-              onlineDevices: discoveryService.getDevices().length,
+              onlineDevices: ws.discovery.getDevices().length,
             },
             timestamp: new Date().toISOString(),
           })
@@ -92,6 +108,12 @@ export function broadcastEvent(wss, event, data, excludeWs = null) {
   });
 
   for (const client of wss.clients) {
+    // Unauthenticated sockets receive nothing while a PIN policy is active.
+    if (typeof client.isAuthorized === 'function') {
+      if (!client.isAuthorized()) continue;
+    } else if (client.authorized === false) {
+      continue;
+    }
     if (event === 'upload:request' && !client.isHost) continue;
     if (client !== excludeWs && client.readyState === 1 /* OPEN */) {
       try {

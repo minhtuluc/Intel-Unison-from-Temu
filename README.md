@@ -1,10 +1,16 @@
 # UniversalTrans ⚡
 
-## Cập nhật quyền host và kế hoạch phát triển
+## Trạng thái thực tế và cách vận hành sau M1
 
 Chỉ phiên host đã xác thực được xem danh sách chờ và Accept/Decline. Chạy `npm start` và dùng browser do launcher mở; QR/public URL dành cho client. Khi không tự mở browser, dùng liên kết `Host approval URL` riêng được in ở terminal trên máy host. Không chia sẻ liên kết riêng này. Sau restart cần mở lại phiên host.
 
-Mô hình hiện tại truyền qua host, chưa có P2P trực tiếp giữa client. Xem [báo cáo và roadmap](REPORT-ROADMAP.md), [quy chuẩn agent](AGENTS.md) và [quality system](docs/agents/quality.md). Chạy `npm run quality` trên Node 22/24 để kiểm tra lint, format, test và coverage. Các tuyên bố reliability bên dưới cần đối chiếu các giới hạn còn mở trong báo cáo.
+Nếu đặt `UTRANS_PIN` (4-6 chữ số), host yêu cầu PIN: client phải nhập PIN trong cổng kết nối trước khi xem, tải hay gửi file. PIN trống giữ hành vi LAN mở như trước. Phiên PIN có expiry, thu hồi được (`POST /api/auth/logout`), và mất khi restart. Chi tiết quyết định: [ADR-0002](docs/adr/0002-session-runtime-authority.md).
+
+Stage đường dẫn nguồn (nhánh JSON của `POST /api/share`, dùng cho CLI) là hành động host-only; đặt `UTRANS_ALLOWED_SOURCE_DIRS` để giới hạn thêm thư mục nguồn.
+
+Mô hình hiện tại truyền qua host, chưa có P2P trực tiếp giữa client. Xem [báo cáo và roadmap](REPORT-ROADMAP.md), [quy chuẩn agent](AGENTS.md) và [quality system](docs/agents/quality.md). Chạy `npm run quality` trên Node 22/24 để kiểm tra lint, format, test và coverage.
+
+Đã kiểm chứng trong lượt M1 (Node 22.23.1, Linux): 195 test pass, coverage 93,13% line / 88,89% branch / 93,80% function; lint và format sạch. **Chưa** kiểm chứng: Node 24, Windows, CI GitHub, điện thoại thật (Android Chrome / iOS Safari), TLS LAN. Các tuyên bố bên dưới cần đối chiếu giới hạn còn mở trong báo cáo.
 
 <p align="center">
   <img src="public/favicon.svg" alt="UniversalTrans Logo" width="96" height="96" />
@@ -12,13 +18,13 @@ Mô hình hiện tại truyền qua host, chưa có P2P trực tiếp giữa cli
 
 <p align="center">
   <strong>AirDrop-style bidirectional file transfer between PC (Windows, Linux) and mobile devices (Android, iOS, iPadOS) over local Wi-Fi.</strong><br>
-  <em>100% LAN qua máy host • Zero cloud dependencies • Hiện đang trong giai đoạn hardening.</em>
+  <em>100% LAN qua máy host • Zero cloud dependencies • Đang hardening, xem giới hạn trong roadmap.</em>
 </p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/node-%3E%3D20.0.0-brightgreen" alt="Node Version" />
-  <img src="https://img.shields.io/badge/tests-143%20passed-success" alt="Tests" />
-  <img src="https://img.shields.io/badge/coverage-83.49%25-blue" alt="Coverage" />
+  <img src="https://img.shields.io/badge/tests-195%20passed-success" alt="Tests" />
+  <img src="https://img.shields.io/badge/coverage-93.13%25-blue" alt="Coverage" />
   <img src="https://img.shields.io/badge/port-8080%20default-orange" alt="Port 8080" />
   <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License" />
   <img src="https://img.shields.io/badge/pwa-standalone%20ready-purple" alt="PWA Ready" />
@@ -51,7 +57,7 @@ Mô hình hiện tại truyền qua host, chưa có P2P trực tiếp giữa cli
 - 🛡️ **Tự động chống ghi đè (Anti-collision Rename)**: Tự động đổi tên `file_(1).ext` nếu file đã tồn tại trên PC.
 - 📂 **Tệp lớn đến giới hạn cấu hình**: Mặc định tối đa 10 GiB với chunk 10 MiB. Pause / Resume / Retry cần tiếp tục được harden theo roadmap.
 - 🖐️ **Kéo thả thư mục đệ quy & Dán ảnh Clipboard**: Hỗ trợ kéo thả cả thư mục (kể cả sub-folder lồng nhau) từ PC hoặc bấm **`Ctrl+V`** để chia sẻ ảnh chụp màn hình ngay tức thì.
-- 💡 **Screen Wake Lock & Tab Guard**: Tự động giữ sáng màn hình thiết bị khi đang truyền file và cảnh báo chống đóng tab dở dang (`beforeunload`).
+- 💡 **Screen Wake Lock & Tab Guard (có điều kiện)**: Wake Lock chỉ hoạt động trong secure context — trên LAN HTTP (không phải `localhost`) trình duyệt không cấp API này và app không báo lỗi. Cảnh báo chống đóng tab dở dang (`beforeunload`) vẫn chạy.
 - 🎨 **Giao diện hiện đại Dark Glassmorphism**: Không dùng framework nặng, 100% Vanilla JS & Vanilla CSS hiệu năng cao, siêu mượt mà.
 
 ---
@@ -67,8 +73,8 @@ npm run setup:shortcuts
 
 Sau khi chạy, ngoài màn hình Desktop sẽ xuất hiện 2 phím tắt:
 
-- 🟢 **`UniversalTrans - Bat.lnk`**: Nhấp đúp để **BẬT** server. Tự động dọn dẹp port 8080 nếu có tiến trình cũ treo, mở server trên port 8080, in mã QR to rõ và tự động mở trình duyệt web.
-- 🔴 **`UniversalTrans - Tat.lnk`**: Nhấp đúp để **TẮT** sạch toàn bộ tiến trình UniversalTrans đang chạy trên port 8080 chỉ trong 1 giây.
+- 🟢 **`UniversalTrans - Bat.lnk`**: Nhấp đúp để **BẬT** server trên port 8080, in QR và tự động mở trình duyệt. Nếu app đang chạy sẵn, script báo và không khởi động trùng.
+- 🔴 **`UniversalTrans - Tat.lnk`**: Nhấp đúp để **TẮT** đúng tiến trình UniversalTrans. Script đọc file instance `%TEMP%\utrans-8080.json` (chứa PID do app ghi) nên không kill nhầm ứng dụng khác đang dùng port 8080. Nếu port bị chiếm bởi chương trình khác, bạn cần xử lý thủ công: `utrans -p 9090`.
 
 ---
 
@@ -144,7 +150,7 @@ utrans -p 9090
 
 ### 3. Cài đặt PWA như Ứng dụng gốc
 
-- **Android (Chrome / Edge)**: Bấm nút **Install App** ở góc trên thanh Header ➔ Chọn **Cài đặt**.
+- **Android (Chrome / Edge)**: Nút **Install App** chỉ xuất hiện khi trình duyệt bắn sự kiện `beforeinstallprompt`, tức là khi trang chạy trong secure context (HTTPS hoặc `localhost`). Truy cập bằng LAN HTTP thì nút bị ẩn và bạn cần vào menu trình duyệt ➔ _Thêm vào MH chính_.
 - **iPhone / iPad (Safari)**: Bấm nút **Install App** (hoặc nút **Chia sẻ / Share** hình ô vuông mũi tên lên của Safari) ➔ Cuộn xuống chọn **Thêm vào MH chính (Add to Home Screen)**.
 
 ---
@@ -164,7 +170,7 @@ utrans -p 9090
 
 ## 🛠️ Lệnh phát triển & Kiểm thử
 
-Dự án được xây dựng theo chuẩn **Quality Gates** nghiêm ngặt với 100% test passing:
+Quality gate chạy lint + format + toàn bộ test kèm ngưỡng coverage (`npm run quality`). Số liệu dưới đây là lần đo gần nhất trên Node 22/Linux:
 
 ```bash
 # Chạy toàn bộ automated tests (Unit + Integration + Security)

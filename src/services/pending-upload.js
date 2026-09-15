@@ -7,7 +7,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { config } from '../config.js';
+import { DEFAULT_CONFIG } from '../config.js';
 import { generateUploadId } from '../utils/id-generator.js';
 import { sanitizeFileName } from '../utils/file-utils.js';
 import { AppError } from '../middleware/error-handler.js';
@@ -27,7 +27,11 @@ async function moveFileSafe(src, dest) {
 }
 
 export class PendingUploadService {
-  constructor() {
+  /**
+   * @param {{ config?: object }} [options] runtime config; defaults keep unit tests simple
+   */
+  constructor({ config = DEFAULT_CONFIG } = {}) {
+    this.config = config;
     this.pending = new Map();
   }
 
@@ -36,7 +40,7 @@ export class PendingUploadService {
    * @param {object} params
    * @returns {object} Pending transfer record
    */
-  createPending({ fileName, fileSize, mimeType, tempPath, senderDevice = {}, ttlMs = 300000 }) {
+  createPending({ fileName, fileSize, mimeType, tempPath, sender = {}, ttlMs = 300000 }) {
     const transferId = generateUploadId();
     const cleanName = sanitizeFileName(fileName || 'unnamed_file');
 
@@ -60,10 +64,11 @@ export class PendingUploadService {
       fileSize: Number(fileSize) || 0,
       mimeType: mimeType || 'application/octet-stream',
       tempPath,
-      senderDevice: {
-        deviceId: senderDevice.deviceId || 'unknown',
-        deviceName: senderDevice.deviceName || 'Mobile Device',
-        platform: senderDevice.platform || 'unknown',
+      sender: {
+        ip: sender.ip || 'unknown',
+        label: sender.label || 'Unknown device',
+        labelUntrusted: true,
+        platform: sender.platform || 'unknown',
       },
       createdAt: Date.now(),
       timeoutId,
@@ -86,7 +91,7 @@ export class PendingUploadService {
   /**
    * Accepts a pending upload, moving it safely to the configured uploadDir.
    * @param {string} transferId
-   * @returns {Promise<{ transferId: string, fileName: string, filePath: string, size: number }>}
+   * @returns {Promise<{ transferId: string, fileName: string, size: number }>}
    */
   async accept(transferId) {
     const record = this.pending.get(transferId);
@@ -98,16 +103,16 @@ export class PendingUploadService {
     this.pending.delete(transferId);
 
     // Ensure upload directory exists
-    await fs.promises.mkdir(config.uploadDir, { recursive: true });
+    await fs.promises.mkdir(this.config.uploadDir, { recursive: true });
 
     // Handle collision safely
     const ext = path.extname(record.fileName);
     const base = path.basename(record.fileName, ext);
-    let finalPath = path.join(config.uploadDir, record.fileName);
+    let finalPath = path.join(this.config.uploadDir, record.fileName);
     let counter = 1;
 
     while (fs.existsSync(finalPath)) {
-      finalPath = path.join(config.uploadDir, `${base}_(${counter})${ext}`);
+      finalPath = path.join(this.config.uploadDir, `${base}_(${counter})${ext}`);
       counter++;
     }
 
@@ -119,10 +124,10 @@ export class PendingUploadService {
       savedAs: path.basename(finalPath),
     });
 
+    // The absolute path stays inside the service: responses never expose it.
     return {
       transferId,
       fileName: path.basename(finalPath),
-      filePath: finalPath,
       size: record.fileSize,
     };
   }
@@ -178,5 +183,3 @@ export class PendingUploadService {
     return safeRecord;
   }
 }
-
-export const pendingUploadManager = new PendingUploadService();

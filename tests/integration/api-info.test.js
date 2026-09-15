@@ -1,7 +1,6 @@
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from '../../src/server.js';
-import { config } from '../../src/config.js';
 
 describe('Integration: API Info & Auth', () => {
   let server;
@@ -35,10 +34,7 @@ describe('Integration: API Info & Auth', () => {
     assert.equal(typeof body.data.uptime, 'number');
   });
 
-  it('POST /api/auth should bypass when server PIN is null', async () => {
-    const originalPin = config.pin;
-    config.pin = null;
-
+  it('POST /api/auth should bypass when no PIN is configured for the app', async () => {
     const res = await fetch(`${baseUrl}/api/auth`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -49,25 +45,44 @@ describe('Integration: API Info & Auth', () => {
     const body = await res.json();
     assert.equal(body.success, true);
     assert.equal(body.data.token, 'bypass');
+  });
+});
 
-    config.pin = originalPin;
+describe('Integration: PIN session issuance', () => {
+  let app, server, baseUrl, pinToken;
+
+  before(async () => {
+    app = createServer({ pin: '7788' });
+    await new Promise((resolve) => {
+      server = app.listen(0, '127.0.0.1', () => {
+        baseUrl = `http://127.0.0.1:${server.address().port}`;
+        resolve();
+      });
+    });
   });
 
-  it('POST /api/auth should enforce PIN when configured and rate limit after 5 failures', async () => {
-    const originalPin = config.pin;
-    config.pin = '7788';
+  after(async () => {
+    await new Promise((resolve) => server.close(resolve));
+    app.locals.sessions.revokeAll();
+  });
 
-    // 1. Correct PIN succeeds
-    const successRes = await fetch(`${baseUrl}/api/auth`, {
+  it('issues an opaque, expiring session for the correct PIN', async () => {
+    const res = await fetch(`${baseUrl}/api/auth`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ pin: '7788' }),
     });
-    assert.equal(successRes.status, 200);
-    const successBody = await successRes.json();
-    assert.ok(successBody.data.token.startsWith('utrans_'));
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    pinToken = body.data.token;
 
-    // 2. 4 wrong PIN attempts -> 401
+    assert.match(pinToken, /^[a-f0-9]{64}$/);
+    assert.equal(pinToken.includes('utrans_'), false);
+    assert.ok(Date.parse(body.data.expiresAt) > Date.now());
+    assert.equal(body.data.expiresIn > 0, true);
+  });
+
+  it('rate limits after 5 failed attempts', async () => {
     for (let i = 0; i < 4; i++) {
       const failRes = await fetch(`${baseUrl}/api/auth`, {
         method: 'POST',
@@ -77,7 +92,6 @@ describe('Integration: API Info & Auth', () => {
       assert.equal(failRes.status, 401);
     }
 
-    // 3. 5th wrong attempt triggers rate limit -> 429
     const rateLimitRes = await fetch(`${baseUrl}/api/auth`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -86,7 +100,14 @@ describe('Integration: API Info & Auth', () => {
     assert.equal(rateLimitRes.status, 429);
     const rateLimitBody = await rateLimitRes.json();
     assert.equal(rateLimitBody.error.code, 'RATE_LIMITED');
+  });
 
-    config.pin = originalPin;
+  it('gates data routes with the issued session', async () => {
+    assert.equal((await fetch(`${baseUrl}/api/shared`)).status, 401);
+
+    const gated = await fetch(`${baseUrl}/api/shared`, {
+      headers: { 'X-Session-Token': pinToken },
+    });
+    assert.equal(gated.status, 200);
   });
 });

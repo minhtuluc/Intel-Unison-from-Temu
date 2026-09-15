@@ -5,6 +5,7 @@
  */
 
 import { hostHeaders } from './host-session.js';
+import { getSessionToken } from './api.js';
 
 export class ConnectionManager {
   constructor() {
@@ -77,6 +78,28 @@ export class ConnectionManager {
     } catch {
       this._scheduleReconnect();
     }
+  }
+
+  /**
+   * Drops the current socket and reconnects with the latest credentials.
+   * Used after the PIN gate obtains a session capability.
+   */
+  reconnect() {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.reconnectAttempts = 0;
+    if (this.ws) {
+      try {
+        this.ws.onclose = null;
+        this.ws.close();
+      } catch {
+        // Ignore close errors on a dead socket
+      }
+      this.ws = null;
+    }
+    this.connect();
   }
 
   /**
@@ -167,12 +190,6 @@ export class ConnectionManager {
   }
 
   _registerDevice() {
-    let deviceId = localStorage.getItem('utrans_device_id');
-    if (!deviceId) {
-      deviceId = `dev_${Math.random().toString(36).slice(2, 10)}`;
-      localStorage.setItem('utrans_device_id', deviceId);
-    }
-
     const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
     let platform = 'web';
     if (/iPhone|iPad|iPod/i.test(navigator.userAgent)) platform = 'ios';
@@ -189,7 +206,7 @@ export class ConnectionManager {
 
     this.send('client:register', {
       hostToken: hostHeaders()['X-Host-Token'],
-      deviceId,
+      sessionToken: getSessionToken(),
       deviceName,
       platform,
       isHost:

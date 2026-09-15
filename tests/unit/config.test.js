@@ -94,6 +94,22 @@ describe('Config System', () => {
       });
     });
 
+    it('should reject invalid session settings instead of disabling expiry', () => {
+      assert.throws(() => validateConfig({ ...DEFAULT_CONFIG, sessionTtlMs: NaN }), {
+        code: 'CONFIG_INVALID',
+      });
+      assert.throws(() => validateConfig({ ...DEFAULT_CONFIG, sessionTtlMs: 0 }), {
+        code: 'CONFIG_INVALID',
+      });
+      assert.throws(() => validateConfig({ ...DEFAULT_CONFIG, maxSessions: NaN }), {
+        code: 'CONFIG_INVALID',
+      });
+      assert.throws(() => validateConfig({ ...DEFAULT_CONFIG, maxSessions: 0 }), {
+        code: 'CONFIG_INVALID',
+      });
+      assert.equal(validateConfig({ ...DEFAULT_CONFIG, sessionTtlMs: 1000, maxSessions: 1 }), true);
+    });
+
     it('should validate PIN format (4-6 digits)', () => {
       assert.equal(validateConfig({ ...DEFAULT_CONFIG, pin: '1234' }), true);
       assert.equal(validateConfig({ ...DEFAULT_CONFIG, pin: '123456' }), true);

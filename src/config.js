@@ -13,12 +13,17 @@ export const DEFAULT_CONFIG = {
   tempDir: path.join(process.cwd(), 'temp'),
   chunkSize: 10 * 1024 * 1024, // 10MB
   maxFileSize: 10 * 1024 * 1024 * 1024, // 10GB
+  // Empty array = host authority is the only gate for source paths.
+  // Non-empty = every staged source path must live inside one of these roots.
+  allowedSourceDirs: [],
   maxConcurrentTransfers: 5,
   maxConnectedDevices: 20,
   uploadExpiry: 60 * 60 * 1000, // 1 hour
   thumbnailSize: 200,
   thumbnailQuality: 80,
   pin: null,
+  sessionTtlMs: 24 * 60 * 60 * 1000, // PIN session lifetime
+  maxSessions: 64,
   autoOpenBrowser: true,
   logLevel: 'info',
 };
@@ -43,11 +48,12 @@ export function resolvePath(inputPath) {
  */
 export function validateConfig(cfg) {
   const port = Number(cfg.port);
-  if (!Number.isInteger(port) || port < 1024 || port > 65535) {
+  // 0 means "let the OS pick a free port" and is used by tests and launchers.
+  if (!Number.isInteger(port) || port < 0 || (port > 0 && port < 1024) || port > 65535) {
     throw new AppError(
       'CONFIG_INVALID',
       500,
-      `Invalid port: ${cfg.port}. Must be between 1024 and 65535.`
+      `Invalid port: ${cfg.port}. Must be 0 (ephemeral) or between 1024 and 65535.`
     );
   }
 
@@ -85,6 +91,24 @@ export function validateConfig(cfg) {
   const maxDevices = Number(cfg.maxConnectedDevices);
   if (!Number.isInteger(maxDevices) || maxDevices < 1) {
     throw new AppError('CONFIG_INVALID', 500, 'maxConnectedDevices must be an integer >= 1.');
+  }
+
+  const sessionTtlMs = Number(cfg.sessionTtlMs);
+  if (!Number.isInteger(sessionTtlMs) || sessionTtlMs <= 0) {
+    throw new AppError(
+      'CONFIG_INVALID',
+      500,
+      `Invalid sessionTtlMs: ${cfg.sessionTtlMs}. Must be a positive integer.`
+    );
+  }
+
+  const maxSessions = Number(cfg.maxSessions);
+  if (!Number.isInteger(maxSessions) || maxSessions < 1) {
+    throw new AppError(
+      'CONFIG_INVALID',
+      500,
+      `Invalid maxSessions: ${cfg.maxSessions}. Must be an integer >= 1.`
+    );
   }
 
   if (cfg.pin !== null && cfg.pin !== undefined) {
@@ -129,20 +153,36 @@ export function loadConfig(overrides = {}) {
     thumbnailSize: DEFAULT_CONFIG.thumbnailSize,
     thumbnailQuality: DEFAULT_CONFIG.thumbnailQuality,
     pin: env.UTRANS_PIN ? env.UTRANS_PIN.trim() : DEFAULT_CONFIG.pin,
+    sessionTtlMs: env.UTRANS_SESSION_TTL_MS
+      ? parseInt(env.UTRANS_SESSION_TTL_MS, 10)
+      : DEFAULT_CONFIG.sessionTtlMs,
+    maxSessions: env.UTRANS_MAX_SESSIONS
+      ? parseInt(env.UTRANS_MAX_SESSIONS, 10)
+      : DEFAULT_CONFIG.maxSessions,
     autoOpenBrowser:
       env.UTRANS_AUTO_OPEN !== undefined
         ? env.UTRANS_AUTO_OPEN === 'true'
         : DEFAULT_CONFIG.autoOpenBrowser,
     logLevel: env.UTRANS_LOG_LEVEL || DEFAULT_CONFIG.logLevel,
+    allowedSourceDirs: env.UTRANS_ALLOWED_SOURCE_DIRS
+      ? env.UTRANS_ALLOWED_SOURCE_DIRS.split(path.delimiter)
+          .map((dir) => dir.trim())
+          .filter(Boolean)
+          .map((dir) => resolvePath(dir))
+      : DEFAULT_CONFIG.allowedSourceDirs,
     ...overrides,
   };
 
   // Ensure paths are properly resolved
   if (rawConfig.uploadDir) rawConfig.uploadDir = resolvePath(rawConfig.uploadDir);
   if (rawConfig.tempDir) rawConfig.tempDir = resolvePath(rawConfig.tempDir);
+  if (!Array.isArray(rawConfig.allowedSourceDirs)) {
+    throw new AppError('CONFIG_INVALID', 500, 'allowedSourceDirs must be an array of paths.');
+  }
+  rawConfig.allowedSourceDirs = rawConfig.allowedSourceDirs
+    .filter((dir) => typeof dir === 'string' && dir.length > 0)
+    .map((dir) => resolvePath(dir));
 
   validateConfig(rawConfig);
   return rawConfig;
 }
-
-export const config = loadConfig();

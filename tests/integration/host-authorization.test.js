@@ -5,34 +5,38 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import WebSocket from 'ws';
+import { createRuntime } from '../../src/runtime.js';
 import { createServer } from '../../src/server.js';
 import { setupWebSocket } from '../../src/websocket/index.js';
 import { createHostAuth } from '../../src/middleware/host-auth.js';
-import { config } from '../../src/config.js';
-import { pendingUploadManager } from '../../src/services/pending-upload.js';
 
 describe('Host authorization at HTTP and WebSocket interfaces', () => {
-  let app, server, wss, base, root, hostToken;
+  let app, server, wss, base, root, hostToken, runtime;
   const sockets = [];
-  const original = { tempDir: config.tempDir, uploadDir: config.uploadDir };
   before(async () => {
     root = await fs.mkdtemp(path.join(os.tmpdir(), 'utrans-host-auth-'));
-    config.tempDir = root;
-    config.uploadDir = path.join(root, 'received');
-    app = createServer();
+    runtime = createRuntime({
+      tempDir: root,
+      uploadDir: path.join(root, 'received'),
+    });
+    app = createServer(runtime);
     hostToken = app.locals.hostAuth.token;
     server = app.listen(0, '127.0.0.1');
     await once(server, 'listening');
     base = `http://127.0.0.1:${server.address().port}`;
-    wss = setupWebSocket(server, app.locals.hostAuth);
+    wss = setupWebSocket(server, {
+      hostAuth: app.locals.hostAuth,
+      sessions: app.locals.sessions,
+      pinRequired: app.locals.pinRequired,
+      discovery: app.locals.runtime.discovery,
+    });
     app.set('wss', wss);
   });
   after(async () => {
     for (const socket of sockets) socket.terminate();
     for (const socket of wss.clients) socket.terminate();
     await new Promise((resolve) => server.close(resolve));
-    await pendingUploadManager.cleanup();
-    Object.assign(config, original);
+    await runtime.pendingUploadManager.cleanup();
     await fs.rm(root, { recursive: true, force: true });
   });
 
@@ -114,7 +118,7 @@ describe('Host authorization at HTTP and WebSocket interfaces', () => {
         body: JSON.stringify({ transferId, action, isHost: true }),
       });
       assert.equal(response.status, 403);
-      assert.ok(pendingUploadManager.getPending(transferId));
+      assert.ok(runtime.pendingUploadManager.getPending(transferId));
     }
     const headers = { 'Content-Type': 'application/json', 'X-Host-Token': hostToken };
     const missingToken = await fetch(`${base}/api/upload/decision`, {
@@ -140,7 +144,7 @@ describe('Host authorization at HTTP and WebSocket interfaces', () => {
     });
     assert.equal(accepted.status, 200);
     assert.equal(
-      await fs.readFile(path.join(config.uploadDir, 'proof.txt'), 'utf8'),
+      await fs.readFile(path.join(runtime.config.uploadDir, 'proof.txt'), 'utf8'),
       'host-only-proof'
     );
   });

@@ -1,15 +1,15 @@
 /**
  * UniversalTrans — Express Server Entry Point
- * Production-grade HTTP server with LAN-binding, CORS, graceful shutdown,
- * QR code terminal rendering, and automatic browser opening.
+ * LAN-bound HTTP server with CORS, QR rendering in the terminal and optional
+ * browser opening. Lifecycle (signals, exit codes) belongs to bin/utrans.js.
  */
 
 import express from 'express';
 import fs from 'node:fs';
-import path from 'node:path';
 import open from 'open';
 import qrcode from 'qrcode';
-import { config as appConfig } from './config.js';
+import { createRuntime, isRuntime } from './runtime.js';
+import { AppError } from './middleware/error-handler.js';
 import { getLanIp, isLanIp } from './utils/network.js';
 import { logger } from './utils/logger.js';
 import { requestLogger } from './middleware/logger.js';
@@ -17,21 +17,23 @@ import { errorHandler } from './middleware/error-handler.js';
 import { infoRouter } from './routes/info.js';
 import { filesRouter } from './routes/files.js';
 import { transferRouter } from './routes/transfer.js';
-import { shareManager } from './services/share-manager.js';
-import { chunkedUploadManager } from './services/chunked-upload.js';
-import { pendingUploadManager } from './services/pending-upload.js';
 import { setupWebSocket } from './websocket/index.js';
-import { createHostAuth } from './middleware/host-auth.js';
+import { requireSession } from './middleware/session-auth.js';
 
 /**
  * Creates and configures the Express application instance.
- * @param {object} [customConfig]
+ * Accepts an existing runtime, or plain config overrides that build one.
+ * @param {object} [runtimeOrOptions]
  * @returns {express.Application}
  */
-export function createServer(customConfig = {}) {
+export function createServer(runtimeOrOptions = {}) {
   const app = express();
-  const _cfg = { ...appConfig, ...customConfig };
-  app.locals.hostAuth = createHostAuth();
+  const runtime = isRuntime(runtimeOrOptions) ? runtimeOrOptions : createRuntime(runtimeOrOptions);
+
+  app.locals.runtime = runtime;
+  app.locals.hostAuth = runtime.hostAuth;
+  app.locals.sessions = runtime.sessions;
+  app.locals.pinRequired = runtime.pinRequired;
 
   // Security: hide framework banner and set defensive headers
   app.disable('x-powered-by');
@@ -63,6 +65,16 @@ export function createServer(customConfig = {}) {
     next();
   });
 
+  // API responses describe live state (staged files, pending approvals). A cached
+  // 304 would leave clients showing a stale or empty list after the state changed.
+  app.use('/api', (req, res, next) => {
+    res.setHeader('Cache-Control', 'no-store');
+    if (req.headers['if-none-match']) {
+      delete req.headers['if-none-match'];
+    }
+    next();
+  });
+
   // Request logging
   app.use(requestLogger);
 
@@ -70,8 +82,8 @@ export function createServer(customConfig = {}) {
   app.use(express.json({ limit: '10mb' }));
   app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-  // Serve static assets from public/
-  const publicDir = path.resolve('public');
+  // Serve static assets from public/ (resolved against the package, not the cwd)
+  const publicDir = runtime.publicDir;
   if (fs.existsSync(publicDir)) {
     app.use(
       express.static(publicDir, {
@@ -96,10 +108,11 @@ export function createServer(customConfig = {}) {
     });
   });
 
-  // Mount API routers
+  // Mount API routers. Discovery and PIN exchange stay public; data routes are
+  // gated whenever a PIN is configured (see session-auth.js).
   app.use(infoRouter);
-  app.use(filesRouter);
-  app.use(transferRouter);
+  app.use(requireSession, filesRouter);
+  app.use(requireSession, transferRouter);
 
   // Centralized error handler
   app.use(errorHandler);
@@ -113,13 +126,17 @@ export function createServer(customConfig = {}) {
  * @returns {Promise<{ server: import('http').Server, app: express.Application, url: string }>}
  */
 export async function startServer(options = {}) {
-  const cfg = { ...appConfig, ...options };
-  const app = createServer(cfg);
+  // Launch options (host, noBrowser, initialPaths) are not runtime config; keep them
+  // separate so the runtime config only carries app settings.
+  const { host: requestedHost, localOnly, noBrowser, initialPaths, ...configOverrides } = options;
+  const runtime = isRuntime(options) ? options : createRuntime(configOverrides);
+  const cfg = runtime.config;
+  const app = createServer(runtime);
 
   // Determine host: bind LAN IP by default, allow localhost
   const lanIp = getLanIp();
-  const host = options.host || (options.localOnly ? '127.0.0.1' : lanIp || '127.0.0.1');
-  const port = options.port ?? appConfig.port;
+  const host = requestedHost || (localOnly ? '127.0.0.1' : lanIp || '127.0.0.1');
+  const port = configOverrides.port ?? cfg.port;
   let url;
 
   // Ensure directories exist
@@ -127,18 +144,24 @@ export async function startServer(options = {}) {
   await fs.promises.mkdir(cfg.tempDir, { recursive: true });
 
   // Share initial paths if provided via CLI
-  if (options.initialPaths && options.initialPaths.length > 0) {
-    logger.info('Staging initial files from command line', { count: options.initialPaths.length });
-    await shareManager.addFiles(options.initialPaths);
+  if (initialPaths && initialPaths.length > 0) {
+    logger.info('Staging initial files from command line', { count: initialPaths.length });
+    await runtime.shareManager.addFiles(initialPaths);
   }
 
   return new Promise((resolve, reject) => {
     const server = app.listen(port, host, async (err) => {
       if (err) return reject(err);
 
-      url = `http://${host}:${server.address().port}`;
+      runtime.setListenPort(server.address().port);
+      url = `http://${host}:${runtime.port}`;
       const hostUrl = `${url}/#host-token=${app.locals.hostAuth.token}`;
-      const wss = setupWebSocket(server, app.locals.hostAuth);
+      const wss = setupWebSocket(server, {
+        hostAuth: app.locals.hostAuth,
+        sessions: app.locals.sessions,
+        pinRequired: app.locals.pinRequired,
+        discovery: runtime.discovery,
+      });
       app.set('wss', wss);
 
       logger.info(`UniversalTrans server running at ${url}`);
@@ -153,12 +176,12 @@ export async function startServer(options = {}) {
       } catch {
         console.log(`Connect URL: ${url}`);
       }
-      if (options.noBrowser || !cfg.autoOpenBrowser) {
+      if (noBrowser || !cfg.autoOpenBrowser) {
         console.log(`Host approval URL (private; do not share): ${hostUrl}`);
       }
 
       // Auto-open browser on PC if configured
-      if (cfg.autoOpenBrowser && !options.noBrowser) {
+      if (cfg.autoOpenBrowser && !noBrowser) {
         try {
           await open(hostUrl);
         } catch {
@@ -166,33 +189,24 @@ export async function startServer(options = {}) {
         }
       }
 
-      // Setup graceful shutdown handlers
-      const shutdown = async (signal) => {
-        logger.info(`Received ${signal}, shutting down gracefully...`);
-        try {
-          wss.close();
-        } catch {
-          // Ignore ws close error
-        }
-        server.close(async () => {
-          try {
-            shareManager.clear();
-            await chunkedUploadManager.cleanup();
-            await pendingUploadManager.cleanup();
-          } catch {
-            // Ignore cleanup errors during shutdown
-          }
+      // Lifecycle belongs to the caller (bin/utrans.js): startServer never installs
+      // signal handlers and never calls process.exit.
+      runtime.attach({ server, wss });
 
-          logger.info('UniversalTrans shutdown complete');
-          process.exit(0);
-        });
-      };
-
-      process.once('SIGINT', () => shutdown('SIGINT'));
-      process.once('SIGTERM', () => shutdown('SIGTERM'));
-
-      resolve({ server, app, url, wss });
+      resolve({ server, app, url, wss, runtime });
     });
-    server.once('error', reject);
+    server.once('error', (err) => {
+      if (err && err.code === 'EADDRINUSE') {
+        reject(
+          new AppError(
+            'PORT_IN_USE',
+            409,
+            `Port ${port} is already in use by another process. Stop it or choose another port.`
+          )
+        );
+        return;
+      }
+      reject(err);
+    });
   });
 }

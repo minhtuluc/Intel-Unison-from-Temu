@@ -1,23 +1,36 @@
 import { describe, it, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
+import { createRuntime } from '../../src/runtime.js';
 import { createServer } from '../../src/server.js';
-import { shareManager } from '../../src/services/share-manager.js';
 
 describe('Integration: API Files & Sharing', () => {
   let server;
   let baseUrl;
-  const testDir = path.resolve('temp/test_api_files');
-  const file1 = path.join(testDir, 'document.pdf');
-  const file2 = path.join(testDir, 'photo.png');
+  let hostToken;
+  let runtime;
+  let root;
+  let testDir;
+  let file1;
+  let file2;
 
   before(async () => {
+    root = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'utrans-api-files-'));
+    testDir = path.join(root, 'fixtures');
+    file1 = path.join(testDir, 'document.pdf');
+    file2 = path.join(testDir, 'photo.png');
     await fs.promises.mkdir(testDir, { recursive: true });
     await fs.promises.writeFile(file1, 'PDF dummy content');
     await fs.promises.writeFile(file2, 'PNG dummy content');
 
-    const app = createServer();
+    runtime = createRuntime({
+      tempDir: path.join(root, 'temp'),
+      uploadDir: path.join(root, 'received'),
+    });
+    const app = createServer(runtime);
+    hostToken = app.locals.hostAuth.token;
     await new Promise((resolve) => {
       server = app.listen(0, '127.0.0.1', () => {
         const port = server.address().port;
@@ -29,11 +42,13 @@ describe('Integration: API Files & Sharing', () => {
 
   after(async () => {
     await new Promise((resolve) => server.close(resolve));
-    await fs.promises.rm(testDir, { recursive: true, force: true });
+    runtime.shareManager.clear();
+    await runtime.pendingUploadManager.cleanup();
+    await fs.promises.rm(root, { recursive: true, force: true });
   });
 
   beforeEach(() => {
-    shareManager.clear();
+    runtime.shareManager.clear();
   });
 
   it('GET /api/shared should return empty list initially', async () => {
@@ -46,10 +61,10 @@ describe('Integration: API Files & Sharing', () => {
     assert.equal(body.data.fileCount, 0);
   });
 
-  it('POST /api/share (Local JSON mode) should stage files from disk', async () => {
+  it('POST /api/share (Local JSON mode) should stage files from disk for the host', async () => {
     const res = await fetch(`${baseUrl}/api/share`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'X-Host-Token': hostToken },
       body: JSON.stringify({ paths: [file1, file2] }),
     });
 
@@ -86,7 +101,7 @@ describe('Integration: API Files & Sharing', () => {
   });
 
   it('DELETE /api/share/:fileId should unstage a file', async () => {
-    const meta = await shareManager.addFile(file1);
+    const meta = await runtime.shareManager.addFile(file1);
 
     const deleteRes = await fetch(`${baseUrl}/api/share/${meta.id}`, {
       method: 'DELETE',

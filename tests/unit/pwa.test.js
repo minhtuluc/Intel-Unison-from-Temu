@@ -84,6 +84,12 @@ describe('PWA & Static Assets (Unit)', () => {
       assert.ok(swCode.includes('/api'), 'handles or bypasses api routes');
       assert.ok(swCode.includes('/ws'), 'handles or bypasses ws routes');
     });
+
+    it('caches the session-aware api client in the shell', () => {
+      const swCode = fs.readFileSync(swPath, 'utf8');
+      assert.ok(swCode.includes("'/js/api.js'"), 'api.js is part of the cached shell');
+      assert.equal(swCode.includes('utrans-shell-v3'), false, 'old shell cache version is gone');
+    });
   });
 
   describe('Security and Cache Headers', () => {

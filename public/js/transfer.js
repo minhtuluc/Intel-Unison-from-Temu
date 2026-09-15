@@ -5,6 +5,7 @@
  */
 
 import { formatFileSize, formatEta } from './utils.js';
+import { apiFetch, getSessionToken, getHostToken } from './api.js';
 
 export class TransferEngine {
   constructor(options = {}) {
@@ -211,7 +212,11 @@ export class TransferEngine {
       formData.append('files', task.file, task.name);
 
       xhr.open('POST', '/api/upload');
-      xhr.setRequestHeader('X-Device-Id', this._getDeviceId());
+      const sessionToken = getSessionToken();
+      if (sessionToken) xhr.setRequestHeader('X-Session-Token', sessionToken);
+      const hostToken = getHostToken();
+      if (hostToken) xhr.setRequestHeader('X-Host-Token', hostToken);
+      // The server derives identity itself; only the display label is reported.
       xhr.setRequestHeader('X-Device-Name', this._getDeviceName());
       xhr.setRequestHeader('X-Platform', this._getPlatform());
       xhr.send(formData);
@@ -225,7 +230,7 @@ export class TransferEngine {
     try {
       // Step 1: Init if not already initialized
       if (!task.uploadId) {
-        const initRes = await fetch('/api/upload/init', {
+        const initRes = await apiFetch('/api/upload/init', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -282,11 +287,10 @@ export class TransferEngine {
       }
 
       // Step 3: Complete upload
-      const compRes = await fetch('/api/upload/complete', {
+      const compRes = await apiFetch('/api/upload/complete', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'X-Device-Id': this._getDeviceId(),
           'X-Device-Name': this._getDeviceName(),
           'X-Platform': this._getPlatform(),
         },
@@ -347,6 +351,10 @@ export class TransferEngine {
       formData.append('chunk', chunkBlob, `chunk_${chunkIndex}`);
 
       xhr.open('POST', '/api/upload/chunk');
+      const sessionToken = getSessionToken();
+      if (sessionToken) xhr.setRequestHeader('X-Session-Token', sessionToken);
+      const hostToken = getHostToken();
+      if (hostToken) xhr.setRequestHeader('X-Host-Token', hostToken);
       xhr.send(formData);
     });
   }
@@ -412,7 +420,7 @@ export class TransferEngine {
 
     if (task.isChunked && task.uploadId) {
       try {
-        const res = await fetch(`/api/upload/status/${task.uploadId}`);
+        const res = await apiFetch(`/api/upload/status/${task.uploadId}`);
         if (res.ok) {
           const data = await res.json();
           if (data.data?.nextChunk !== null && data.data?.nextChunk !== undefined) {
@@ -533,15 +541,6 @@ export class TransferEngine {
   clearCompleted() {
     this.completedTransfers = [];
     this._emit('queue:updated', this.getStatus());
-  }
-
-  _getDeviceId() {
-    let id = localStorage.getItem('utrans_device_id');
-    if (!id) {
-      id = `dev_${Math.random().toString(36).slice(2, 10)}`;
-      localStorage.setItem('utrans_device_id', id);
-    }
-    return id;
   }
 
   _getDeviceName() {

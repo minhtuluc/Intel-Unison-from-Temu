@@ -232,5 +232,3 @@ export class ShareManager {
     };
   }
 }
-
-export const shareManager = new ShareManager();

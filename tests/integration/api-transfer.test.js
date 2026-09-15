@@ -1,28 +1,38 @@
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { createRuntime } from '../../src/runtime.js';
 import { createServer } from '../../src/server.js';
-import { shareManager } from '../../src/services/share-manager.js';
-import { config } from '../../src/config.js';
 
 describe('Integration: API Transfer (Download & Upload)', () => {
   let server;
   let baseUrl;
-  const testDir = path.resolve('temp/test_api_transfer');
-  const downloadSourceFile = path.join(testDir, 'source_file.dat');
+  let runtime;
+  let root;
+  let testDir;
+  let downloadSourceFile;
   let testFileHash = '';
   const fileContent = '0123456789ABCDEFGHIJabcdefghij!@#$%^&*()'; // 40 bytes
 
   before(async () => {
+    root = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'utrans-transfer-'));
+    testDir = path.join(root, 'fixtures');
+    downloadSourceFile = path.join(testDir, 'source_file.dat');
     await fs.promises.mkdir(testDir, { recursive: true });
-    await fs.promises.mkdir(config.uploadDir, { recursive: true });
+
+    runtime = createRuntime({
+      tempDir: path.join(root, 'temp'),
+      uploadDir: path.join(root, 'received'),
+    });
+    await fs.promises.mkdir(runtime.config.uploadDir, { recursive: true });
     await fs.promises.writeFile(downloadSourceFile, fileContent);
 
     testFileHash = crypto.createHash('sha256').update(fileContent).digest('hex');
 
-    const app = createServer();
+    const app = createServer(runtime);
     await new Promise((resolve) => {
       server = app.listen(0, '127.0.0.1', () => {
         const port = server.address().port;
@@ -34,12 +44,14 @@ describe('Integration: API Transfer (Download & Upload)', () => {
 
   after(async () => {
     await new Promise((resolve) => server.close(resolve));
-    await fs.promises.rm(testDir, { recursive: true, force: true });
+    runtime.shareManager.clear();
+    await runtime.pendingUploadManager.cleanup();
+    await fs.promises.rm(root, { recursive: true, force: true });
   });
 
   describe('GET /api/download/:fileId', () => {
     it('should stream download full file with correct headers and intact checksum', async () => {
-      const meta = await shareManager.addFile(downloadSourceFile);
+      const meta = await runtime.shareManager.addFile(downloadSourceFile);
 
       const res = await fetch(`${baseUrl}/api/download/${meta.id}`);
       assert.equal(res.status, 200);
@@ -54,7 +66,7 @@ describe('Integration: API Transfer (Download & Upload)', () => {
     });
 
     it('should support Range header for resume & seek (206 Partial Content)', async () => {
-      const meta = await shareManager.addFile(downloadSourceFile);
+      const meta = await runtime.shareManager.addFile(downloadSourceFile);
 
       // Request bytes 10-19 (10 bytes: 'ABCDEFGHIJ')
       const res = await fetch(`${baseUrl}/api/download/${meta.id}`, {
@@ -70,7 +82,7 @@ describe('Integration: API Transfer (Download & Upload)', () => {
     });
 
     it('should return 416 for invalid range values', async () => {
-      const meta = await shareManager.addFile(downloadSourceFile);
+      const meta = await runtime.shareManager.addFile(downloadSourceFile);
 
       const res = await fetch(`${baseUrl}/api/download/${meta.id}`, {
         headers: { Range: 'bytes=500-600' },
@@ -96,17 +108,19 @@ describe('Integration: API Transfer (Download & Upload)', () => {
       assert.equal(body.success, true);
       assert.ok(body.data.uploaded[0].name.startsWith('mobile_upload'));
 
-      const savedPath = body.data.uploaded[0].path;
-      assert.ok(fs.existsSync(savedPath));
-      const content = await fs.promises.readFile(savedPath, 'utf8');
+      // UT-015: responses never disclose host paths.
+      assert.equal(body.data.uploaded[0].path, undefined);
+      const pendingPath = path.join(runtime.config.tempDir, 'pending', body.data.uploaded[0].name);
+      assert.ok(fs.existsSync(pendingPath));
+      const content = await fs.promises.readFile(pendingPath, 'utf8');
       assert.equal(content, uploadText);
     });
   });
 
   describe('POST /api/upload/init -> chunk -> complete (Chunked Upload Protocol)', () => {
     it('should complete full chunked upload cycle and merge on disk', async () => {
-      const originalChunkSize = config.chunkSize;
-      config.chunkSize = 20; // 20 bytes per chunk so 38 bytes creates 2 chunks
+      const originalChunkSize = runtime.config.chunkSize;
+      runtime.config.chunkSize = 20; // 20 bytes per chunk so 38 bytes creates 2 chunks
 
       try {
         const testChunk1 = Buffer.from('Part1_Payload_Data_'); // 19 bytes
@@ -170,13 +184,20 @@ describe('Integration: API Transfer (Download & Upload)', () => {
         assert.equal(completeRes.status, 200);
         const completeBody = await completeRes.json();
         assert.equal(completeBody.success, true);
-        assert.ok(fs.existsSync(completeBody.data.filePath));
+        // UT-015: the merged file path stays server-side.
+        assert.equal(completeBody.data.filePath, undefined);
+        const mergedPath = path.join(
+          runtime.config.tempDir,
+          'pending',
+          completeBody.data.pending.fileName
+        );
+        assert.ok(fs.existsSync(mergedPath), `merged file exists at ${mergedPath}`);
 
-        const mergedContent = await fs.promises.readFile(completeBody.data.filePath);
+        const mergedContent = await fs.promises.readFile(mergedPath);
         const expectedContent = Buffer.concat([testChunk1, testChunk2]);
         assert.deepEqual(mergedContent, expectedContent);
       } finally {
-        config.chunkSize = originalChunkSize;
+        runtime.config.chunkSize = originalChunkSize;
       }
     });
   });
