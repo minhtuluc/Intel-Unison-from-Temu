@@ -1,5 +1,58 @@
 # Review M1 — chưa đủ điều kiện merge
 
+## Review vòng 2 — commit 181efef (2026-09-15)
+
+**Kết luận hiện tại: Request changes.** Bản sửa đã giải quyết các triệu chứng chính của R1–R4. R5 còn lỗi và có hai vấn đề cần xử lý ở việc cập nhật frontend và regression test. Phần review vòng 1 bên dưới được giữ làm lịch sử, không phải trạng thái mới nhất.
+
+### Đã xác nhận tiến bộ
+
+- `npm run quality` trên Windows / Node 24.15.0: **204/204 pass**, không fail/cancel/skip; lint và format pass. Coverage local của mã được load: 87,40% line / 81,95% branch / 84,96% function. Không đồng nhất số đo này với số Linux trong tài liệu agent.
+- [CI tại commit 181efef](https://github.com/minhtuluc/Intel-Unison-from-Temu/actions/runs/34917922098) success.
+- R1: probe bổ sung bằng HTTP/WS thật với cookie kiểm tra logout, revoke-all, expiry và eviction: socket đóng, không nhận `share:update` sau khi mất quyền. Suite bàn giao cũng kiểm tra token trong register và host còn quyền sau revoke-all.
+- R2: browser Windows gửi fixture 100 MiB qua chính `TransferEngine.addFiles`, PIN session thật, XMLHttpRequest thật, complete và host bấm Accept trong UI. SHA-256 file nhận khớp fixture: `20492a4d0d84f8beb1767f6616229f85d44c2827b64bdbfb260ee12fa1109e0e`.
+- R3: mở browser host từ bootstrap riêng trên origin test mới, không nhập PIN, không xuất hiện PIN modal; host nhận popup và duyệt được. Suite kiểm tra host-session cookie và data API thành công.
+- R4: regression qua HTTP trả 413 khi vượt limit runtime, file nhỏ nhận 201. Tuy nhiên assertion về dọn đĩa chưa đáng tin vì R7 bên dưới.
+- Fixture browser dùng thư mục temp riêng. Không kiểm thử Android/iOS, Linux local hoặc installer ở vòng này. Phép thử browser dùng harness gọi module production, không phải chọn file qua file picker của app.
+
+### R6 — P1: frontend đã cache không nhận bản vá R2/R3
+
+Vị trí: `public/sw.js:6,56-63` và các thay đổi `public/js/api.js`, `app.js`, `transfer.js`.
+
+`public/sw.js` không thay đổi giữa `1d64c07` và `181efef`: cùng Git blob `3913a0e51e171b89abe9ef5fe2bcac1970665f16`, vẫn `utrans-shell-v4`. Worker phục vụ shell theo cache-first và chỉ nạp STATIC_ASSETS khi install. Browser đã cài worker/cache từ bản M1 cũ không có worker mới để install; reload thông thường vẫn lấy các module cũ, giữ lỗi XHR/PIN dù backend đã cập nhật. Điều này áp dụng cho origin hỗ trợ service worker, ví dụ localhost trên host; không khẳng định HTTP LAN nào cũng có SW.
+
+Yêu cầu: thay đổi version worker/cache cho bản vá này hoặc cơ chế cập nhật asset tương đương. Không cần xây toàn bộ UT-016 trong M1, nhưng phải đưa được bản vá frontend tới phiên đã dùng bản trước.
+
+Điều kiện pass: cài/cache `1d64c07`, triển khai bản mới trên cùng origin, đi qua quy trình cập nhật/reload được hỗ trợ; chứng minh module mới được dùng và upload PIN không còn InvalidStateError. Browser origin sạch chưa kiểm tra được ca nâng cấp này. Phát hiện dựa trên diff và luồng cache production; chưa thực hiện upgrade browser đầu-cuối ở vòng 2.
+
+### R5 — P2 / vẫn mở: shutdown báo thành công giả hoặc không trả kết quả
+
+Vị trí: `src/runtime.js:107-137`.
+
+Hai ca fault injection bổ sung trên runtime production:
+
+1. `chunkedUploadManager.cleanup` reject ngay với lỗi giả lập EACCES: `stop({timeoutMs:100})` trả `{stopped:true,timedOut:false}`, bỏ qua pending cleanup và vẫn còn 1 session. Catch chỉ xét thời gian, không phản ánh lỗi cleanup.
+2. Cleanup thực sự không resolve (`new Promise(() => {})`) trong tiến trình Node độc lập: deadline dùng `timer.unref()`, nên không giữ event loop sống để trả kết quả. Child thoát code 13 với cảnh báo unsettled top-level await, không in kết quả stop. Test hiện hữu dùng timer 200 ms giữ event loop sống nên không phát hiện được ca này.
+
+Yêu cầu: giữ timer deadline sống tới lúc hoàn tất, dọn timer khi xong, phân biệt cleanup lỗi với thành công; thực hiện các cleanup độc lập cần thiết dù một bước reject. Quy định rõ tác vụ cleanup còn chạy sau timeout và trạng thái trả về; caller không được báo shutdown thành công giả.
+
+Điều kiện pass: success, immediate rejection, slow completion, never-resolving cleanup trong child process; kiểm tra kết quả/exit code, pending cleanup, revoke session và stop lặp. Không thay test hang bằng delay để bỏ sót trường hợp thật sự không settle.
+
+### R7 — P2: test dọn file nuốt chính AssertionError
+
+Vị trí: `tests/integration/m1-review-regression.test.js:355-360`.
+
+`assert.equal(entries.length, 0)` nằm trong `try` và `catch` trống bắt mọi lỗi. Nếu còn file dư, assertion ném lỗi rồi bị nuốt, test vẫn xanh. Vì vậy test hiện tại không chứng minh cam kết dọn sạch sau 413.
+
+Yêu cầu: chỉ xử lý ENOENT ở thao tác đọc thư mục; đặt assertion ngoài catch, các lỗi khác phải throw. Thêm kiểm chứng rằng fixture có file dư làm test đỏ. Đây là sửa chất lượng test, không phải bằng chứng production hiện đang để lại file.
+
+### Bàn giao vòng 2
+
+Sửa R5, R6, R7 trên `m1-auth-runtime`; giữ regression R1–R4. Chạy quality và cập nhật bằng chứng tại commit mới. Reviewer chỉ cập nhật tài liệu trên nhánh này, chưa sửa code production hay merge vào main.
+
+---
+
+## Lịch sử: review vòng 1
+
 Ngày review: 2026-09-15. Reviewer kiểm tra nhánh `origin/m1-auth-runtime`, commit `1d64c07196006e54feb56e0c36ce494e49946ae2`, so với `origin/main` tại `cd5d5be`. Phạm vi: UT-002, UT-003, UT-005, UT-010, UT-015; 54 file thay đổi. Không sửa production, không merge/push trong lượt review.
 
 ## Kết luận
