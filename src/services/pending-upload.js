@@ -251,12 +251,43 @@ export class PendingUploadService {
     try {
       const entries = await fs.promises.readdir(pendingDir, { withFileTypes: true });
       const now = Date.now();
-      const activePaths = new Set(Array.from(this.pending.values()).map((r) => r.tempPath));
+      const activePaths = new Set();
+      for (const r of this.pending.values()) {
+        if (!r.tempPath) continue;
+        const p = path.resolve(r.tempPath);
+        activePaths.add(p);
+        if (process.platform === 'win32') {
+          activePaths.add(p.toLowerCase());
+        }
+        try {
+          const real = await fs.promises.realpath(p);
+          activePaths.add(real);
+          if (process.platform === 'win32') {
+            activePaths.add(real.toLowerCase());
+          }
+        } catch {
+          // Ignore if realpath fails
+        }
+      }
 
       for (const entry of entries) {
         if (!entry.isFile()) continue;
         const fullPath = path.join(pendingDir, entry.name);
-        if (!activePaths.has(fullPath)) {
+        let realFullPath = fullPath;
+        try {
+          realFullPath = await fs.promises.realpath(fullPath);
+        } catch {
+          // Fallback to fullPath
+        }
+
+        const isTracked =
+          activePaths.has(fullPath) ||
+          activePaths.has(realFullPath) ||
+          (process.platform === 'win32' &&
+            (activePaths.has(fullPath.toLowerCase()) ||
+              activePaths.has(realFullPath.toLowerCase())));
+
+        if (!isTracked) {
           try {
             const stat = await fs.promises.stat(fullPath);
             if (now - stat.mtimeMs >= olderThanMs) {
