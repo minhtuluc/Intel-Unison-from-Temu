@@ -9,7 +9,7 @@ import { startServer } from '../../src/server.js';
 import { TransferEngine, computeFileSha256 } from '../../public/js/transfer.js';
 import { IncrementalSha256 } from '../../public/js/utils.js';
 
-describe('M2 QC Review Regression Suite (R1 to R12)', () => {
+describe('M2 QC Review Regression Suite (R1 to R13)', () => {
   let tempDir;
   let uploadDir;
   let serverInstance;
@@ -1462,6 +1462,24 @@ describe('M2 QC Review Regression Suite (R1 to R12)', () => {
         const spoofJson = await spoofRes.json();
         assert.equal(spoofJson.error.code, 'INVALID_CONNECTION_ID');
 
+        // A forged host capability must not bypass the connection/session binding.
+        const formForgedHost = new FormData();
+        formForgedHost.append('files', new Blob(['forged host payload']), 'forged_host.txt');
+        const forgedHostRes = await fetch(`${pinUrl}/api/upload`, {
+          method: 'POST',
+          headers: {
+            'X-Session-Token': tokenB,
+            'X-Connection-Id': connIdA,
+            'X-Host-Token': 'a'.repeat(64),
+          },
+          body: formForgedHost,
+        });
+        assert.equal(
+          forgedHostRes.status,
+          403,
+          'Forged host token must not bypass session binding'
+        );
+
         // 6. Fail-closed probe: Upload without session token claiming connectionIdA
         const formNoToken = new FormData();
         formNoToken.append('files', new Blob(['no token payload']), 'notoken.txt');
@@ -1505,5 +1523,105 @@ describe('M2 QC Review Regression Suite (R1 to R12)', () => {
         await fs.promises.rm(pinTestDir, { recursive: true, force: true });
       }
     });
+  });
+
+  // ==========================================
+  // R13 — P1 / UT-004: Host capability remains valid when sender attribution uses connectionId
+  // ==========================================
+  describe('R13: Host upload with connectionId', () => {
+    for (const pin of [null, '2468']) {
+      const policyLabel = pin ? 'PIN enabled' : 'PIN disabled';
+
+      it(`accepts host simple and chunked uploads with ${policyLabel}`, async () => {
+        const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'utrans-r13-host-'));
+        const instance = await startServer({
+          port: 0,
+          host: '127.0.0.1',
+          noBrowser: true,
+          ...(pin ? { pin } : {}),
+          tempDir: path.join(root, 'temp'),
+          uploadDir: path.join(root, 'uploads'),
+        });
+        const port = instance.server.address().port;
+        const base = `http://127.0.0.1:${port}`;
+        const hostToken = instance.runtime.hostAuth.token;
+        const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+
+        try {
+          await new Promise((resolve) => ws.on('open', resolve));
+          const registered = new Promise((resolve) => {
+            ws.on('message', (raw) => {
+              const event = JSON.parse(raw);
+              if (event.event === 'client:registered') resolve(event.data);
+            });
+          });
+          ws.send(
+            JSON.stringify({
+              event: 'client:register',
+              data: { deviceName: 'Host', platform: 'windows', hostToken },
+            })
+          );
+          const { connectionId } = await registered;
+          const authorityHeaders = {
+            'X-Host-Token': hostToken,
+            'X-Connection-Id': connectionId,
+          };
+
+          const simpleForm = new FormData();
+          simpleForm.append('files', new Blob(['host simple payload']), 'host-simple.txt');
+          const simpleRes = await fetch(`${base}/api/upload`, {
+            method: 'POST',
+            headers: authorityHeaders,
+            body: simpleForm,
+          });
+          assert.equal(
+            simpleRes.status,
+            201,
+            `Host simple upload must succeed with ${policyLabel}`
+          );
+
+          const chunkPayload = Buffer.from('host chunked payload');
+          const checksum = crypto.createHash('sha256').update(chunkPayload).digest('hex');
+          const initRes = await fetch(`${base}/api/upload/init`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', ...authorityHeaders },
+            body: JSON.stringify({
+              fileName: 'host-chunked.txt',
+              fileSize: chunkPayload.length,
+              mimeType: 'text/plain',
+              checksum,
+            }),
+          });
+          assert.equal(initRes.status, 200, `Host chunked init must succeed with ${policyLabel}`);
+          const { uploadId } = (await initRes.json()).data;
+
+          const chunkForm = new FormData();
+          chunkForm.append('uploadId', uploadId);
+          chunkForm.append('chunkIndex', '0');
+          chunkForm.append('chunk', new Blob([chunkPayload]), 'chunk_0');
+          const chunkRes = await fetch(`${base}/api/upload/chunk`, {
+            method: 'POST',
+            headers: { 'X-Host-Token': hostToken },
+            body: chunkForm,
+          });
+          assert.equal(chunkRes.status, 200, `Host chunk upload must succeed with ${policyLabel}`);
+
+          const completeRes = await fetch(`${base}/api/upload/complete`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', ...authorityHeaders },
+            body: JSON.stringify({ uploadId }),
+          });
+          assert.equal(
+            completeRes.status,
+            200,
+            `Host chunked complete must succeed with ${policyLabel}`
+          );
+        } finally {
+          ws.terminate();
+          await instance.runtime.stop({ timeoutMs: 3000 });
+          await fs.promises.rm(root, { recursive: true, force: true });
+        }
+      });
+    }
   });
 });

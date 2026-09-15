@@ -1,5 +1,20 @@
 # Review M2 — Reliable transfer
 
+## Xác minh sau vá R13 — trạng thái cuối nhánh (2026-09-15)
+
+### Kết luận: Approved for merge
+
+R13 đã được sửa bằng đúng authority contract `hostAuth.verify(req, hostToken)`. Regression production seam xác nhận host đăng ký WebSocket bằng capability thật có thể gửi cả simple upload và chunked init/chunk/complete khi PIN bật hoặc tắt; host token giả không bypass được ràng buộc session/connection. Toàn bộ R1–R13 hiện đã có regression và pass trên Windows local.
+
+### Bằng chứng cuối
+
+- Regression M2: 32/32 test pass, gồm R11 same-name concurrency, R12 cross-session spoof và R13 host upload.
+- `npm run quality`: lint/format pass; 291/291 test pass, 89 suite, không fail/cancel/skip/todo. Coverage: 88,26% line / 80,07% branch / 84,79% function.
+- `git diff --check`: pass.
+- Phạm vi chưa kiểm chứng không thay đổi: GitHub Actions, Linux local, browser/device thật, payload nhiều GiB, ENOSPC/EACCES thật và installer. Vì vậy kết luận này phê duyệt merge mã M2, không phải phê duyệt release sản phẩm.
+
+---
+
 ## Review vòng 4 — commit `8fc3e4c` (2026-09-15)
 
 ### Kết luận: Request changes

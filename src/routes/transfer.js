@@ -51,7 +51,7 @@ function resolveSender(req) {
         req.app.locals.pinRequired ?? req.app.locals.runtime?.pinRequired ?? false;
       const hostAuth = req.app.locals.hostAuth || req.app.locals.runtime?.hostAuth;
       const hostToken = req.headers['x-host-token'];
-      const isHostReq = Boolean(hostToken && hostAuth?.validate(hostToken));
+      const isHostReq = Boolean(hostToken && hostAuth?.verify(req, hostToken));
 
       if (!isHostReq && (isPinRequired || matchedClient.sessionToken)) {
         const reqToken = extractSessionToken(req);
