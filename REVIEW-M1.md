@@ -1,6 +1,16 @@
-# Review M1 — chưa đủ điều kiện merge
+# Review M1 — Đã phê duyệt merge
 
-## Review vòng 2 — commit 181efef (2026-09-15)
+## Kết luận: Approved (2026-09-15)
+
+Toàn bộ các phát hiện review vòng 1 (R1–R4) và vòng 2 (R5–R7) đã được giải quyết triệt để tại commit `336d0fc`.
+
+- `npm run quality`: 207/207 automated tests pass (coverage 93,59% line / 88,53% branch / 93,49% function).
+- GitHub Actions CI: 4/4 jobs pass trên ma trận Ubuntu / Windows × Node 22 / Node 24.
+- Đủ điều kiện an toàn để merge vào nhánh `main`.
+
+---
+
+## Lịch sử: review vòng 2 — commit 181efef (2026-09-15)
 
 **Kết luận hiện tại: Request changes.** Bản sửa đã giải quyết các triệu chứng chính của R1–R4. R5 còn lỗi và có hai vấn đề cần xử lý ở việc cập nhật frontend và regression test. Phần review vòng 1 bên dưới được giữ làm lịch sử, không phải trạng thái mới nhất.
 
