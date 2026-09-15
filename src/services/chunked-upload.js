@@ -20,6 +20,21 @@ export class ChunkedUploadManager {
     this.tempDir = path.join(this.config.tempDir, 'chunks');
     /** @type {Map<string, object>} */
     this.sessions = new Map();
+    /** @type {Map<string, object>} uploadId -> completion outcome */
+    this.completedOutcomes = new Map();
+    this.completedOutcomesLimit = 200;
+  }
+
+  getCompletedOutcome(uploadId) {
+    return this.completedOutcomes.get(uploadId) || null;
+  }
+
+  recordCompletedOutcome(uploadId, outcome) {
+    if (this.completedOutcomes.size >= this.completedOutcomesLimit) {
+      const oldestKey = this.completedOutcomes.keys().next().value;
+      this.completedOutcomes.delete(oldestKey);
+    }
+    this.completedOutcomes.set(uploadId, outcome);
   }
 
   /**
@@ -60,6 +75,15 @@ export class ChunkedUploadManager {
       );
     }
 
+    if (!checksum || typeof checksum !== 'string' || !/^[a-fA-F0-9]{64}$/.test(checksum)) {
+      throw new AppError(
+        'INVALID_CHECKSUM',
+        400,
+        'checksum must be a valid 64-character SHA-256 hex string'
+      );
+    }
+    const normalizedChecksum = checksum.toLowerCase();
+
     if (this.config.quotaTracker) {
       this.config.quotaTracker.reserve(size);
     }
@@ -86,7 +110,7 @@ export class ChunkedUploadManager {
       fileName: sanitizeFileName(fileName),
       fileSize: size,
       mimeType: mimeType || 'application/octet-stream',
-      expectedChecksum: checksum || null,
+      expectedChecksum: normalizedChecksum,
       chunkSize,
       totalChunks,
       receivedChunks: new Set(),
@@ -235,6 +259,10 @@ export class ChunkedUploadManager {
    * @returns {Promise<{ fileName: string, filePath: string, size: number, mimeType: string, duration: number, averageSpeed: string }>}
    */
   async complete(uploadId, targetDir = this.config.uploadDir) {
+    if (this.completedOutcomes.has(uploadId)) {
+      return { ...this.completedOutcomes.get(uploadId), alreadyCompleted: true };
+    }
+
     const session = this.sessions.get(uploadId);
     if (!session) {
       throw new AppError('UPLOAD_EXPIRED', 410, 'Upload session not found or has expired');
@@ -248,6 +276,9 @@ export class ChunkedUploadManager {
       );
     }
     if (session.status === 'completed') {
+      if (this.completedOutcomes.has(uploadId)) {
+        return { ...this.completedOutcomes.get(uploadId), alreadyCompleted: true };
+      }
       throw new AppError('ALREADY_COMPLETED', 409, `Upload ${uploadId} has already been completed`);
     }
     if (session.status === 'cancelled') {
@@ -336,8 +367,16 @@ export class ChunkedUploadManager {
       throw err;
     }
 
-    // Cleanup session temporary chunks directory
-    await fs.promises.rm(session.sessionDir, { recursive: true, force: true });
+    // Cleanup session temporary chunks directory (best-effort, recoverable)
+    try {
+      await fs.promises.rm(session.sessionDir, { recursive: true, force: true });
+    } catch (cleanupErr) {
+      logger.warn('Failed to clean up chunk session directory (best-effort)', {
+        uploadId,
+        sessionDir: session.sessionDir,
+        error: cleanupErr.message,
+      });
+    }
     this.sessions.delete(uploadId);
     if (this.config.quotaTracker) {
       this.config.quotaTracker.release(session.fileSize);
@@ -354,7 +393,7 @@ export class ChunkedUploadManager {
       speed: `${speedMBs} MB/s`,
     });
 
-    return {
+    const completionResult = {
       fileName: finalFileName,
       filePath: finalPath,
       size: session.fileSize,
@@ -362,6 +401,10 @@ export class ChunkedUploadManager {
       duration: parseFloat(duration.toFixed(1)),
       averageSpeed: `${speedMBs} MB/s`,
     };
+
+    this.recordCompletedOutcome(uploadId, completionResult);
+
+    return completionResult;
   }
 
   /**

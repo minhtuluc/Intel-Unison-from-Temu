@@ -6,9 +6,10 @@ import os from 'node:os';
 import crypto from 'node:crypto';
 import WebSocket from 'ws';
 import { startServer } from '../../src/server.js';
-import { TransferEngine } from '../../public/js/transfer.js';
+import { TransferEngine, computeFileSha256 } from '../../public/js/transfer.js';
+import { IncrementalSha256 } from '../../public/js/utils.js';
 
-describe('M2 QC Review Regression Suite (R1, R2, R3, R4)', () => {
+describe('M2 QC Review Regression Suite (R1 to R10)', () => {
   let tempDir;
   let uploadDir;
   let serverInstance;
@@ -156,12 +157,14 @@ describe('M2 QC Review Regression Suite (R1, R2, R3, R4)', () => {
 
       try {
         const chunk1 = Buffer.from('1234567890');
+        const hash = crypto.createHash('sha256').update(chunk1).digest('hex');
         const initRes = await fetch(`${baseUrl}/api/upload/init`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             fileName: 'complete_vs_cancel.bin',
             fileSize: 10,
+            checksum: hash,
           }),
         });
         assert.equal(initRes.status, 200);
@@ -215,11 +218,12 @@ describe('M2 QC Review Regression Suite (R1, R2, R3, R4)', () => {
   // ==========================================
   describe('R2: Resource limits, storage quota, integer fileSize and checksum integrity', () => {
     it('rejects non-integer, negative, or invalid fileSize with 400 INVALID_FILE_SIZE', async () => {
+      const validChecksum = 'a'.repeat(64);
       // Float
       const resFloat = await fetch(`${baseUrl}/api/upload/init`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ fileName: 'test.bin', fileSize: 12.34 }),
+        body: JSON.stringify({ fileName: 'test.bin', fileSize: 12.34, checksum: validChecksum }),
       });
       assert.equal(resFloat.status, 400);
       const jsonFloat = await resFloat.json();
@@ -229,7 +233,7 @@ describe('M2 QC Review Regression Suite (R1, R2, R3, R4)', () => {
       const resNeg = await fetch(`${baseUrl}/api/upload/init`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ fileName: 'test.bin', fileSize: -500 }),
+        body: JSON.stringify({ fileName: 'test.bin', fileSize: -500, checksum: validChecksum }),
       });
       assert.equal(resNeg.status, 400);
 
@@ -237,7 +241,11 @@ describe('M2 QC Review Regression Suite (R1, R2, R3, R4)', () => {
       const resStr = await fetch(`${baseUrl}/api/upload/init`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ fileName: 'test.bin', fileSize: 'not-a-number' }),
+        body: JSON.stringify({
+          fileName: 'test.bin',
+          fileSize: 'not-a-number',
+          checksum: validChecksum,
+        }),
       });
       assert.equal(resStr.status, 400);
     });
@@ -310,6 +318,7 @@ describe('M2 QC Review Regression Suite (R1, R2, R3, R4)', () => {
           body: JSON.stringify({
             fileName: 'too_big_for_quota.bin',
             fileSize: 600,
+            checksum: 'a'.repeat(64),
           }),
         });
         assert.equal(resInit.status, 507);
@@ -414,7 +423,7 @@ describe('M2 QC Review Regression Suite (R1, R2, R3, R4)', () => {
         const res1 = await fetch(`${tightUrl}/api/upload/init`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ fileName: 'file1.bin', fileSize: 100 }),
+          body: JSON.stringify({ fileName: 'file1.bin', fileSize: 100, checksum: 'a'.repeat(64) }),
         });
         assert.equal(res1.status, 200);
 
@@ -422,7 +431,7 @@ describe('M2 QC Review Regression Suite (R1, R2, R3, R4)', () => {
         const res2 = await fetch(`${tightUrl}/api/upload/init`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ fileName: 'file2.bin', fileSize: 100 }),
+          body: JSON.stringify({ fileName: 'file2.bin', fileSize: 100, checksum: 'b'.repeat(64) }),
         });
         assert.equal(res2.status, 429);
         const json2 = await res2.json();
@@ -443,7 +452,11 @@ describe('M2 QC Review Regression Suite (R1, R2, R3, R4)', () => {
       const resInit = await fetch(`${baseUrl}/api/upload/init`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ fileName: 'quota_cancel.bin', fileSize: 1000 }),
+        body: JSON.stringify({
+          fileName: 'quota_cancel.bin',
+          fileSize: 1000,
+          checksum: 'c'.repeat(64),
+        }),
       });
       const { uploadId } = (await resInit.json()).data;
       assert.equal(runtime.quotaTracker.getStats().used, initialUsed + 1000);
@@ -771,6 +784,487 @@ describe('M2 QC Review Regression Suite (R1, R2, R3, R4)', () => {
         engine.pendingWsDecisions.size <= 50,
         `pendingWsDecisions must be capped at 50, but got ${engine.pendingWsDecisions.size}`
       );
+    });
+  });
+
+  // ==========================================
+  // R5 — P1 / UT-007, UT-009: Frontend Incremental SHA-256 Memory Bound & AbortSignal
+  // ==========================================
+  describe('R5: Memory-bounded incremental SHA-256 hashing and AbortSignal support', () => {
+    it('computes accurate SHA-256 without calling file.arrayBuffer() on the entire file', async () => {
+      // 1.5MB buffer across 500KB slices
+      const buffer = crypto.randomBytes(1500 * 1024);
+      let arrayBufferCalled = false;
+      let sliceCallCount = 0;
+
+      const mockFile = {
+        size: buffer.length,
+        arrayBuffer: () => {
+          arrayBufferCalled = true;
+          throw new Error('Whole-file arrayBuffer() must never be called on mockFile!');
+        },
+        slice: (start, end) => {
+          sliceCallCount++;
+          const sliceBuf = buffer.subarray(start, end);
+          return {
+            arrayBuffer: async () =>
+              sliceBuf.buffer.slice(sliceBuf.byteOffset, sliceBuf.byteOffset + sliceBuf.byteLength),
+          };
+        },
+      };
+
+      const expectedHash = crypto.createHash('sha256').update(buffer).digest('hex');
+      const actualHash = await computeFileSha256(mockFile, { sliceSize: 500 * 1024 });
+
+      assert.equal(actualHash, expectedHash);
+      assert.equal(arrayBufferCalled, false, 'Whole-file arrayBuffer() must not be called');
+      assert.equal(sliceCallCount, 3, 'Must slice into 3 discrete chunks');
+    });
+
+    it('immediately aborts hash calculation when AbortSignal triggers', async () => {
+      // Pre-aborted signal
+      const preController = new AbortController();
+      preController.abort();
+      const mockFile1 = {
+        size: 1024,
+        slice: () => ({ arrayBuffer: async () => new ArrayBuffer(1024) }),
+      };
+      await assert.rejects(
+        () => computeFileSha256(mockFile1, { signal: preController.signal }),
+        (err) => err.name === 'AbortError'
+      );
+
+      // Mid-flight abort
+      const midController = new AbortController();
+      let slicesRead = 0;
+      const mockFile2 = {
+        size: 5000,
+        slice: (start, end) => {
+          slicesRead++;
+          if (slicesRead === 2) {
+            midController.abort();
+          }
+          return {
+            arrayBuffer: async () => Buffer.alloc(end - start).buffer,
+          };
+        },
+      };
+      await assert.rejects(
+        () => computeFileSha256(mockFile2, { signal: midController.signal, sliceSize: 1000 }),
+        (err) => err.name === 'AbortError'
+      );
+    });
+
+    it('IncrementalSha256 pure JS engine correctly hashes data of arbitrary sizes and chunks', () => {
+      const hasher = new IncrementalSha256();
+      const data = Buffer.from(
+        'UniversalTrans M2: Incremental SHA-256 pure JS fallback implementation with various chunk sizes.'
+      );
+      hasher.update(data.subarray(0, 15));
+      hasher.update(data.subarray(15, 45));
+      hasher.update(data.subarray(45));
+      const digest = hasher.digest();
+      const expected = crypto.createHash('sha256').update(data).digest('hex');
+      assert.equal(digest, expected);
+    });
+  });
+
+  // ==========================================
+  // R6 — P1 / UT-007: Concurrency Slot Pre-Claim, Disk Quota Reconcile & Multipart Rollback
+  // ==========================================
+  describe('R6: Simple upload concurrency slot pre-claim, disk quota reconcile & multipart rollback', () => {
+    it('enforces maxConcurrentTransfers across simple and chunked uploads (rejects with 429)', async () => {
+      const tightDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'utrans-r6-concur-'));
+      const tightServer = await startServer({
+        port: 0,
+        host: '127.0.0.1',
+        noBrowser: true,
+        tempDir: tightDir,
+        uploadDir: path.join(tightDir, 'uploads'),
+        maxConcurrentTransfers: 1, // Only 1 concurrent transfer allowed
+      });
+
+      try {
+        const tightUrl = `http://127.0.0.1:${tightServer.server.address().port}`;
+
+        // Init chunked transfer 1 (occupies the single slot)
+        const initRes = await fetch(`${tightUrl}/api/upload/init`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            fileName: 'slot_holder.bin',
+            fileSize: 100,
+            checksum: 'a'.repeat(64),
+          }),
+        });
+        assert.equal(initRes.status, 200);
+
+        // Simple upload while chunked transfer is active must be rejected with 429
+        const form = new FormData();
+        form.append('files', new Blob([Buffer.from('blocked payload')]), 'blocked.bin');
+        const blockedRes = await fetch(`${tightUrl}/api/upload`, {
+          method: 'POST',
+          body: form,
+        });
+        assert.equal(blockedRes.status, 429);
+        const errJson = await blockedRes.json();
+        assert.equal(errJson.error.code, 'TOO_MANY_TRANSFERS');
+      } finally {
+        if (tightServer?.wss) tightServer.wss.close();
+        if (tightServer?.server) {
+          await new Promise((r) => tightServer.server.close(r));
+        }
+        await fs.promises.rm(tightDir, { recursive: true, force: true });
+      }
+    });
+
+    it('reconciles existing disk usage at startup and blocks upload when quota is exceeded', async () => {
+      const testDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'utrans-r6-reconcile-'));
+      const pendingDir = path.join(testDir, 'pending');
+      await fs.promises.mkdir(pendingDir, { recursive: true });
+
+      // Create an orphan file of 800 bytes in pending directory
+      const orphanPath = path.join(pendingDir, 'orphan_800.tmp');
+      await fs.promises.writeFile(orphanPath, Buffer.alloc(800, 'Z'));
+
+      // Start server with 1000 bytes quota
+      const reconServer = await startServer({
+        port: 0,
+        host: '127.0.0.1',
+        noBrowser: true,
+        tempDir: testDir,
+        uploadDir: path.join(testDir, 'uploads'),
+        storageQuota: 1000,
+      });
+
+      try {
+        const reconUrl = `http://127.0.0.1:${reconServer.server.address().port}`;
+
+        // Verify quota tracker accounted for the 800 bytes on startup
+        const stats = reconServer.runtime.quotaTracker.getStats();
+        assert.equal(stats.used, 800, 'Used quota must account for 800 byte orphan file on disk');
+        assert.equal(stats.available, 200, 'Available quota must be 200 bytes');
+
+        // Requesting 300 bytes must be rejected with 507 STORAGE_QUOTA_EXCEEDED (800 + 300 > 1000)
+        const initRes = await fetch(`${reconUrl}/api/upload/init`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            fileName: 'excess.bin',
+            fileSize: 300,
+            checksum: 'b'.repeat(64),
+          }),
+        });
+        assert.equal(initRes.status, 507);
+        const json = await initRes.json();
+        assert.equal(json.error.code, 'STORAGE_QUOTA_EXCEEDED');
+      } finally {
+        if (reconServer?.wss) reconServer.wss.close();
+        if (reconServer?.server) {
+          await new Promise((r) => reconServer.server.close(r));
+        }
+        await fs.promises.rm(testDir, { recursive: true, force: true });
+      }
+    });
+
+    it('atomic multipart upload failure cleans up partial files and releases reserved quota', async () => {
+      const tightDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'utrans-r6-atomic-'));
+      const tightServer = await startServer({
+        port: 0,
+        host: '127.0.0.1',
+        noBrowser: true,
+        tempDir: tightDir,
+        uploadDir: path.join(tightDir, 'uploads'),
+        storageQuota: 1200, // 1200 bytes quota
+      });
+
+      try {
+        const tightUrl = `http://127.0.0.1:${tightServer.server.address().port}`;
+
+        // Upload batch of 2 files: 700 bytes + 700 bytes = 1400 bytes > 1200 quota
+        const form = new FormData();
+        form.append('files', new Blob([Buffer.alloc(700, 'A')]), 'file_a.bin');
+        form.append('files', new Blob([Buffer.alloc(700, 'B')]), 'file_b.bin');
+
+        const uploadRes = await fetch(`${tightUrl}/api/upload`, {
+          method: 'POST',
+          body: form,
+        });
+
+        // Must reject with 507 STORAGE_QUOTA_EXCEEDED
+        assert.equal(uploadRes.status, 507);
+        const errJson = await uploadRes.json();
+        assert.equal(errJson.error.code, 'STORAGE_QUOTA_EXCEEDED');
+
+        // Verify quota is restored to 0 used
+        const stats = tightServer.runtime.quotaTracker.getStats();
+        assert.equal(stats.used, 0, 'Used quota must roll back to 0 after failed batch');
+
+        // Verify no pending records were created
+        assert.equal(tightServer.runtime.pendingUploadManager.pending.size, 0);
+      } finally {
+        if (tightServer?.wss) tightServer.wss.close();
+        if (tightServer?.server) {
+          await new Promise((r) => tightServer.server.close(r));
+        }
+        await fs.promises.rm(tightDir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  // ==========================================
+  // R7 — P1 / UT-008, UT-009: Complete Retry Idempotency & Safe Best-Effort Cleanup
+  // ==========================================
+  describe('R7: Complete retry idempotency and safe chunk cleanup', () => {
+    it('sequential retry of complete returns HTTP 200 with identical transferId without re-processing', async () => {
+      const origChunkSize = runtime.config.chunkSize;
+      runtime.config.chunkSize = 10;
+
+      try {
+        const chunkData = Buffer.from('0123456789');
+        const hash = crypto.createHash('sha256').update(chunkData).digest('hex');
+
+        // 1. Init
+        const initRes = await fetch(`${baseUrl}/api/upload/init`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            fileName: 'retry_complete.bin',
+            fileSize: 10,
+            checksum: hash,
+          }),
+        });
+        assert.equal(initRes.status, 200);
+        const { uploadId } = (await initRes.json()).data;
+
+        // 2. Upload chunk
+        const form = new FormData();
+        form.append('uploadId', uploadId);
+        form.append('chunkIndex', '0');
+        form.append('chunk', new Blob([chunkData]), 'chunk0');
+        const chunkRes = await fetch(`${baseUrl}/api/upload/chunk`, {
+          method: 'POST',
+          body: form,
+        });
+        assert.equal(chunkRes.status, 200);
+
+        // 3. First complete call -> 200 OK
+        const completeRes1 = await fetch(`${baseUrl}/api/upload/complete`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ uploadId }),
+        });
+        assert.equal(completeRes1.status, 200);
+        const json1 = await completeRes1.json();
+        const transferId1 = json1.data.transferId;
+        assert.ok(transferId1, 'First complete returns transferId');
+
+        // 4. Sequential retry of complete call with same uploadId -> must return 200 OK with identical transferId
+        const completeRes2 = await fetch(`${baseUrl}/api/upload/complete`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ uploadId }),
+        });
+        assert.equal(completeRes2.status, 200, 'Retry of complete must return 200, not 410');
+        const json2 = await completeRes2.json();
+        assert.equal(
+          json2.data.transferId,
+          transferId1,
+          'Retry must return the identical transferId'
+        );
+
+        // Clean up pending item
+        await runtime.pendingUploadManager.decline(transferId1);
+      } finally {
+        runtime.config.chunkSize = origChunkSize;
+      }
+    });
+
+    it('best-effort cleanup when rm(sessionDir) encounters an error does not fail completion', async () => {
+      const origChunkSize = runtime.config.chunkSize;
+      runtime.config.chunkSize = 10;
+      const origRm = fs.promises.rm;
+
+      try {
+        const payload = Buffer.from('NonFatalRm');
+        const hash = crypto.createHash('sha256').update(payload).digest('hex');
+
+        const session = await runtime.chunkedUploadManager.initUpload({
+          fileName: 'non_fatal_rm.bin',
+          fileSize: 10,
+          checksum: hash,
+        });
+
+        await runtime.chunkedUploadManager.addChunk(session.uploadId, 0, payload);
+
+        // Mock rm to throw EACCES for this upload's session dir
+        fs.promises.rm = async (targetPath, opts) => {
+          if (typeof targetPath === 'string' && targetPath.includes(session.uploadId)) {
+            const err = new Error('EACCES: permission denied');
+            err.code = 'EACCES';
+            throw err;
+          }
+          return origRm(targetPath, opts);
+        };
+
+        // complete() should succeed without throwing despite rm error
+        const result = await runtime.chunkedUploadManager.complete(session.uploadId);
+        assert.ok(result);
+        assert.equal(result.fileName, 'non_fatal_rm.bin');
+
+        // Clean up created file
+        if (result.filePath && fs.existsSync(result.filePath)) {
+          await fs.promises.unlink(result.filePath).catch(() => {});
+        }
+      } finally {
+        fs.promises.rm = origRm;
+        runtime.config.chunkSize = origChunkSize;
+      }
+    });
+  });
+
+  // ==========================================
+  // R8 — P1 / frontend delivery: Service Worker Cache Lifecycle
+  // ==========================================
+  describe('R8: Service Worker cache version and update lifecycle', () => {
+    it('public/sw.js defines CACHE_NAME as utrans-shell-v6 and purges v5 on activation', async () => {
+      const swPath = path.resolve('public/sw.js');
+      const swContent = await fs.promises.readFile(swPath, 'utf8');
+
+      // Verify CACHE_NAME is updated to v6
+      assert.match(swContent, /CACHE_NAME\s*=\s*['"]utrans-shell-v6['"]/);
+      assert.doesNotMatch(swContent, /CACHE_NAME\s*=\s*['"]utrans-shell-v5['"]/);
+
+      // Verify activation logic purges non-current caches
+      assert.match(swContent, /caches\.delete\(key\)/);
+    });
+  });
+
+  // ==========================================
+  // R9 — P2 / UT-007: Strict 64-hex Checksum Validation
+  // ==========================================
+  describe('R9: Strict 64-character hex SHA-256 checksum input validation', () => {
+    it('rejects null, undefined, number, object, short hex, and invalid hex checksums with 400 INVALID_CHECKSUM', async () => {
+      const invalidChecksums = [
+        null,
+        undefined,
+        12345678,
+        { sha256: 'abc' },
+        'abc',
+        'g'.repeat(64), // non-hex character 'g'
+        '1234567890abcdef'.repeat(3), // 48 chars
+        '1234567890abcdef'.repeat(5), // 80 chars
+      ];
+
+      for (const badChecksum of invalidChecksums) {
+        const body = { fileName: 'strict_chk.bin', fileSize: 100 };
+        if (badChecksum !== undefined) {
+          body.checksum = badChecksum;
+        }
+
+        const res = await fetch(`${baseUrl}/api/upload/init`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+
+        assert.equal(
+          res.status,
+          400,
+          `Expected 400 for checksum: ${JSON.stringify(badChecksum)}, got ${res.status}`
+        );
+        const json = await res.json();
+        assert.equal(json.error.code, 'INVALID_CHECKSUM');
+      }
+    });
+
+    it('accepts valid 64-char uppercase hex checksum and normalizes it to lowercase', async () => {
+      const upperHex = 'A'.repeat(64);
+      const res = await fetch(`${baseUrl}/api/upload/init`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          fileName: 'upper_hex.bin',
+          fileSize: 10,
+          checksum: upperHex,
+        }),
+      });
+
+      assert.equal(res.status, 200);
+      const { uploadId } = (await res.json()).data;
+      const session = runtime.chunkedUploadManager.sessions.get(uploadId);
+      assert.equal(
+        session.expectedChecksum,
+        'a'.repeat(64),
+        'Must normalize checksum to lowercase'
+      );
+
+      // Cancel to clean up
+      await runtime.chunkedUploadManager.cancelUpload(uploadId);
+    });
+  });
+
+  // ==========================================
+  // R10 — P2 / UT-004: Connection ID Validation & Spoofing Protection
+  // ==========================================
+  describe('R10: Connection ID validation, spoofing protection & terminal event routing', () => {
+    it('rejects upload with non-existent or spoofed X-Connection-Id with 403 INVALID_CONNECTION_ID', async () => {
+      const form = new FormData();
+      form.append('files', new Blob(['test payload']), 'spoof_test.txt');
+
+      const res = await fetch(`${baseUrl}/api/upload`, {
+        method: 'POST',
+        headers: {
+          'X-Connection-Id': 'fake-non-existent-conn-id-999',
+        },
+        body: form,
+      });
+
+      assert.equal(res.status, 403);
+      const json = await res.json();
+      assert.equal(json.error.code, 'INVALID_CONNECTION_ID');
+    });
+
+    it('sanitizes connectionId out of discovery getDevices() and device:join broadcasts', async () => {
+      const port = serverInstance.server.address().port;
+      const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+      const events = [];
+      ws.on('message', (m) => events.push(JSON.parse(m)));
+
+      try {
+        await new Promise((r) => ws.on('open', r));
+        ws.send(
+          JSON.stringify({
+            event: 'client:register',
+            data: { deviceName: 'Sanitization Test Device', platform: 'android' },
+          })
+        );
+
+        await new Promise((r) => setTimeout(r, 80));
+
+        // Check discovery getDevices()
+        const devices = runtime.discovery.getDevices();
+        assert.ok(devices.length > 0);
+        for (const dev of devices) {
+          assert.equal(
+            dev.connectionId,
+            undefined,
+            'connectionId must NEVER be exposed in discovery device list'
+          );
+        }
+
+        // Check WebSocket broadcasted device:join events
+        const joinEvents = events.filter((e) => e.event === 'device:join');
+        for (const je of joinEvents) {
+          assert.equal(
+            je.data?.connectionId,
+            undefined,
+            'connectionId must NEVER be leaked in device:join payload'
+          );
+        }
+      } finally {
+        ws.close();
+      }
     });
   });
 });

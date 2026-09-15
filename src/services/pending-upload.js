@@ -27,13 +27,21 @@ export class PendingUploadService {
    * @param {object} params
    * @returns {object} Pending transfer record
    */
-  createPending({ fileName, fileSize, mimeType, tempPath, sender = {}, ttlMs = 300000 }) {
+  createPending({
+    fileName,
+    fileSize,
+    mimeType,
+    tempPath,
+    sender = {},
+    ttlMs = 300000,
+    quotaAlreadyReserved = false,
+  }) {
     const transferId = generateUploadId();
     const cleanName = sanitizeFileName(fileName || 'unnamed_file');
     const size = Number(fileSize) || 0;
     const finalTtl = Number(ttlMs) || 300000;
 
-    if (this.config.quotaTracker) {
+    if (!quotaAlreadyReserved && this.config.quotaTracker) {
       this.config.quotaTracker.reserve(size);
     }
 
@@ -359,6 +367,9 @@ export class PendingUploadService {
             const stat = await fs.promises.stat(fullPath);
             if (olderThanMs <= 0 || Date.now() - stat.mtimeMs >= olderThanMs) {
               await fs.promises.unlink(fullPath);
+              if (this.config.quotaTracker) {
+                this.config.quotaTracker.release(stat.size);
+              }
               logger.info('Swept orphaned pending file', { path: entry.name });
             }
           } catch {

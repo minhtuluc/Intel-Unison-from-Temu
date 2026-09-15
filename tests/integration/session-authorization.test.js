@@ -133,7 +133,11 @@ describe('UT-002: PIN policy gates every data route and WebSocket', () => {
     const init = await fetch(`${base}/api/upload/init`, {
       method: 'POST',
       headers: sessionHeaders(),
-      body: JSON.stringify({ fileName: 'big.bin', fileSize: 1024 }),
+      body: JSON.stringify({
+        fileName: 'big.bin',
+        fileSize: 1024,
+        checksum: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+      }),
     });
     assert.equal(init.status, 200);
 

@@ -150,6 +150,9 @@ export async function startServer(options = {}) {
     await runtime.shareManager.addFiles(initialPaths);
   }
 
+  // Reconcile disk usage with quota tracker before accepting uploads
+  await runtime.reconcileDiskQuota();
+
   return new Promise((resolve, reject) => {
     const server = app.listen(port, host, async (err) => {
       if (err) return reject(err);

@@ -74,12 +74,13 @@ export function handleWsMessage(wss, ws, rawMessage) {
       }
 
       // Send registered ack to current client with all current devices
+      const { connectionId: _c, ...safeDevice } = deviceRecord;
       if (ws.readyState === 1) {
         ws.send(
           JSON.stringify({
             event: 'client:registered',
             data: {
-              device: deviceRecord,
+              device: safeDevice,
               devices: ws.discovery.getDevices(),
               connectionId: ws.connectionId,
             },
@@ -88,8 +89,8 @@ export function handleWsMessage(wss, ws, rawMessage) {
         );
       }
 
-      // Broadcast device:join to other clients
-      broadcastEvent(wss, 'device:join', { device: deviceRecord }, ws);
+      // Broadcast device:join to other clients (never exposing connectionId)
+      broadcastEvent(wss, 'device:join', { device: safeDevice }, ws);
       logger.info('Device registered via WebSocket', {
         deviceId: deviceRecord.id,
         label: deviceRecord.label,
@@ -170,15 +171,7 @@ export function sendTransferTerminalEvent(wss, event, data, sender = null) {
     if (client.isHost) return true;
     const hasSenderInfo = sender && (sender.connectionId || (sender.ip && sender.ip !== 'unknown'));
     if (!hasSenderInfo) return true;
-    if (sender.connectionId && client.connectionId === sender.connectionId) {
-      return true;
-    }
-    if (
-      !sender.connectionId &&
-      sender.ip &&
-      sender.ip !== 'unknown' &&
-      (client._remoteIp === sender.ip || client.ip === sender.ip)
-    ) {
+    if (sender?.connectionId && client.connectionId === sender.connectionId) {
       return true;
     }
     return false;

@@ -16,51 +16,143 @@ import { requireHost } from '../middleware/host-auth.js';
 export const transferRouter = Router();
 
 /**
- * Sender attribution for approvals. The IP is observed by the server; the display
- * name is whatever the client claimed and is marked untrusted for the host UI.
+ * Resolves and strictly validates sender attribution from request headers/body against
+ * observed connection state. Throws 403 INVALID_CONNECTION_ID if connectionId is spoofed
+ * or belongs to a different socket IP / session.
  * @param {import('express').Request} req
  */
-function describeSender(req) {
+function resolveSender(req) {
+  const connectionId = req.headers['x-connection-id'] || req.body?.connectionId || null;
+  const rawReqIp = req.ip || req.socket?.remoteAddress || 'unknown';
+  const cleanReqIp = rawReqIp.replace(/^::ffff:/, '');
+
+  if (connectionId) {
+    const wss = req.app.get('wss') || req.app.locals.runtime?.wss;
+    if (wss && wss.clients) {
+      let matchedClient = null;
+      for (const client of wss.clients) {
+        if (client.connectionId === connectionId) {
+          matchedClient = client;
+          break;
+        }
+      }
+      if (!matchedClient) {
+        throw new AppError('INVALID_CONNECTION_ID', 403, 'Connection ID not found or expired');
+      }
+
+      const clientIp = (matchedClient._remoteIp || '').replace(/^::ffff:/, '');
+      if (clientIp && cleanReqIp && cleanReqIp !== 'unknown' && clientIp !== cleanReqIp) {
+        throw new AppError('INVALID_CONNECTION_ID', 403, 'Connection ID does not match sender IP');
+      }
+
+      // If PIN is required, verify that the session matches the connected socket
+      if (req.app.locals.pinRequired) {
+        const authHeader = req.headers.authorization || '';
+        const bearerToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+        const cookieToken = req.cookies?.['utrans_session'];
+        const reqToken = bearerToken || cookieToken;
+        if (matchedClient.sessionToken && reqToken && matchedClient.sessionToken !== reqToken) {
+          throw new AppError(
+            'INVALID_CONNECTION_ID',
+            403,
+            'Connection ID belongs to a different session'
+          );
+        }
+      }
+    }
+  }
+
   return {
-    connectionId: req.headers['x-connection-id'] || req.body?.connectionId || null,
-    ip: req.ip || req.socket?.remoteAddress || 'unknown',
+    connectionId,
+    ip: rawReqIp,
     label: req.headers['x-device-name'] || req.body?.deviceName || 'Unknown device',
     labelUntrusted: true,
     platform: req.headers['x-platform'] || req.body?.platform || 'unknown',
   };
 }
 
-// Storage for simple upload (<100MB) staged in pending directory awaiting approval
-const simpleUploadStorage = multer.diskStorage({
-  destination: async (req, _file, cb) => {
-    const pendingDir = path.join(req.app.locals.runtime.config.tempDir, 'pending');
-    try {
-      await fs.promises.mkdir(pendingDir, { recursive: true });
-      cb(null, pendingDir);
-    } catch (err) {
-      cb(err, pendingDir);
-    }
-  },
-  filename: (req, file, cb) => {
-    const cleanName = sanitizeFileName(file.originalname);
-    const pendingDir = path.join(req.app.locals.runtime.config.tempDir, 'pending');
-    let finalPath = path.join(pendingDir, cleanName);
+/**
+ * Custom Multer storage engine that streams files to pending staging area while atomically
+ * enforcing quota reservations on each incoming byte and tracking created files for transaction rollback.
+ */
+class SimpleUploadQuotaStorage {
+  _handleFile(req, file, cb) {
+    const runtime = req.app.locals.runtime;
+    const pendingDir = path.join(runtime.config.tempDir, 'pending');
 
-    if (!fs.existsSync(finalPath)) {
-      return cb(null, cleanName);
-    }
+    fs.mkdir(pendingDir, { recursive: true }, (mkdirErr) => {
+      if (mkdirErr) return cb(mkdirErr);
 
-    // Resolve name collisions safely in pending area
-    const ext = path.extname(cleanName);
-    const base = path.basename(cleanName, ext);
-    let counter = 1;
-    while (fs.existsSync(finalPath)) {
-      finalPath = path.join(pendingDir, `${base}_(${counter})${ext}`);
-      counter++;
+      const cleanName = sanitizeFileName(file.originalname || 'unnamed');
+      const ext = path.extname(cleanName);
+      const base = path.basename(cleanName, ext);
+      let finalName = cleanName;
+      let finalPath = path.join(pendingDir, finalName);
+      let counter = 1;
+      while (fs.existsSync(finalPath)) {
+        finalName = `${base}_(${counter})${ext}`;
+        finalPath = path.join(pendingDir, finalName);
+        counter++;
+      }
+
+      req._createdFiles = req._createdFiles || [];
+      const fileRecord = { path: finalPath, size: 0, reservedQuota: 0 };
+      req._createdFiles.push(fileRecord);
+
+      const outStream = fs.createWriteStream(finalPath);
+      let bytesWritten = 0;
+      let aborted = false;
+
+      file.stream.on('data', (chunk) => {
+        bytesWritten += chunk.length;
+        fileRecord.size = bytesWritten;
+        if (runtime.quotaTracker) {
+          try {
+            runtime.quotaTracker.reserve(chunk.length);
+            fileRecord.reservedQuota += chunk.length;
+          } catch (quotaErr) {
+            aborted = true;
+            file.stream.unpipe?.();
+            file.stream.destroy?.();
+            outStream.destroy(quotaErr);
+          }
+        }
+      });
+
+      file.stream.on('error', (err) => {
+        if (!aborted) {
+          outStream.destroy(err);
+        }
+      });
+
+      outStream.on('error', (err) => {
+        cb(err);
+      });
+
+      outStream.on('finish', () => {
+        if (aborted) return;
+        cb(null, {
+          destination: pendingDir,
+          filename: finalName,
+          path: finalPath,
+          size: bytesWritten,
+        });
+      });
+
+      file.stream.pipe(outStream);
+    });
+  }
+
+  _removeFile(req, file, cb) {
+    if (file && file.path) {
+      fs.unlink(file.path, cb);
+    } else {
+      cb(null);
     }
-    cb(null, path.basename(finalPath));
-  },
-});
+  }
+}
+
+const simpleUploadStorage = new SimpleUploadQuotaStorage();
 
 const SIMPLE_UPLOAD_CEILING = 100 * 1024 * 1024;
 const simpleUploads = new WeakMap();
@@ -78,7 +170,7 @@ function simpleUploadFor(runtime) {
   return upload;
 }
 
-/** Parses simple multipart uploads and reports oversized files as 413. */
+/** Parses simple multipart uploads, enforces atomic concurrency slot and quota with batch rollback. */
 function parseSimpleUpload(req, res, next) {
   const runtime = req.app.locals.runtime;
   if (runtime.getActiveTransferCount() >= runtime.config.maxConcurrentTransfers) {
@@ -91,10 +183,49 @@ function parseSimpleUpload(req, res, next) {
     );
   }
 
+  // Pre-claim transfer slot before Multer parses and buffers body
+  runtime.inFlightSimpleUploads++;
+  let slotReleased = false;
+  const releaseSlot = () => {
+    if (!slotReleased) {
+      slotReleased = true;
+      runtime.inFlightSimpleUploads = Math.max(0, runtime.inFlightSimpleUploads - 1);
+    }
+  };
+
+  const cleanupCreatedFiles = async () => {
+    if (req._createdFiles && req._createdFiles.length > 0) {
+      const filesToClean = [...req._createdFiles];
+      req._createdFiles = [];
+      for (const item of filesToClean) {
+        try {
+          if (fs.existsSync(item.path)) {
+            await fs.promises.unlink(item.path);
+          }
+        } catch {
+          // ignore unlink failure
+        }
+        if (runtime.quotaTracker && item.reservedQuota > 0) {
+          runtime.quotaTracker.release(item.reservedQuota);
+          item.reservedQuota = 0;
+        }
+      }
+    }
+  };
+
+  res.on('finish', releaseSlot);
+  res.on('close', async () => {
+    releaseSlot();
+    if (!res.writableEnded) {
+      await cleanupCreatedFiles();
+    }
+  });
+
   const contentLength = Number(req.headers['content-length'] || 0);
   if (runtime.quotaTracker && contentLength > 0) {
     const stats = runtime.quotaTracker.getStats();
     if (contentLength > stats.available) {
+      releaseSlot();
       return next(
         new AppError(
           'STORAGE_QUOTA_EXCEEDED',
@@ -108,18 +239,11 @@ function parseSimpleUpload(req, res, next) {
   const limit = Math.min(runtime.config.maxFileSize, SIMPLE_UPLOAD_CEILING);
   simpleUploadFor(runtime).array('files')(req, res, async (err) => {
     if (!err) return next();
+
+    releaseSlot();
+    await cleanupCreatedFiles();
+
     if (err.code === 'LIMIT_FILE_SIZE') {
-      if (req.files && Array.isArray(req.files)) {
-        for (const file of req.files) {
-          if (file.path) {
-            try {
-              await fs.promises.unlink(file.path);
-            } catch {
-              // Ignore unlink error
-            }
-          }
-        }
-      }
       return next(
         new AppError(
           'FILE_TOO_LARGE',
@@ -262,15 +386,14 @@ transferRouter.get('/api/thumbnail/:fileId', (req, res) => {
  */
 transferRouter.post('/api/upload', parseSimpleUpload, async (req, res, next) => {
   const runtime = req.app.locals.runtime;
-  runtime.inFlightSimpleUploads++;
   try {
     const files = req.files || [];
     if (files.length === 0) {
       throw new AppError('NO_FILES_UPLOADED', 400, 'No files provided in upload');
     }
 
-    // Sender attribution is observed by the server; the claimed name is a label only.
-    const sender = describeSender(req);
+    // Sender attribution is strictly verified against active connection and remote IP
+    const sender = resolveSender(req);
 
     const uploaded = [];
     const pending = [];
@@ -283,6 +406,7 @@ transferRouter.post('/api/upload', parseSimpleUpload, async (req, res, next) => 
         mimeType: f.mimetype,
         tempPath: f.path,
         sender,
+        quotaAlreadyReserved: true,
       });
 
       uploaded.push({
@@ -302,9 +426,17 @@ transferRouter.post('/api/upload', parseSimpleUpload, async (req, res, next) => 
       data: { uploaded, pending },
     });
   } catch (error) {
+    if (req.files && Array.isArray(req.files)) {
+      for (const f of req.files) {
+        try {
+          if (fs.existsSync(f.path)) await fs.promises.unlink(f.path);
+        } catch {
+          // ignore unlink failure
+        }
+        if (runtime.quotaTracker) runtime.quotaTracker.release(f.size);
+      }
+    }
     next(error);
-  } finally {
-    runtime.inFlightSimpleUploads = Math.max(0, runtime.inFlightSimpleUploads - 1);
   }
 });
 
@@ -323,6 +455,8 @@ transferRouter.post('/api/upload/init', async (req, res, next) => {
       );
     }
 
+    const sender = resolveSender(req);
+
     const { fileName, fileSize, mimeType, checksum } = req.body || {};
     const result = await runtime.chunkedUploadManager.initUpload({
       fileName,
@@ -330,6 +464,11 @@ transferRouter.post('/api/upload/init', async (req, res, next) => {
       mimeType,
       checksum,
     });
+
+    const session = runtime.chunkedUploadManager.sessions.get(result.uploadId);
+    if (session) {
+      session.sender = sender;
+    }
 
     res.json({
       success: true,
@@ -437,11 +576,43 @@ transferRouter.post('/api/upload/complete', async (req, res, next) => {
     }
 
     const runtime = req.app.locals.runtime;
+    const existingOutcome = runtime.chunkedUploadManager.getCompletedOutcome(uploadId);
+    if (existingOutcome && existingOutcome.pending) {
+      return res.json({
+        success: true,
+        data: {
+          fileName: existingOutcome.fileName,
+          size: existingOutcome.size,
+          duration: existingOutcome.duration,
+          averageSpeed: existingOutcome.averageSpeed,
+          pending: existingOutcome.pending,
+          transferId: existingOutcome.transferId,
+        },
+      });
+    }
+
     const pendingDir = path.join(runtime.config.tempDir, 'pending');
     const result = await runtime.chunkedUploadManager.complete(uploadId, pendingDir);
+    if (result.pending) {
+      return res.json({
+        success: true,
+        data: {
+          fileName: result.fileName,
+          size: result.size,
+          duration: result.duration,
+          averageSpeed: result.averageSpeed,
+          pending: result.pending,
+          transferId: result.transferId,
+        },
+      });
+    }
 
-    // Sender attribution is observed by the server; the claimed name is a label only.
-    const sender = describeSender(req);
+    let sender;
+    if (req.headers['x-connection-id'] || req.body?.connectionId) {
+      sender = resolveSender(req);
+    } else {
+      sender = result.sender || resolveSender(req);
+    }
 
     const record = runtime.pendingUploadManager.createPending({
       fileName: result.fileName,
@@ -449,7 +620,20 @@ transferRouter.post('/api/upload/complete', async (req, res, next) => {
       mimeType: result.mimeType || 'application/octet-stream',
       tempPath: result.filePath,
       sender,
+      quotaAlreadyReserved: true,
     });
+
+    const outcomeData = {
+      fileName: result.fileName,
+      size: result.size,
+      duration: result.duration,
+      averageSpeed: result.averageSpeed,
+      pending: record,
+      transferId: record.transferId,
+      filePath: result.filePath,
+    };
+
+    runtime.chunkedUploadManager.recordCompletedOutcome(uploadId, outcomeData);
 
     const wss = req.app.get('wss');
     if (wss) {
@@ -459,12 +643,12 @@ transferRouter.post('/api/upload/complete', async (req, res, next) => {
     res.json({
       success: true,
       data: {
-        fileName: result.fileName,
-        size: result.size,
-        duration: result.duration,
-        averageSpeed: result.averageSpeed,
-        pending: record,
-        transferId: record.transferId,
+        fileName: outcomeData.fileName,
+        size: outcomeData.size,
+        duration: outcomeData.duration,
+        averageSpeed: outcomeData.averageSpeed,
+        pending: outcomeData.pending,
+        transferId: outcomeData.transferId,
       },
     });
   } catch (error) {

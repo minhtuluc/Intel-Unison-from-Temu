@@ -6,6 +6,7 @@
  * `app.locals.runtime`, so two runtimes can run side by side without shared state.
  */
 
+import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig } from './config.js';
 import { removeInstanceFile } from './utils/instance-file.js';
@@ -29,6 +30,11 @@ export function createRuntime(options = {}) {
   const config = loadConfig(options);
   const quotaTracker = new StorageQuotaTracker(config.storageQuota);
   config.quotaTracker = quotaTracker;
+
+  // Reconcile existing disk usage from chunks and pending directories
+  const chunksDir = path.join(config.tempDir, 'chunks');
+  const pendingDir = path.join(config.tempDir, 'pending');
+  quotaTracker.reconcileFromDiskSync([chunksDir, pendingDir]);
 
   const runtime = {
     config,
@@ -81,6 +87,16 @@ export function createRuntime(options = {}) {
         runtime.pendingUploadManager.sweepOrphans(olderThanMs),
         runtime.shareManager.sweepOrphans(runtime.config.tempDir, olderThanMs),
       ]);
+    },
+
+    /**
+     * Re-scans disk for chunks and pending uploads to align quota allocation.
+     * @returns {Promise<number>}
+     */
+    async reconcileDiskQuota() {
+      const chunks = path.join(runtime.config.tempDir, 'chunks');
+      const pending = path.join(runtime.config.tempDir, 'pending');
+      return await quotaTracker.reconcileFromDisk([chunks, pending]);
     },
 
     /**

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import crypto from 'node:crypto';
 import WebSocket from 'ws';
 import { startServer } from '../../src/server.js';
 
@@ -154,6 +155,7 @@ describe('Upload Approval & Decision Integration Tests', () => {
 
     try {
       const chunkData = Buffer.from('Chunked_Payload_Data_123456'); // 27 bytes -> 2 chunks
+      const checksum = crypto.createHash('sha256').update(chunkData).digest('hex');
       const initRes = await fetch(`${baseUrl}/api/upload/init`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -161,6 +163,7 @@ describe('Upload Approval & Decision Integration Tests', () => {
           fileName: 'large_recording.mp4',
           fileSize: chunkData.length,
           mimeType: 'video/mp4',
+          checksum,
         }),
       });
 

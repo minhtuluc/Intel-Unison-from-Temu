@@ -28,6 +28,9 @@ describe('ChunkedUploadManager Service', () => {
     });
   });
 
+  const defaultHash = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
+  const sampleHash = (content) => crypto.createHash('sha256').update(content).digest('hex');
+
   afterEach(async () => {
     await fs.promises.rm(rootDir, { recursive: true, force: true });
   });
@@ -37,6 +40,7 @@ describe('ChunkedUploadManager Service', () => {
       const init = await manager.initUpload({
         fileName: 'large_data.bin',
         fileSize: 2500, // Needs 3 chunks of 1024 bytes
+        checksum: defaultHash,
       });
 
       assert.ok(init.uploadId.startsWith('up_'));
@@ -68,11 +72,20 @@ describe('ChunkedUploadManager Service', () => {
         uploadExpiry: 60000,
       });
 
-      await tinyManager.initUpload({ fileName: 'file1.bin', fileSize: 1024 });
-      await tinyManager.initUpload({ fileName: 'file2.bin', fileSize: 1024 });
+      await tinyManager.initUpload({
+        fileName: 'file1.bin',
+        fileSize: 1024,
+        checksum: defaultHash,
+      });
+      await tinyManager.initUpload({
+        fileName: 'file2.bin',
+        fileSize: 1024,
+        checksum: defaultHash,
+      });
 
       await assert.rejects(
-        () => tinyManager.initUpload({ fileName: 'file3.bin', fileSize: 1024 }),
+        () =>
+          tinyManager.initUpload({ fileName: 'file3.bin', fileSize: 1024, checksum: defaultHash }),
         { code: 'TOO_MANY_SESSIONS', statusCode: 429 }
       );
     });
@@ -80,13 +93,15 @@ describe('ChunkedUploadManager Service', () => {
 
   describe('addChunk() & getStatus()', () => {
     it('should store chunks and track received progress', async () => {
+      const chunk0 = Buffer.alloc(1024, 'A');
+      const chunk1 = Buffer.alloc(1024, 'B');
+      const fullChecksum = sampleHash(Buffer.concat([chunk0, chunk1]));
+
       const init = await manager.initUpload({
         fileName: 'transfer.bin',
         fileSize: 2048, // 2 chunks
+        checksum: fullChecksum,
       });
-
-      const chunk0 = Buffer.alloc(1024, 'A');
-      const chunk1 = Buffer.alloc(1024, 'B');
 
       const res0 = await manager.addChunk(init.uploadId, 0, chunk0);
       assert.equal(res0.chunkIndex, 0);
@@ -106,6 +121,7 @@ describe('ChunkedUploadManager Service', () => {
       const init = await manager.initUpload({
         fileName: 'transfer.bin',
         fileSize: 1024, // 1 chunk
+        checksum: defaultHash,
       });
 
       await assert.rejects(() => manager.addChunk(init.uploadId, 5, Buffer.from('data')), {
@@ -125,6 +141,7 @@ describe('ChunkedUploadManager Service', () => {
       const init = await manager.initUpload({
         fileName: 'transfer.bin',
         fileSize: 2048, // 2 chunks of 1024
+        checksum: defaultHash,
       });
 
       // Pass only 500 bytes for chunk 0 when 1024 is expected
@@ -138,6 +155,7 @@ describe('ChunkedUploadManager Service', () => {
       const init = await manager.initUpload({
         fileName: 'transfer.bin',
         fileSize: 1024,
+        checksum: defaultHash,
       });
 
       const chunkData = Buffer.alloc(1024, 'Z');
@@ -158,13 +176,14 @@ describe('ChunkedUploadManager Service', () => {
 
   describe('complete()', () => {
     it('should merge all chunks sequentially and output full file to uploadDir', async () => {
+      const content = Buffer.from('Hello Universe!');
       const init = await manager.initUpload({
         fileName: 'final_merged.txt',
         fileSize: 15,
+        checksum: sampleHash(content),
       });
 
       // 15 bytes in 1KB chunkSize -> 1 chunk
-      const content = Buffer.from('Hello Universe!');
       await manager.addChunk(init.uploadId, 0, content);
 
       const result = await manager.complete(init.uploadId);
@@ -179,6 +198,7 @@ describe('ChunkedUploadManager Service', () => {
       const init = await manager.initUpload({
         fileName: 'incomplete.bin',
         fileSize: 3000, // 3 chunks
+        checksum: defaultHash,
       });
 
       await manager.addChunk(init.uploadId, 0, Buffer.alloc(1024));
@@ -193,6 +213,7 @@ describe('ChunkedUploadManager Service', () => {
       const init = await manager.initUpload({
         fileName: 'corrupt.bin',
         fileSize: 2048,
+        checksum: defaultHash,
       });
 
       await manager.addChunk(init.uploadId, 0, Buffer.alloc(1024, 'A'));
@@ -214,6 +235,7 @@ describe('ChunkedUploadManager Service', () => {
       const init = await manager.initUpload({
         fileName: 'expired.bin',
         fileSize: 1024,
+        checksum: defaultHash,
       });
 
       // Wait for session to expire (expiry was set to 1000ms in test setup)
@@ -229,6 +251,7 @@ describe('ChunkedUploadManager Service', () => {
       const init = await manager.initUpload({
         fileName: 'to_cancel.bin',
         fileSize: 2048,
+        checksum: defaultHash,
       });
 
       await manager.addChunk(init.uploadId, 0, Buffer.alloc(1024));
@@ -261,6 +284,7 @@ describe('ChunkedUploadManager Service', () => {
       const init = await manager.initUpload({
         fileName: 'active.bin',
         fileSize: 1024,
+        checksum: defaultHash,
       });
       const activeDir = path.join(chunksDir, init.uploadId);
 

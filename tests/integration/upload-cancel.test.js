@@ -46,6 +46,7 @@ describe('Integration: POST /api/upload/cancel (Server-side Cancel & Cleanup)', 
         fileName: 'cancelling_movie.mp4',
         fileSize: 2048,
         mimeType: 'video/mp4',
+        checksum: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
       }),
     });
     assert.equal(initRes.status, 200);

@@ -184,6 +184,10 @@ describe('Integration: API Transfer (Download & Upload)', () => {
         const testChunk1 = Buffer.from('Part1_Payload_Data__'); // 20 bytes (chunk 0)
         const testChunk2 = Buffer.from('Part2_Payload_Data'); // 18 bytes (chunk 1 - terminal)
         const totalSize = testChunk1.length + testChunk2.length;
+        const totalChecksum = crypto
+          .createHash('sha256')
+          .update(Buffer.concat([testChunk1, testChunk2]))
+          .digest('hex');
 
         // 1. Init
         const initRes = await fetch(`${baseUrl}/api/upload/init`, {
@@ -193,6 +197,7 @@ describe('Integration: API Transfer (Download & Upload)', () => {
             fileName: 'video_transfer.mp4',
             fileSize: totalSize,
             mimeType: 'video/mp4',
+            checksum: totalChecksum,
           }),
         });
 

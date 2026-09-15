@@ -92,7 +92,9 @@ export class DiscoveryService {
   }
 
   getDevices() {
-    return Array.from(this.devices.values()).map((device) => ({ ...device }));
+    return Array.from(this.devices.values()).map(({ connectionId: _c, ...device }) => ({
+      ...device,
+    }));
   }
 
   clear() {

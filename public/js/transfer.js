@@ -4,26 +4,49 @@
  * with rolling 5s speed calculation, ETA estimation, pause/resume, and PC approval tracking.
  */
 
-import { formatFileSize, formatEta } from './utils.js';
+import { formatFileSize, formatEta, IncrementalSha256 } from './utils.js';
 import { apiFetch, getSessionToken, getHostToken } from './api.js';
 
 /**
- * Computes whole-file SHA-256 digest using Web Crypto API.
+ * Computes whole-file SHA-256 digest incrementally with bounded RAM (<= 2MB).
+ * Never calls file.arrayBuffer() on the entire file. Supports cancellation via AbortSignal.
  * @param {Blob|File} file
- * @returns {Promise<string|null>} Hex string or null if unsupported
+ * @param {{ signal?: AbortSignal, sliceSize?: number }} [options]
+ * @returns {Promise<string>} 64-character lowercase hex string
  */
-export async function computeFileSha256(file) {
-  if (typeof crypto === 'undefined' || !crypto?.subtle?.digest) {
-    return null;
+export async function computeFileSha256(file, { signal = null, sliceSize = 2 * 1024 * 1024 } = {}) {
+  if (!file || typeof file.slice !== 'function') {
+    throw new Error('Invalid file or blob provided for checksum calculation');
   }
-  try {
-    const buffer = await file.arrayBuffer();
-    const hashBuffer = await crypto.subtle.digest('SHA-256', buffer);
-    const hashArray = Array.from(new Uint8Array(hashBuffer));
-    return hashArray.map((b) => b.toString(16).padStart(2, '0')).join('');
-  } catch {
-    return null;
+
+  const hasher = new IncrementalSha256();
+  let offset = 0;
+  const totalSize = file.size;
+
+  while (offset < totalSize) {
+    if (signal?.aborted) {
+      throw new DOMException('Aborted', 'AbortError');
+    }
+    const end = Math.min(offset + sliceSize, totalSize);
+    const slice = file.slice(offset, end);
+    let chunkBytes;
+    if (typeof slice?.arrayBuffer === 'function') {
+      const buffer = await slice.arrayBuffer();
+      chunkBytes = new Uint8Array(buffer);
+    } else if (slice instanceof Uint8Array) {
+      chunkBytes = slice;
+    } else if (ArrayBuffer.isView(slice)) {
+      chunkBytes = new Uint8Array(slice.buffer, slice.byteOffset, slice.byteLength);
+    } else if (slice instanceof ArrayBuffer) {
+      chunkBytes = new Uint8Array(slice);
+    } else {
+      chunkBytes = new Uint8Array(await new Blob([slice]).arrayBuffer());
+    }
+    hasher.update(chunkBytes);
+    offset = end;
   }
+
+  return hasher.digest('hex');
 }
 
 export class TransferEngine {
@@ -278,7 +301,21 @@ export class TransferEngine {
       if (!task.uploadId) {
         if (task.status === 'paused' || task.status === 'cancelled') return task;
 
-        const checksum = await computeFileSha256(task.file);
+        let checksum;
+        try {
+          checksum = await computeFileSha256(task.file, {
+            signal: task.abortController.signal,
+          });
+        } catch (err) {
+          if (
+            task.status === 'paused' ||
+            task.status === 'cancelled' ||
+            err.name === 'AbortError'
+          ) {
+            return task;
+          }
+          throw err;
+        }
         const connectionId =
           this.connectionId || (typeof window !== 'undefined' ? window.utransConnectionId : null);
         const headers = { 'Content-Type': 'application/json' };
