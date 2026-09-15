@@ -9,22 +9,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { DEFAULT_CONFIG } from '../config.js';
 import { generateUploadId } from '../utils/id-generator.js';
-import { sanitizeFileName } from '../utils/file-utils.js';
+import { sanitizeFileName, atomicMove } from '../utils/file-utils.js';
 import { AppError } from '../middleware/error-handler.js';
 import { logger } from '../utils/logger.js';
-
-async function moveFileSafe(src, dest) {
-  try {
-    await fs.promises.rename(src, dest);
-  } catch (err) {
-    if (err.code === 'EXDEV') {
-      await fs.promises.copyFile(src, dest);
-      await fs.promises.unlink(src);
-    } else {
-      throw err;
-    }
-  }
-}
 
 export class PendingUploadService {
   /**
@@ -93,43 +80,70 @@ export class PendingUploadService {
    * @param {string} transferId
    * @returns {Promise<{ transferId: string, fileName: string, size: number }>}
    */
+  /**
+   * Accepts a pending upload, moving it safely to the configured uploadDir.
+   * Atomic collision resolution and transactional: preserves record and temp file on move failure.
+   * @param {string} transferId
+   * @returns {Promise<{ transferId: string, fileName: string, size: number }>}
+   */
   async accept(transferId) {
     const record = this.pending.get(transferId);
     if (!record) {
       throw new AppError('PENDING_NOT_FOUND', 404, `Pending transfer ${transferId} not found`);
     }
 
-    clearTimeout(record.timeoutId);
-    this.pending.delete(transferId);
-
-    // Ensure upload directory exists
-    await fs.promises.mkdir(this.config.uploadDir, { recursive: true });
-
-    // Handle collision safely
-    const ext = path.extname(record.fileName);
-    const base = path.basename(record.fileName, ext);
-    let finalPath = path.join(this.config.uploadDir, record.fileName);
-    let counter = 1;
-
-    while (fs.existsSync(finalPath)) {
-      finalPath = path.join(this.config.uploadDir, `${base}_(${counter})${ext}`);
-      counter++;
+    if (record.isAccepting) {
+      throw new AppError(
+        'TRANSFER_IN_PROGRESS',
+        409,
+        `Transfer ${transferId} is already being accepted`
+      );
     }
+    record.isAccepting = true;
 
-    await moveFileSafe(record.tempPath, finalPath);
+    // Pause timeout while move is in progress
+    clearTimeout(record.timeoutId);
 
-    logger.info('Pending transfer accepted by PC', {
-      transferId,
-      originalName: record.fileName,
-      savedAs: path.basename(finalPath),
-    });
+    try {
+      // Ensure upload directory exists
+      await fs.promises.mkdir(this.config.uploadDir, { recursive: true });
 
-    // The absolute path stays inside the service: responses never expose it.
-    return {
-      transferId,
-      fileName: path.basename(finalPath),
-      size: record.fileSize,
-    };
+      // Atomic move with race-free collision resolution
+      const moved = await atomicMove(record.tempPath, this.config.uploadDir, record.fileName);
+
+      // Only delete record from pending map after the file is successfully moved to uploadDir
+      this.pending.delete(transferId);
+
+      logger.info('Pending transfer accepted by PC', {
+        transferId,
+        originalName: record.fileName,
+        savedAs: moved.fileName,
+      });
+
+      // The absolute path stays inside the service: responses never expose it.
+      return {
+        transferId,
+        fileName: moved.fileName,
+        size: record.fileSize,
+      };
+    } catch (err) {
+      record.isAccepting = false;
+
+      // Re-arm timeout with remaining TTL (minimum 10 seconds) so user can resolve issue and retry
+      const elapsed = Date.now() - record.createdAt;
+      const remainingTtl = Math.max(10000, 300000 - elapsed);
+      record.timeoutId = setTimeout(async () => {
+        logger.warn('Pending upload timed out, removing temp file', {
+          transferId,
+          fileName: record.fileName,
+        });
+        await this._deleteTemp(record.tempPath);
+        this.pending.delete(transferId);
+      }, remainingTtl);
+      if (record.timeoutId.unref) record.timeoutId.unref();
+
+      throw err;
+    }
   }
 
   /**
@@ -165,6 +179,38 @@ export class PendingUploadService {
       await this._deleteTemp(record.tempPath);
     }
     this.pending.clear();
+  }
+
+  /**
+   * Sweeps orphaned pending files from tempDir/pending that are not tracked in this.pending
+   * and are older than olderThanMs.
+   * @param {number} [olderThanMs] Defaults to 5 minutes
+   */
+  async sweepOrphans(olderThanMs = 300000) {
+    const pendingDir = path.join(this.config.tempDir, 'pending');
+    try {
+      const entries = await fs.promises.readdir(pendingDir, { withFileTypes: true });
+      const now = Date.now();
+      const activePaths = new Set(Array.from(this.pending.values()).map((r) => r.tempPath));
+
+      for (const entry of entries) {
+        if (!entry.isFile()) continue;
+        const fullPath = path.join(pendingDir, entry.name);
+        if (!activePaths.has(fullPath)) {
+          try {
+            const stat = await fs.promises.stat(fullPath);
+            if (now - stat.mtimeMs >= olderThanMs) {
+              await fs.promises.unlink(fullPath);
+              logger.info('Swept orphaned pending file', { path: entry.name });
+            }
+          } catch {
+            // Ignore individual file errors
+          }
+        }
+      }
+    } catch {
+      // Ignore if pendingDir does not exist yet
+    }
   }
 
   async _deleteTemp(tempPath) {

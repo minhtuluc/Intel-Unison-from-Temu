@@ -223,4 +223,51 @@ describe('ChunkedUploadManager Service', () => {
       assert.equal(manager.sessions.has(init.uploadId), false);
     });
   });
+
+  describe('cancelUpload()', () => {
+    it('should cancel active session and immediately delete chunk files from disk', async () => {
+      const init = await manager.initUpload({
+        fileName: 'to_cancel.bin',
+        fileSize: 2048,
+      });
+
+      await manager.addChunk(init.uploadId, 0, Buffer.alloc(1024));
+      const sessionDir = path.join(testTempDir, 'chunks', init.uploadId);
+      assert.ok(fs.existsSync(sessionDir));
+
+      const cancelled = await manager.cancelUpload(init.uploadId);
+      assert.equal(cancelled, true);
+      assert.equal(manager.sessions.has(init.uploadId), false);
+      assert.equal(
+        fs.existsSync(sessionDir),
+        false,
+        'Session temp dir must be deleted immediately'
+      );
+    });
+
+    it('should return false when cancelling non-existent uploadId', async () => {
+      const cancelled = await manager.cancelUpload('up_non_existent');
+      assert.equal(cancelled, false);
+    });
+  });
+
+  describe('sweepOrphans()', () => {
+    it('should sweep orphaned chunk session directories not in memory', async () => {
+      const chunksDir = path.join(testTempDir, 'chunks');
+      const orphanDir = path.join(chunksDir, 'up_orphan_session');
+      await fs.promises.mkdir(orphanDir, { recursive: true });
+      await fs.promises.writeFile(path.join(orphanDir, 'chunk_0'), 'orphan');
+
+      const init = await manager.initUpload({
+        fileName: 'active.bin',
+        fileSize: 1024,
+      });
+      const activeDir = path.join(chunksDir, init.uploadId);
+
+      await manager.sweepOrphans(0);
+
+      assert.equal(fs.existsSync(orphanDir), false, 'Orphaned chunk folder must be swept');
+      assert.equal(fs.existsSync(activeDir), true, 'Active chunk folder must be kept');
+    });
+  });
 });

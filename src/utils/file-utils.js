@@ -3,6 +3,7 @@
  * Formatting file sizes, detecting file types/categories, and sanitizing file names.
  */
 
+import fs from 'node:fs';
 import path from 'node:path';
 import mime from 'mime-types';
 
@@ -218,4 +219,70 @@ export function parseRange(rangeHeader, fileSize) {
     end,
     contentLength: end - start + 1,
   };
+}
+
+/**
+ * Atomically reserves a non-colliding file path in targetDir using exclusive creation (O_CREAT | O_EXCL).
+ * If desiredName exists, increments (1), (2), etc.
+ * Returns { fileName, filePath, fileHandle } with an open FileHandle that the caller can write into or close.
+ * @param {string} targetDir
+ * @param {string} desiredName
+ * @returns {Promise<{ fileName: string, filePath: string, fileHandle: import('node:fs/promises').FileHandle }>}
+ */
+export async function reserveWritableFile(targetDir, desiredName) {
+  await fs.promises.mkdir(targetDir, { recursive: true });
+  const cleanName = sanitizeFileName(desiredName);
+  const ext = path.extname(cleanName);
+  const base = path.basename(cleanName, ext);
+
+  let counter = 0;
+  while (true) {
+    const candidateName = counter === 0 ? cleanName : `${base}_(${counter})${ext}`;
+    const candidatePath = path.join(targetDir, candidateName);
+
+    try {
+      const fileHandle = await fs.promises.open(candidatePath, 'wx');
+      return { fileName: candidateName, filePath: candidatePath, fileHandle };
+    } catch (err) {
+      if (err.code === 'EEXIST') {
+        counter++;
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
+/**
+ * Atomically moves a file from src into targetDir under desiredName (or non-colliding copy).
+ * Handles cross-device moves (EXDEV) and cleans up reserved placeholder on failure.
+ * @param {string} src
+ * @param {string} targetDir
+ * @param {string} desiredName
+ * @returns {Promise<{ fileName: string, filePath: string }>}
+ */
+export async function atomicMove(src, targetDir, desiredName) {
+  const { fileName, filePath, fileHandle } = await reserveWritableFile(targetDir, desiredName);
+  await fileHandle.close();
+
+  try {
+    try {
+      await fs.promises.rename(src, filePath);
+    } catch (err) {
+      if (err.code === 'EXDEV') {
+        await fs.promises.copyFile(src, filePath);
+        await fs.promises.unlink(src);
+      } else {
+        throw err;
+      }
+    }
+    return { fileName, filePath };
+  } catch (err) {
+    try {
+      await fs.promises.unlink(filePath);
+    } catch {
+      // Ignore cleanup error
+    }
+    throw err;
+  }
 }

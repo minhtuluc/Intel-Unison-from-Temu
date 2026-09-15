@@ -366,6 +366,27 @@ transferRouter.get('/api/upload/status/:uploadId', (req, res, next) => {
 });
 
 /**
+ * POST /api/upload/cancel
+ * Client cancels an active chunked upload session and cleans up temporary chunks.
+ */
+transferRouter.post('/api/upload/cancel', async (req, res, next) => {
+  try {
+    const { uploadId } = req.body || {};
+    if (!uploadId) {
+      throw new AppError('INVALID_INPUT', 400, 'uploadId is required');
+    }
+
+    const cancelled = await req.app.locals.runtime.chunkedUploadManager.cancelUpload(uploadId);
+    res.json({
+      success: true,
+      data: { uploadId, cancelled },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
  * POST /api/upload/complete
  * Merges all uploaded chunks into the pending staging file awaiting approval.
  */

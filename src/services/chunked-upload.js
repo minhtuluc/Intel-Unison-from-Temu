@@ -10,7 +10,7 @@ import crypto from 'node:crypto';
 import { pipeline } from 'node:stream/promises';
 import { DEFAULT_CONFIG } from '../config.js';
 import { generateUploadId } from '../utils/id-generator.js';
-import { sanitizeFileName, formatFileSize } from '../utils/file-utils.js';
+import { sanitizeFileName, formatFileSize, reserveWritableFile } from '../utils/file-utils.js';
 import { AppError } from '../middleware/error-handler.js';
 import { logger } from '../utils/logger.js';
 
@@ -214,50 +214,42 @@ export class ChunkedUploadManager {
       );
     }
 
-    // Ensure target directory exists
-    await fs.promises.mkdir(targetDir, { recursive: true });
+    // Ensure target directory exists and reserve non-colliding destination file exclusively
+    const {
+      fileName: finalFileName,
+      filePath: finalPath,
+      fileHandle,
+    } = await reserveWritableFile(targetDir, session.fileName);
+    const writeStream = fileHandle.createWriteStream();
 
-    // Handle existing filename collisions cleanly
-    let finalFileName = session.fileName;
-    let finalPath = path.join(targetDir, finalFileName);
+    try {
+      for (let i = 0; i < session.totalChunks; i++) {
+        const chunkPath = path.join(session.sessionDir, `chunk_${i}`);
+        const readStream = fs.createReadStream(chunkPath);
+        await pipeline(readStream, writeStream, { end: false });
+      }
 
-    let counter = 1;
-    const ext = path.extname(session.fileName);
-    const base = path.basename(session.fileName, ext);
+      // Close write stream
+      await new Promise((resolve, reject) => {
+        writeStream.end((err) => (err ? reject(err) : resolve()));
+      });
 
-    while (fs.existsSync(finalPath)) {
-      finalFileName = `${base}_(${counter})${ext}`;
-      finalPath = path.join(targetDir, finalFileName);
-      counter++;
-    }
-
-    // Stream-merge chunks into destination file
-    const writeStream = fs.createWriteStream(finalPath, { flags: 'w' });
-
-    for (let i = 0; i < session.totalChunks; i++) {
-      const chunkPath = path.join(session.sessionDir, `chunk_${i}`);
-      const readStream = fs.createReadStream(chunkPath);
-      await pipeline(readStream, writeStream, { end: false });
-    }
-
-    // Close write stream
-    await new Promise((resolve, reject) => {
-      writeStream.end((err) => (err ? reject(err) : resolve()));
-    });
-
-    // Integrity check: verify reassembled size equals declared fileSize
-    const stat = await fs.promises.stat(finalPath);
-    if (stat.size !== session.fileSize) {
+      // Integrity check: verify reassembled size equals declared fileSize
+      const stat = await fs.promises.stat(finalPath);
+      if (stat.size !== session.fileSize) {
+        throw new AppError(
+          'FILE_CORRUPTED',
+          500,
+          `Reassembled file size (${stat.size}) does not match expected size (${session.fileSize})`
+        );
+      }
+    } catch (err) {
       try {
         await fs.promises.unlink(finalPath);
       } catch {
         // Ignore unlink error
       }
-      throw new AppError(
-        'FILE_CORRUPTED',
-        500,
-        `Reassembled file size (${stat.size}) does not match expected size (${session.fileSize})`
-      );
+      throw err;
     }
 
     // Cleanup session temporary chunks directory
@@ -286,6 +278,28 @@ export class ChunkedUploadManager {
   }
 
   /**
+   * Cancels an active chunked upload session and immediately removes temp files.
+   * @param {string} uploadId
+   * @returns {Promise<boolean>}
+   */
+  async cancelUpload(uploadId) {
+    const session = this.sessions.get(uploadId);
+    if (!session) {
+      return false;
+    }
+
+    this.sessions.delete(uploadId);
+    try {
+      await fs.promises.rm(session.sessionDir, { recursive: true, force: true });
+    } catch {
+      // Ignore cleanup error
+    }
+
+    logger.info('Cancelled chunked upload session', { uploadId, name: session.fileName });
+    return true;
+  }
+
+  /**
    * Cleans up expired upload sessions and removes abandoned chunk directories.
    */
   async cleanup() {
@@ -300,6 +314,36 @@ export class ChunkedUploadManager {
         }
         this.sessions.delete(uploadId);
       }
+    }
+  }
+
+  /**
+   * Sweeps orphaned chunk session directories from tempDir/chunks that are not tracked in this.sessions
+   * and are older than olderThanMs.
+   * @param {number} [olderThanMs] Defaults to config.uploadExpiry
+   */
+  async sweepOrphans(olderThanMs = this.config.uploadExpiry) {
+    try {
+      const entries = await fs.promises.readdir(this.tempDir, { withFileTypes: true });
+      const now = Date.now();
+
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        if (!this.sessions.has(entry.name)) {
+          const fullPath = path.join(this.tempDir, entry.name);
+          try {
+            const stat = await fs.promises.stat(fullPath);
+            if (now - stat.mtimeMs >= olderThanMs) {
+              await fs.promises.rm(fullPath, { recursive: true, force: true });
+              logger.info('Swept orphaned chunk session directory', { dir: entry.name });
+            }
+          } catch {
+            // Ignore stat/rm errors
+          }
+        }
+      }
+    } catch {
+      // Ignore if this.tempDir doesn't exist yet
     }
   }
 }

@@ -56,6 +56,19 @@ export function createRuntime(options = {}) {
     },
 
     /**
+     * Sweeps expired sessions and orphaned temp files across all managers.
+     * @param {{ olderThanMs?: number }} [options]
+     */
+    async sweepAll({ olderThanMs } = {}) {
+      await Promise.allSettled([
+        runtime.chunkedUploadManager.cleanup(),
+        runtime.chunkedUploadManager.sweepOrphans(olderThanMs),
+        runtime.pendingUploadManager.sweepOrphans(olderThanMs),
+        runtime.shareManager.sweepOrphans(runtime.config.tempDir, olderThanMs),
+      ]);
+    },
+
+    /**
      * Stops everything this runtime owns within a deadline. Never calls process.exit
      * and never leaves WebSocket clients pinning the HTTP server open.
      * @param {{ timeoutMs?: number }} [options]
@@ -65,6 +78,11 @@ export function createRuntime(options = {}) {
       if (runtime.stoppingPromise) return runtime.stoppingPromise;
 
       runtime.stoppingPromise = (async () => {
+        if (runtime.sweepInterval) {
+          clearInterval(runtime.sweepInterval);
+          runtime.sweepInterval = null;
+        }
+
         const deadline = Date.now() + timeoutMs;
         let timedOut = false;
 
@@ -159,6 +177,19 @@ export function createRuntime(options = {}) {
       return runtime.stoppingPromise;
     },
   };
+
+  // Background periodic sweeper for orphaned temp files
+  const sweepInterval = setInterval(
+    () => {
+      runtime.sweepAll().catch(() => {});
+    },
+    5 * 60 * 1000
+  );
+  if (sweepInterval.unref) sweepInterval.unref();
+  runtime.sweepInterval = sweepInterval;
+
+  // Run startup sweep in background
+  runtime.sweepAll().catch(() => {});
 
   return runtime;
 }
