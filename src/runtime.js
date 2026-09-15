@@ -100,31 +100,49 @@ export function createRuntime(options = {}) {
           });
         }
 
+        let cleanupError = null;
+        const runCleanupTask = async (name, fn) => {
+          try {
+            await fn();
+          } catch (err) {
+            cleanupError = cleanupError || err;
+            logger.warn(`Runtime cleanup task "${name}" reported an error`, { error: err.message });
+          }
+        };
+
+        const performCleanup = async () => {
+          await Promise.allSettled([
+            runCleanupTask('shareManager', () => runtime.shareManager.clear()),
+            runCleanupTask('chunkedUploadManager', () => runtime.chunkedUploadManager.cleanup()),
+            runCleanupTask('pendingUploadManager', () => runtime.pendingUploadManager.cleanup()),
+            runCleanupTask('sessions', () => runtime.sessions.revokeAll()),
+          ]);
+        };
+
+        let cleanupTimer = null;
         const remainingMs = deadline - Date.now();
         if (remainingMs <= 0) {
           timedOut = true;
         } else {
           try {
             await Promise.race([
-              (async () => {
-                runtime.shareManager.clear();
-                await runtime.chunkedUploadManager.cleanup();
-                await runtime.pendingUploadManager.cleanup();
-                runtime.sessions.revokeAll();
-              })(),
+              performCleanup(),
               new Promise((_, reject) => {
-                const timer = setTimeout(() => {
+                cleanupTimer = setTimeout(() => {
                   timedOut = true;
                   reject(new Error('Cleanup timed out'));
                 }, remainingMs);
-                timer.unref?.();
               }),
             ]);
-          } catch (err) {
+          } catch {
             if (Date.now() >= deadline) {
               timedOut = true;
             }
-            logger.warn('Runtime cleanup reported an error', { error: err.message });
+          } finally {
+            if (cleanupTimer) {
+              clearTimeout(cleanupTimer);
+              cleanupTimer = null;
+            }
           }
         }
 
@@ -134,7 +152,8 @@ export function createRuntime(options = {}) {
 
         removeInstanceFile(runtime.port);
 
-        return { stopped: !timedOut, timedOut };
+        const stopped = !timedOut && !cleanupError;
+        return { stopped, timedOut, error: cleanupError || undefined };
       })();
 
       return runtime.stoppingPromise;

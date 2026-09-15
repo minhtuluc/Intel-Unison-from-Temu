@@ -10,6 +10,7 @@ import { once } from 'node:events';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { spawn } from 'node:child_process';
 import { WebSocket } from 'ws';
 import { createRuntime } from '../../src/runtime.js';
 import { createServer } from '../../src/server.js';
@@ -352,12 +353,35 @@ describe('M1 Review Regression: R1 to R5', () => {
 
       // Verify no dangling files remain in pending directory
       const pendingDir = path.join(runtime.config.tempDir, 'pending');
+      let entries = [];
       try {
-        const entries = await fs.readdir(pendingDir);
-        assert.equal(entries.length, 0, 'Pending directory must remain clean after 413');
-      } catch {
-        // Pending dir not created or empty
+        entries = await fs.readdir(pendingDir);
+      } catch (err) {
+        if (err.code !== 'ENOENT') throw err;
       }
+      assert.equal(entries.length, 0, 'Pending directory must remain clean after 413');
+    });
+
+    it('fails verification if pending directory contains lingering files', async () => {
+      const lingeringDir = await fs.mkdtemp(path.join(os.tmpdir(), 'utrans-lingering-'));
+      await fs.writeFile(path.join(lingeringDir, 'dangling.bin'), 'leftover');
+
+      const verifyClean = async (dir) => {
+        let entries = [];
+        try {
+          entries = await fs.readdir(dir);
+        } catch (err) {
+          if (err.code !== 'ENOENT') throw err;
+        }
+        assert.equal(entries.length, 0, 'Pending directory must remain clean');
+      };
+
+      await assert.rejects(
+        async () => verifyClean(lingeringDir),
+        (err) => err instanceof assert.AssertionError
+      );
+
+      await fs.rm(lingeringDir, { recursive: true, force: true });
     });
 
     it('accepts file within runtime maxFileSize', async () => {
@@ -421,6 +445,95 @@ describe('M1 Review Regression: R1 to R5', () => {
       assert.ok(elapsed < 150, `Stop must resolve within finite bound; elapsed: ${elapsed}ms`);
 
       await fs.rm(slowRoot, { recursive: true, force: true });
+    });
+
+    it('continues independent cleanup and reports stopped: false when a task rejects', async () => {
+      const errRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'utrans-err-stop-'));
+      const errRuntime = createRuntime({
+        tempDir: path.join(errRoot, 'temp'),
+        uploadDir: path.join(errRoot, 'received'),
+      });
+      const errApp = createServer(errRuntime);
+      const errServer = errApp.listen(0, '127.0.0.1');
+      await once(errServer, 'listening');
+      errRuntime.setListenPort(errServer.address().port);
+      errRuntime.attach({ server: errServer });
+
+      // Issue a session to verify sessions.revokeAll is executed even if chunked cleanup rejects
+      errRuntime.sessions.issue();
+      assert.equal(errRuntime.sessions.size(), 1);
+
+      let pendingCleaned = false;
+      errRuntime.pendingUploadManager.cleanup = async () => {
+        pendingCleaned = true;
+      };
+
+      // Simulated immediate rejection
+      const simulatedError = new Error('EACCES: permission denied');
+      errRuntime.chunkedUploadManager.cleanup = async () => {
+        throw simulatedError;
+      };
+
+      const result = await errRuntime.stop({ timeoutMs: 100 });
+      assert.equal(result.timedOut, false);
+      assert.equal(result.stopped, false, 'Must not report stopped: true when cleanup rejects');
+      assert.ok(result.error, 'Must report the cleanup error');
+      assert.equal(pendingCleaned, true, 'Pending upload manager must still be cleaned up');
+      assert.equal(errRuntime.sessions.size(), 0, 'Sessions must still be revoked');
+
+      // Repeated stop must be idempotent and preserve status
+      const repeatResult = await errRuntime.stop({ timeoutMs: 100 });
+      assert.equal(repeatResult.stopped, false);
+      assert.equal(repeatResult.timedOut, false);
+
+      await fs.rm(errRoot, { recursive: true, force: true });
+    });
+
+    it('handles never-resolving cleanup in a child process without hanging or code 13', async () => {
+      const script = `
+        import { createRuntime } from './src/runtime.js';
+        import { createServer } from './src/server.js';
+        import os from 'node:os';
+        import fs from 'node:fs/promises';
+        import path from 'node:path';
+        import { once } from 'node:events';
+
+        const root = await fs.mkdtemp(path.join(os.tmpdir(), 'utrans-hang-test-'));
+        const runtime = createRuntime({
+          tempDir: path.join(root, 'temp'),
+          uploadDir: path.join(root, 'received'),
+        });
+        const app = createServer(runtime);
+        const server = app.listen(0, '127.0.0.1');
+        await once(server, 'listening');
+        runtime.setListenPort(server.address().port);
+        runtime.attach({ server });
+
+        // Never-resolving cleanup
+        runtime.chunkedUploadManager.cleanup = () => new Promise(() => {});
+
+        const res = await runtime.stop({ timeoutMs: 40 });
+        console.log('STOP_RESULT:' + JSON.stringify(res));
+        await fs.rm(root, { recursive: true, force: true });
+        process.exit(0);
+      `;
+
+      const child = spawn(process.execPath, ['--input-type=module', '-e', script], {
+        cwd: process.cwd(),
+      });
+
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', (d) => {
+        stdout += d.toString();
+      });
+      child.stderr.on('data', (d) => {
+        stderr += d.toString();
+      });
+
+      const [exitCode] = await once(child, 'exit');
+      assert.equal(exitCode, 0, `Child process should exit code 0, stderr: ${stderr}`);
+      assert.ok(stdout.includes('STOP_RESULT:{"stopped":false,"timedOut":true}'));
     });
   });
 });
