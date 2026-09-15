@@ -1,6 +1,6 @@
 # ADR-0002 — session capability, runtime ownership và lifecycle
 
-Status: Accepted (thực thi backlog M1, 2026-09-14).
+Status: Accepted & Merged into main (thực thi backlog M1, 2026-09-15).
 
 Bổ sung cho [ADR-0001](0001-host-approval-authority.md); không thay thế. ADR-0001 quy định host capability cho hành động của host. ADR này quy định quyền của client, phạm vi state của một app instance, và ai sở hữu vòng đời tiến trình.
 
@@ -25,7 +25,7 @@ Sau ADR-0001, quyền host đã đúng nhưng chỉ chặn endpoint duyệt file
 7. **Một runtime cho một app.** `createRuntime(options)` sở hữu config đã resolve, managers, discovery registry, host capability và session store. `createServer(runtime)` gắn runtime vào `app.locals.runtime`; route/service đọc từ đó, không đọc singleton. `src/config.js` chỉ còn hàm thuần (`loadConfig`, `validateConfig`, `DEFAULT_CONFIG`), không export instance. Static phục vụ từ thư mục package (`import.meta.url`), không theo `process.cwd()`. `/api/info` báo port listener thật sau khi bind (đúng cả với `port: 0`).
 8. **Lifecycle thuộc về caller.** `startServer` không đăng ký signal handler và không gọi `process.exit`; nó trả `runtime` có `stop({timeoutMs})`: terminate WS client → `wss.close()` → `server.close()` (kèm `closeAllConnections`) → cleanup managers → xoá file instance, tất cả trong deadline. `bin/utrans.js` sở hữu SIGINT/SIGTERM. Tiến trình app ghi file instance `os.tmpdir()/utrans-<port>.json`; script dừng chỉ kill đúng PID đó, không kill theo port. `EADDRINUSE` trả `PORT_IN_USE` với thông báo rõ và exit code 1.
 
-## Sửa đổi sau review (2026-09-14, cùng lượt)
+## Sửa đổi sau review (2026-09-14 & 2026-09-15)
 
 Review độc lập trên diff M1 tìm ra các lỗi trong chính bản vá này; đã sửa kèm test hồi quy:
 
@@ -40,7 +40,9 @@ Review độc lập trên diff M1 tìm ra các lỗi trong chính bản vá này
 9. **Lỗi thứ tự XMLHttpRequest khi gửi chunk có PIN token (R2, P1).** `public/js/transfer.js` gọi `xhr.open()` trước `xhr.setRequestHeader()`, đồng thời bổ sung truyền `X-Host-Token`/`X-Session-Token` cho cả simple upload và chunked upload.
 10. **Frontend host capability cho API dữ liệu và session cookie (R3, P1).** Route `POST /api/auth/host-session` cấp session cookie cho host chính chủ kết nối từ loopback; `apiFetch` tự động gắn `X-Host-Token` cho các request cùng origin; UI chỉ mở cổng PIN khi thực sự gặp lỗi 401 hoặc bị từ chối kết nối.
 11. **Simple upload tuân thủ `maxFileSize` của runtime (R4, P2).** Multer cho simple upload cache per-runtime qua WeakMap theo `min(runtime.config.maxFileSize, 100 MiB)` và trả 413 `FILE_TOO_LARGE` có cấu trúc, dọn sạch pending rác khi bị từ chối.
-12. **Deadline shutdown bao phủ toàn bộ vòng đời cleanup (R5, P2).** `runtime.stop({timeoutMs})` áp dụng deadline cho cả các tác vụ dọn dẹp đĩa và session; kết thúc trong thời hạn hữu hạn và trả đúng `{ stopped: false, timedOut: true }` nếu cleanup bị chậm hoặc treo.
+12. **Deadline shutdown bao phủ toàn bộ vòng đời cleanup (R5, P2).** `runtime.stop({timeoutMs})` áp dụng deadline cho cả các tác vụ dọn dẹp đĩa và session; kết thúc trong thời hạn hữu hạn và trả đúng `{ stopped: false, timedOut: true }` nếu cleanup bị chậm hoặc treo. Ở review vòng 2, các tác vụ cleanup được bọc `runCleanupTask` độc lập và chạy qua `Promise.allSettled`, bỏ `timer.unref()` tránh lỗi code 13 trong top-level await của child process, trả đúng `stopped = !timedOut && !cleanupError`.
+13. **Nâng cấp Service Worker Shell Cache v5 (R6, P1).** `public/sw.js` cập nhật `CACHE_NAME = 'utrans-shell-v5'` để các trình duyệt đã cài đặt cache worker cũ tự động dọn cache v4 và nạp bản vá frontend mới (R2 & R3).
+14. **Sửa assertion dọn thư mục pending và test chống nuốt lỗi (R7, P2).** Tách `readdir` chỉ bắt `ENOENT`, đưa `assert.equal(entries.length, 0)` ra ngoài `try/catch` và bổ sung test hồi quy xác thực fixture có file dư sẽ kích hoạt `AssertionError`.
 
 ## Consequences
 

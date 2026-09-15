@@ -10,7 +10,7 @@ Stage đường dẫn nguồn (nhánh JSON của `POST /api/share`, dùng cho CL
 
 Mô hình hiện tại truyền qua host, chưa có P2P trực tiếp giữa client. Xem [báo cáo và roadmap](REPORT-ROADMAP.md), [quy chuẩn agent](AGENTS.md) và [quality system](docs/agents/quality.md). Chạy `npm run quality` trên Node 22/24 để kiểm tra lint, format, test và coverage.
 
-Đã kiểm chứng trong lượt M1 (Node 22.23.1, Linux): 195 test pass, coverage 93,13% line / 88,89% branch / 93,80% function; lint và format sạch. **Chưa** kiểm chứng: Node 24, Windows, CI GitHub, điện thoại thật (Android Chrome / iOS Safari), TLS LAN. Các tuyên bố bên dưới cần đối chiếu giới hạn còn mở trong báo cáo.
+Đã hoàn thành và kiểm chứng toàn diện mốc M1 (đã merge vào `main` tại commit `64cff86`): 207 automated tests pass trên Node 22 và Node 24, coverage 93,68% line / 88,60% branch / 93,49% function; lint và format sạch; GitHub Actions CI matrix trên cả Ubuntu và Windows pass 100%. **Chưa** kiểm chứng: điện thoại thật (Android Chrome / iOS Safari), TLS LAN. Các tuyên bố bên dưới cần đối chiếu giới hạn còn mở trong báo cáo.
 
 <p align="center">
   <img src="public/favicon.svg" alt="UniversalTrans Logo" width="96" height="96" />
@@ -23,8 +23,8 @@ Mô hình hiện tại truyền qua host, chưa có P2P trực tiếp giữa cli
 
 <p align="center">
   <img src="https://img.shields.io/badge/node-%3E%3D20.0.0-brightgreen" alt="Node Version" />
-  <img src="https://img.shields.io/badge/tests-195%20passed-success" alt="Tests" />
-  <img src="https://img.shields.io/badge/coverage-93.13%25-blue" alt="Coverage" />
+  <img src="https://img.shields.io/badge/tests-207%20passed-success" alt="Tests" />
+  <img src="https://img.shields.io/badge/coverage-93.68%25-blue" alt="Coverage" />
   <img src="https://img.shields.io/badge/port-8080%20default-orange" alt="Port 8080" />
   <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License" />
   <img src="https://img.shields.io/badge/pwa-standalone%20ready-purple" alt="PWA Ready" />
@@ -164,7 +164,7 @@ utrans -p 9090
 | **PC Confirmation & 5-min TTL** | File tải lên được đưa vào vùng tạm `temp/pending`. Tự động xóa sau 5 phút nếu PC không duyệt.                            |
 | **Anti-Traversal Protection**   | Chặn toàn bộ ký tự traversal `..`, `\0` null-bytes, kiểm tra quyền truy cập đĩa cứng an toàn.                            |
 | **Security Headers**            | Trang bị `X-Content-Type-Options: nosniff`, `X-Frame-Options: SAMEORIGIN`, tắt `x-powered-by`.                           |
-| **Offline Shell Cache**         | Service Worker `utrans-shell-v2` cache sẵn giao diện; đường truyền dữ liệu `/api/*` và `/ws` luôn đi thẳng qua mạng LAN. |
+| **Offline Shell Cache**         | Service Worker `utrans-shell-v5` cache sẵn giao diện; đường truyền dữ liệu `/api/*` và `/ws` luôn đi thẳng qua mạng LAN. |
 
 ---
 

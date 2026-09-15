@@ -1,12 +1,12 @@
-# Review M1 — Đã phê duyệt merge
+# Review M1 — Đã phê duyệt và hoàn tất merge
 
-## Kết luận: Approved (2026-09-15)
+## Kết luận: Approved & Merged (2026-09-15)
 
 Toàn bộ các phát hiện review vòng 1 (R1–R4) và vòng 2 (R5–R7) đã được giải quyết triệt để tại commit `336d0fc`.
 
-- `npm run quality`: 207/207 automated tests pass (coverage 93,59% line / 88,53% branch / 93,49% function).
-- GitHub Actions CI: 4/4 jobs pass trên ma trận Ubuntu / Windows × Node 22 / Node 24.
-- Đủ điều kiện an toàn để merge vào nhánh `main`.
+- `npm run quality`: 207/207 automated tests pass (coverage 93,68% line / 88,60% branch / 93,49% function).
+- GitHub Actions CI: 4/4 jobs (8 checks) pass 100% trên ma trận Ubuntu / Windows × Node 22 / Node 24.
+- Đã hoàn tất merge an toàn vào nhánh `main` qua Pull Request #1 tại commit `64cff86`.
 
 ---
 
