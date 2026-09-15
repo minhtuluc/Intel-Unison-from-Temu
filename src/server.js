@@ -31,6 +31,7 @@ export function createServer(runtimeOrOptions = {}) {
   const runtime = isRuntime(runtimeOrOptions) ? runtimeOrOptions : createRuntime(runtimeOrOptions);
 
   app.locals.runtime = runtime;
+  runtime.app = app;
   app.locals.hostAuth = runtime.hostAuth;
   app.locals.sessions = runtime.sessions;
   app.locals.pinRequired = runtime.pinRequired;

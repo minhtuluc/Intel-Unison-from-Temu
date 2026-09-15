@@ -16,6 +16,7 @@ import { PendingUploadService } from './services/pending-upload.js';
 import { DiscoveryService } from './services/discovery.js';
 import { createHostAuth } from './middleware/host-auth.js';
 import { createSessionStore } from './middleware/session-auth.js';
+import { broadcastEvent } from './websocket/handlers.js';
 
 /** Static assets live with the package, never relative to the process cwd. */
 export const PUBLIC_DIR = fileURLToPath(new URL('../public', import.meta.url));
@@ -190,6 +191,19 @@ export function createRuntime(options = {}) {
 
   // Run startup sweep in background
   runtime.sweepAll().catch(() => {});
+
+  runtime.pendingUploadManager.onTimeout = ({ transferId }) => {
+    const wss = runtime.wss || runtime.app?.get('wss');
+    if (wss) {
+      broadcastEvent(wss, 'transfer:rejected', {
+        transferId,
+        reason: 'TIMEOUT',
+      });
+      broadcastEvent(wss, 'transfer:expired', {
+        transferId,
+      });
+    }
+  };
 
   return runtime;
 }

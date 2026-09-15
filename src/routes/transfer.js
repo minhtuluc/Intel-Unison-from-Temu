@@ -445,6 +445,23 @@ transferRouter.get('/api/upload/pending', requireHost, (req, res) => {
 });
 
 /**
+ * GET /api/upload/pending/:transferId
+ * Returns the status or outcome of a specific transfer (pending, completed, rejected, expired).
+ */
+transferRouter.get('/api/upload/pending/:transferId', (req, res) => {
+  const status = req.app.locals.runtime.pendingUploadManager.getTransferStatus(
+    req.params.transferId
+  );
+  if (!status) {
+    throw new AppError('TRANSFER_NOT_FOUND', 404, `Transfer ${req.params.transferId} not found`);
+  }
+  res.json({
+    success: true,
+    data: status,
+  });
+});
+
+/**
  * POST /api/upload/decision
  * PC user accepts or declines a pending upload.
  */

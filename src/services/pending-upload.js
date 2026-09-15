@@ -38,6 +38,19 @@ export class PendingUploadService {
       });
       await this._deleteTemp(tempPath);
       this.pending.delete(transferId);
+      this._recordOutcome(transferId, {
+        status: 'expired',
+        reason: 'TIMEOUT',
+        fileName: cleanName,
+        timestamp: Date.now(),
+      });
+      if (typeof this.onTimeout === 'function') {
+        try {
+          this.onTimeout({ transferId, fileName: cleanName });
+        } catch (err) {
+          logger.error('Error in onTimeout handler', err);
+        }
+      }
     }, ttlMs);
 
     // Prevent timer from keeping Node process alive if exiting
@@ -113,6 +126,12 @@ export class PendingUploadService {
 
       // Only delete record from pending map after the file is successfully moved to uploadDir
       this.pending.delete(transferId);
+      this._recordOutcome(transferId, {
+        status: 'completed',
+        fileName: moved.fileName,
+        size: record.fileSize,
+        timestamp: Date.now(),
+      });
 
       logger.info('Pending transfer accepted by PC', {
         transferId,
@@ -139,6 +158,19 @@ export class PendingUploadService {
         });
         await this._deleteTemp(record.tempPath);
         this.pending.delete(transferId);
+        this._recordOutcome(transferId, {
+          status: 'expired',
+          reason: 'TIMEOUT',
+          fileName: record.fileName,
+          timestamp: Date.now(),
+        });
+        if (typeof this.onTimeout === 'function') {
+          try {
+            this.onTimeout({ transferId, fileName: record.fileName });
+          } catch (err) {
+            logger.error('Error in onTimeout handler', err);
+          }
+        }
       }, remainingTtl);
       if (record.timeoutId.unref) record.timeoutId.unref();
 
@@ -159,6 +191,11 @@ export class PendingUploadService {
 
     clearTimeout(record.timeoutId);
     this.pending.delete(transferId);
+    this._recordOutcome(transferId, {
+      status: 'rejected',
+      reason: 'REJECTED_BY_PC',
+      timestamp: Date.now(),
+    });
 
     await this._deleteTemp(record.tempPath);
 
@@ -173,12 +210,35 @@ export class PendingUploadService {
     };
   }
 
+  _recordOutcome(transferId, outcome) {
+    if (!this.recentOutcomes) {
+      this.recentOutcomes = new Map();
+    }
+    if (this.recentOutcomes.size >= 200) {
+      const oldestKey = this.recentOutcomes.keys().next().value;
+      this.recentOutcomes.delete(oldestKey);
+    }
+    this.recentOutcomes.set(transferId, outcome);
+  }
+
+  getTransferStatus(transferId) {
+    const record = this.pending.get(transferId);
+    if (record) {
+      return { status: 'pending', ...this._sanitizeRecord(record) };
+    }
+    if (this.recentOutcomes && this.recentOutcomes.has(transferId)) {
+      return this.recentOutcomes.get(transferId);
+    }
+    return null;
+  }
+
   async cleanup() {
     for (const record of this.pending.values()) {
       clearTimeout(record.timeoutId);
       await this._deleteTemp(record.tempPath);
     }
     this.pending.clear();
+    this.recentOutcomes?.clear();
   }
 
   /**

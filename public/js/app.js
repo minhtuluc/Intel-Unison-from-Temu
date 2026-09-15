@@ -875,6 +875,7 @@ class App {
         if (status === 'CONNECTED') {
           dot.classList.add('connection-dot--connected');
           text.textContent = 'Online';
+          transferEngine.reconcileAwaitingTransfers();
         } else if (status === 'RECONNECTING') {
           dot.classList.add('connection-dot--reconnecting');
           text.textContent = 'Reconnecting';
@@ -968,6 +969,14 @@ class App {
 
     connection.on('transfer:rejected', (data) => {
       transferEngine.handleWebSocketEvent('transfer:rejected', data);
+      if (this.isHost) {
+        closeModal();
+        this._loadPendingApprovals();
+      }
+    });
+
+    connection.on('transfer:expired', (data) => {
+      transferEngine.handleWebSocketEvent('transfer:expired', data);
       if (this.isHost) {
         closeModal();
         this._loadPendingApprovals();
