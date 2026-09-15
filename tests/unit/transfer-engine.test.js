@@ -188,11 +188,7 @@ describe('TransferEngine (Unit)', () => {
   });
 
   it('UT-004: should buffer WebSocket event if it arrives before HTTP response sets transferId', () => {
-    // 1. WS event arrives early
-    engine.handleWebSocketEvent('transfer:complete', { transferId: 'early_tx_100' });
-    assert.equal(engine.pendingWsDecisions.has('early_tx_100'), true);
-
-    // 2. HTTP response returns later and sets task.transferId
+    // 1. Task is uploading, but HTTP response has not yet assigned transferId
     const task = {
       id: 'task_pending_early',
       name: 'fast.png',
@@ -201,6 +197,11 @@ describe('TransferEngine (Unit)', () => {
     };
     engine.activeTransfers.set(task.id, task);
 
+    // 2. WS event arrives early
+    engine.handleWebSocketEvent('transfer:complete', { transferId: 'early_tx_100' });
+    assert.equal(engine.pendingWsDecisions.has('early_tx_100'), true);
+
+    // 3. HTTP response returns later and sets task.transferId
     // Simulate HTTP response completion handler logic
     task.transferId = 'early_tx_100';
     task.status = 'awaiting_approval';

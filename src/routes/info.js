@@ -67,6 +67,12 @@ infoRouter.get('/api/info', async (req, res, next) => {
         pinRequired: Boolean(req.app.locals.pinRequired),
         connectedDevices,
         uptime: Math.floor(process.uptime()),
+        maxConcurrentTransfers: runtime.config.maxConcurrentTransfers,
+        maxUploadSessions: runtime.config.maxUploadSessions,
+        maxConnectedDevices: runtime.config.maxConnectedDevices,
+        maxFileSize: runtime.config.maxFileSize,
+        chunkSize: runtime.config.chunkSize,
+        storageQuota: runtime.config.storageQuota,
       },
     });
   } catch (error) {

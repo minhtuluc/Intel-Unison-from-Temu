@@ -14,9 +14,10 @@ import { ShareManager } from './services/share-manager.js';
 import { ChunkedUploadManager } from './services/chunked-upload.js';
 import { PendingUploadService } from './services/pending-upload.js';
 import { DiscoveryService } from './services/discovery.js';
+import { StorageQuotaTracker } from './services/storage-quota.js';
 import { createHostAuth } from './middleware/host-auth.js';
 import { createSessionStore } from './middleware/session-auth.js';
-import { broadcastEvent } from './websocket/handlers.js';
+import { sendTransferTerminalEvent } from './websocket/handlers.js';
 
 /** Static assets live with the package, never relative to the process cwd. */
 export const PUBLIC_DIR = fileURLToPath(new URL('../public', import.meta.url));
@@ -26,18 +27,31 @@ export const PUBLIC_DIR = fileURLToPath(new URL('../public', import.meta.url));
  */
 export function createRuntime(options = {}) {
   const config = loadConfig(options);
+  const quotaTracker = new StorageQuotaTracker(config.storageQuota);
+  config.quotaTracker = quotaTracker;
 
   const runtime = {
     config,
     publicDir: options.publicDir || PUBLIC_DIR,
+    quotaTracker,
     shareManager: new ShareManager(),
     chunkedUploadManager: new ChunkedUploadManager(config),
-    pendingUploadManager: new PendingUploadService({ config }),
-    discovery: new DiscoveryService(),
+    pendingUploadManager: new PendingUploadService({ config, quotaTracker }),
+    discovery: new DiscoveryService({ maxConnectedDevices: config.maxConnectedDevices }),
     hostAuth: createHostAuth(),
     sessions: createSessionStore({ ttlMs: config.sessionTtlMs, maxSessions: config.maxSessions }),
     pinRequired: Boolean(config.pin),
     listenPort: null,
+    inFlightSimpleUploads: 0,
+    getActiveTransferCount() {
+      let chunkCount = 0;
+      for (const session of runtime.chunkedUploadManager.sessions.values()) {
+        if (session.status === 'uploading' || session.status === 'completing') {
+          chunkCount++;
+        }
+      }
+      return chunkCount + runtime.inFlightSimpleUploads;
+    },
     /**
      * Records the port the HTTP listener actually bound to (matters for port 0).
      * @param {number} port
@@ -192,16 +206,18 @@ export function createRuntime(options = {}) {
   // Run startup sweep in background
   runtime.sweepAll().catch(() => {});
 
-  runtime.pendingUploadManager.onTimeout = ({ transferId }) => {
+  runtime.pendingUploadManager.onTimeout = ({ transferId, sender }) => {
     const wss = runtime.wss || runtime.app?.get('wss');
     if (wss) {
-      broadcastEvent(wss, 'transfer:rejected', {
-        transferId,
-        reason: 'TIMEOUT',
-      });
-      broadcastEvent(wss, 'transfer:expired', {
-        transferId,
-      });
+      sendTransferTerminalEvent(
+        wss,
+        'transfer:expired',
+        {
+          transferId,
+          reason: 'TIMEOUT',
+        },
+        sender
+      );
     }
   };
 

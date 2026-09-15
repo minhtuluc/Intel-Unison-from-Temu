@@ -7,11 +7,31 @@
 import { formatFileSize, formatEta } from './utils.js';
 import { apiFetch, getSessionToken, getHostToken } from './api.js';
 
+/**
+ * Computes whole-file SHA-256 digest using Web Crypto API.
+ * @param {Blob|File} file
+ * @returns {Promise<string|null>} Hex string or null if unsupported
+ */
+export async function computeFileSha256(file) {
+  if (typeof crypto === 'undefined' || !crypto?.subtle?.digest) {
+    return null;
+  }
+  try {
+    const buffer = await file.arrayBuffer();
+    const hashBuffer = await crypto.subtle.digest('SHA-256', buffer);
+    const hashArray = Array.from(new Uint8Array(hashBuffer));
+    return hashArray.map((b) => b.toString(16).padStart(2, '0')).join('');
+  } catch {
+    return null;
+  }
+}
+
 export class TransferEngine {
   constructor(options = {}) {
     this.maxConcurrent = options.maxConcurrent || 3;
     this.chunkSize = options.chunkSize || 10 * 1024 * 1024; // 10MB default
     this.maxRetries = options.maxRetries || 3;
+    this.connectionId = options.connectionId || null;
 
     this.queue = [];
     this.activeTransfers = new Map();
@@ -240,6 +260,9 @@ export class TransferEngine {
       // The server derives identity itself; only the display label is reported.
       xhr.setRequestHeader('X-Device-Name', this._getDeviceName());
       xhr.setRequestHeader('X-Platform', this._getPlatform());
+      const connectionId =
+        this.connectionId || (typeof window !== 'undefined' ? window.utransConnectionId : null);
+      if (connectionId) xhr.setRequestHeader('X-Connection-Id', connectionId);
       xhr.send(formData);
     });
   }
@@ -255,14 +278,21 @@ export class TransferEngine {
       if (!task.uploadId) {
         if (task.status === 'paused' || task.status === 'cancelled') return task;
 
+        const checksum = await computeFileSha256(task.file);
+        const connectionId =
+          this.connectionId || (typeof window !== 'undefined' ? window.utransConnectionId : null);
+        const headers = { 'Content-Type': 'application/json' };
+        if (connectionId) headers['X-Connection-Id'] = connectionId;
+
         const initRes = await apiFetch('/api/upload/init', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers,
           signal: task.abortController.signal,
           body: JSON.stringify({
             fileName: task.name,
             fileSize: task.size,
             mimeType: task.type,
+            checksum,
           }),
         });
 
@@ -340,13 +370,18 @@ export class TransferEngine {
       if (task.status === 'paused' || task.status === 'cancelled') return task;
 
       // Step 3: Complete upload
+      const connectionId =
+        this.connectionId || (typeof window !== 'undefined' ? window.utransConnectionId : null);
+      const compHeaders = {
+        'Content-Type': 'application/json',
+        'X-Device-Name': this._getDeviceName(),
+        'X-Platform': this._getPlatform(),
+      };
+      if (connectionId) compHeaders['X-Connection-Id'] = connectionId;
+
       const compRes = await apiFetch('/api/upload/complete', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Device-Name': this._getDeviceName(),
-          'X-Platform': this._getPlatform(),
-        },
+        headers: compHeaders,
         signal: task.abortController.signal,
         body: JSON.stringify({ uploadId: task.uploadId }),
       });
@@ -595,6 +630,9 @@ export class TransferEngine {
           body: JSON.stringify({ uploadId: task.uploadId }),
         }).catch(() => {});
       }
+      if (task.transferId) {
+        this.pendingWsDecisions.delete(task.transferId);
+      }
       task.status = 'cancelled';
       task.speed = 0;
       task.speedFormatted = 'Cancelled';
@@ -642,6 +680,20 @@ export class TransferEngine {
     this._processQueue();
   }
 
+  _pruneWsDecisions() {
+    const now = Date.now();
+    const MAX_AGE_MS = 30000;
+    for (const [id, item] of this.pendingWsDecisions.entries()) {
+      if (now - (item.timestamp || 0) > MAX_AGE_MS) {
+        this.pendingWsDecisions.delete(id);
+      }
+    }
+    while (this.pendingWsDecisions.size > 50) {
+      const oldestKey = this.pendingWsDecisions.keys().next().value;
+      this.pendingWsDecisions.delete(oldestKey);
+    }
+  }
+
   /**
    * Matches WebSocket transfer completion / rejection events to pending client tasks.
    * Buffers early decisions if received before HTTP response assigns transferId.
@@ -670,12 +722,22 @@ export class TransferEngine {
     }
 
     if (!task) {
-      this.pendingWsDecisions.set(transferId, { event, data });
+      // Only buffer WS decisions if there is an active uploading task awaiting transferId
+      const hasUploadingTaskPendingId = Array.from(this.activeTransfers.values()).some(
+        (t) => t.status === 'uploading' && !t.transferId
+      );
+      if (hasUploadingTaskPendingId) {
+        this._pruneWsDecisions();
+        if (this.pendingWsDecisions.size < 50) {
+          this.pendingWsDecisions.set(transferId, { event, data, timestamp: Date.now() });
+        }
+      }
       return;
     }
 
     this.activeTransfers.delete(task.id);
     this.awaitingTransfers.delete(task.id);
+    this.pendingWsDecisions.delete(transferId);
 
     if (event === 'transfer:complete') {
       this._markCompleted(task);
@@ -729,6 +791,9 @@ export class TransferEngine {
   }
 
   _markCompleted(task) {
+    if (task.transferId) {
+      this.pendingWsDecisions.delete(task.transferId);
+    }
     task.status = 'completed';
     task.progress = 100;
     task.speed = 0;
@@ -740,6 +805,9 @@ export class TransferEngine {
   }
 
   _markError(task, errorMessage) {
+    if (task.transferId) {
+      this.pendingWsDecisions.delete(task.transferId);
+    }
     task.status = 'error';
     task.error = errorMessage;
     task.speed = 0;

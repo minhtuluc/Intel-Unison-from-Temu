@@ -27,10 +27,14 @@ export class ChunkedUploadManager {
    * @param {{ fileName: string, fileSize: number, mimeType?: string }} params
    * @returns {Promise<{ uploadId: string, chunkSize: number, totalChunks: number, expiresAt: string }>}
    */
-  async initUpload({ fileName, fileSize, mimeType = null }) {
+  async initUpload({ fileName, fileSize, mimeType = null, checksum = null }) {
     await this.cleanup();
 
-    const maxSessions = this.config.maxSessions || 64;
+    const maxSessions =
+      this.config.maxUploadSessions ??
+      this.config.maxSessions ??
+      this.config.maxConcurrentTransfers ??
+      10;
     if (this.sessions.size >= maxSessions) {
       throw new AppError(
         'TOO_MANY_SESSIONS',
@@ -44,8 +48,8 @@ export class ChunkedUploadManager {
     }
 
     const size = Number(fileSize);
-    if (!Number.isFinite(size) || size <= 0) {
-      throw new AppError('INVALID_FILE_SIZE', 400, 'fileSize must be a positive number');
+    if (!Number.isInteger(size) || size <= 0) {
+      throw new AppError('INVALID_FILE_SIZE', 400, 'fileSize must be a positive integer');
     }
 
     if (size > this.config.maxFileSize) {
@@ -56,6 +60,10 @@ export class ChunkedUploadManager {
       );
     }
 
+    if (this.config.quotaTracker) {
+      this.config.quotaTracker.reserve(size);
+    }
+
     const uploadId = generateUploadId();
     const chunkSize = this.config.chunkSize;
     const totalChunks = Math.ceil(size / chunkSize);
@@ -63,13 +71,22 @@ export class ChunkedUploadManager {
     const sessionDir = path.join(this.tempDir, uploadId);
 
     // Create session temp directory
-    await fs.promises.mkdir(sessionDir, { recursive: true });
+    try {
+      await fs.promises.mkdir(sessionDir, { recursive: true });
+    } catch (err) {
+      if (this.config.quotaTracker) {
+        this.config.quotaTracker.release(size);
+      }
+      throw err;
+    }
 
     const session = {
       uploadId,
+      status: 'uploading', // 'uploading' | 'completing' | 'completed' | 'cancelled'
       fileName: sanitizeFileName(fileName),
       fileSize: size,
       mimeType: mimeType || 'application/octet-stream',
+      expectedChecksum: checksum || null,
       chunkSize,
       totalChunks,
       receivedChunks: new Set(),
@@ -107,6 +124,23 @@ export class ChunkedUploadManager {
     const session = this.sessions.get(uploadId);
     if (!session) {
       throw new AppError('UPLOAD_EXPIRED', 410, 'Upload session not found or has expired');
+    }
+
+    if (session.status === 'completing') {
+      throw new AppError(
+        'TRANSFER_IN_PROGRESS',
+        409,
+        `Upload ${uploadId} is currently being completed`
+      );
+    }
+    if (session.status === 'completed') {
+      throw new AppError('ALREADY_COMPLETED', 409, `Upload ${uploadId} has already been completed`);
+    }
+    if (session.status === 'cancelled') {
+      throw new AppError('UPLOAD_CANCELLED', 409, `Upload ${uploadId} was cancelled`);
+    }
+    if (session.status !== 'uploading') {
+      throw new AppError('INVALID_STATE', 409, `Session in state ${session.status}`);
     }
 
     const idx = Number(chunkIndex);
@@ -206,6 +240,23 @@ export class ChunkedUploadManager {
       throw new AppError('UPLOAD_EXPIRED', 410, 'Upload session not found or has expired');
     }
 
+    if (session.status === 'completing') {
+      throw new AppError(
+        'TRANSFER_IN_PROGRESS',
+        409,
+        `Upload ${uploadId} is currently being completed`
+      );
+    }
+    if (session.status === 'completed') {
+      throw new AppError('ALREADY_COMPLETED', 409, `Upload ${uploadId} has already been completed`);
+    }
+    if (session.status === 'cancelled') {
+      throw new AppError('UPLOAD_CANCELLED', 409, `Upload ${uploadId} was cancelled`);
+    }
+    if (session.status !== 'uploading') {
+      throw new AppError('INVALID_STATE', 409, `Session in state ${session.status}`);
+    }
+
     if (session.receivedChunks.size < session.totalChunks) {
       throw new AppError(
         'CHUNK_MISSING',
@@ -214,6 +265,9 @@ export class ChunkedUploadManager {
       );
     }
 
+    // Atomically transition state
+    session.status = 'completing';
+
     // Ensure target directory exists and reserve non-colliding destination file exclusively
     const {
       fileName: finalFileName,
@@ -221,11 +275,18 @@ export class ChunkedUploadManager {
       fileHandle,
     } = await reserveWritableFile(targetDir, session.fileName);
     const writeStream = fileHandle.createWriteStream();
+    const hasher = session.expectedChecksum ? crypto.createHash('sha256') : null;
 
     try {
       for (let i = 0; i < session.totalChunks; i++) {
+        if (session.status === 'cancelled') {
+          throw new AppError('UPLOAD_CANCELLED', 409, `Upload ${uploadId} was cancelled`);
+        }
         const chunkPath = path.join(session.sessionDir, `chunk_${i}`);
         const readStream = fs.createReadStream(chunkPath);
+        if (hasher) {
+          readStream.on('data', (chunk) => hasher.update(chunk));
+        }
         await pipeline(readStream, writeStream, { end: false });
       }
 
@@ -234,7 +295,7 @@ export class ChunkedUploadManager {
         writeStream.end((err) => (err ? reject(err) : resolve()));
       });
 
-      // Integrity check: verify reassembled size equals declared fileSize
+      // Integrity check 1: verify reassembled size equals declared fileSize
       const stat = await fs.promises.stat(finalPath);
       if (stat.size !== session.fileSize) {
         throw new AppError(
@@ -243,11 +304,34 @@ export class ChunkedUploadManager {
           `Reassembled file size (${stat.size}) does not match expected size (${session.fileSize})`
         );
       }
+
+      // Integrity check 2: verify SHA-256 if expectedChecksum was provided
+      if (hasher && session.expectedChecksum) {
+        const actualChecksum = hasher.digest('hex');
+        if (actualChecksum.toLowerCase() !== session.expectedChecksum.toLowerCase()) {
+          throw new AppError(
+            'CHECKSUM_MISMATCH',
+            400,
+            `File checksum mismatch: expected ${session.expectedChecksum}, got ${actualChecksum}`
+          );
+        }
+      }
+
+      session.status = 'completed';
     } catch (err) {
       try {
         await fs.promises.unlink(finalPath);
       } catch {
         // Ignore unlink error
+      }
+      if (err.code === 'CHECKSUM_MISMATCH' || err.code === 'FILE_CORRUPTED') {
+        await fs.promises.rm(session.sessionDir, { recursive: true, force: true }).catch(() => {});
+        this.sessions.delete(uploadId);
+        if (this.config.quotaTracker) {
+          this.config.quotaTracker.release(session.fileSize);
+        }
+      } else if (session.status !== 'cancelled') {
+        session.status = 'uploading'; // Allow retry if transient disk error
       }
       throw err;
     }
@@ -255,6 +339,9 @@ export class ChunkedUploadManager {
     // Cleanup session temporary chunks directory
     await fs.promises.rm(session.sessionDir, { recursive: true, force: true });
     this.sessions.delete(uploadId);
+    if (this.config.quotaTracker) {
+      this.config.quotaTracker.release(session.fileSize);
+    }
 
     const duration = Math.max(0.1, (Date.now() - session.createdAt) / 1000);
     const speedMBs = (session.fileSize / (1024 * 1024) / duration).toFixed(1);
@@ -288,7 +375,19 @@ export class ChunkedUploadManager {
       return false;
     }
 
+    if (session.status === 'completing') {
+      throw new AppError(
+        'TRANSFER_IN_PROGRESS',
+        409,
+        `Cannot cancel upload ${uploadId} while completion is in progress`
+      );
+    }
+
+    session.status = 'cancelled';
     this.sessions.delete(uploadId);
+    if (this.config.quotaTracker) {
+      this.config.quotaTracker.release(session.fileSize);
+    }
     try {
       await fs.promises.rm(session.sessionDir, { recursive: true, force: true });
     } catch {
@@ -305,12 +404,18 @@ export class ChunkedUploadManager {
   async cleanup() {
     const now = Date.now();
     for (const [uploadId, session] of this.sessions.entries()) {
+      if (session.status === 'completing') {
+        continue; // Do not interrupt in-progress completion
+      }
       if (now > session.expiresAt) {
         logger.warn('Cleaning up expired upload session', { uploadId, name: session.fileName });
         try {
           await fs.promises.rm(session.sessionDir, { recursive: true, force: true });
         } catch {
           // ignore cleanup errors
+        }
+        if (this.config.quotaTracker) {
+          this.config.quotaTracker.release(session.fileSize);
         }
         this.sessions.delete(uploadId);
       }

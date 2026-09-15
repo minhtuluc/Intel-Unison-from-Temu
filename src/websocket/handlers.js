@@ -43,12 +43,35 @@ export function handleWsMessage(wss, ws, rawMessage) {
 
       // Identity is the connection, not the payload. Claimed name/platform are
       // stored as untrusted display labels only.
-      const deviceRecord = ws.discovery.addConnection(ws.connectionId, {
-        label: deviceName,
-        platform,
-        ip: ws._remoteIp || '127.0.0.1',
-        isHost: ws.isHost,
-      });
+      let deviceRecord;
+      try {
+        deviceRecord = ws.discovery.addConnection(ws.connectionId, {
+          label: deviceName,
+          platform,
+          ip: ws._remoteIp || '127.0.0.1',
+          isHost: ws.isHost,
+        });
+      } catch (err) {
+        if (ws.readyState === 1) {
+          ws.send(
+            JSON.stringify({
+              event: 'client:rejected',
+              data: { reason: err.code || 'REGISTRATION_FAILED', message: err.message },
+              timestamp: new Date().toISOString(),
+            })
+          );
+        }
+        logger.warn('Failed to register WebSocket client', {
+          error: err.message,
+          ip: ws._remoteIp,
+        });
+        try {
+          ws.close(1008, err.message);
+        } catch {
+          // ignore error if socket is already closed or destroyed
+        }
+        return;
+      }
 
       // Send registered ack to current client with all current devices
       if (ws.readyState === 1) {
@@ -58,6 +81,7 @@ export function handleWsMessage(wss, ws, rawMessage) {
             data: {
               device: deviceRecord,
               devices: ws.discovery.getDevices(),
+              connectionId: ws.connectionId,
             },
             timestamp: new Date().toISOString(),
           })
@@ -98,7 +122,7 @@ export function handleWsMessage(wss, ws, rawMessage) {
   }
 }
 
-export function broadcastEvent(wss, event, data, excludeWs = null) {
+export function broadcastEvent(wss, event, data, filterOrExclude = null) {
   if (!wss || !wss.clients) return;
 
   const payload = JSON.stringify({
@@ -115,7 +139,15 @@ export function broadcastEvent(wss, event, data, excludeWs = null) {
       continue;
     }
     if (event === 'upload:request' && !client.isHost) continue;
-    if (client !== excludeWs && client.readyState === 1 /* OPEN */) {
+
+    // Filter check
+    if (typeof filterOrExclude === 'function') {
+      if (!filterOrExclude(client)) continue;
+    } else if (filterOrExclude && client === filterOrExclude) {
+      continue;
+    }
+
+    if (client.readyState === 1 /* OPEN */) {
       try {
         client.send(payload);
       } catch (err) {
@@ -123,4 +155,32 @@ export function broadcastEvent(wss, event, data, excludeWs = null) {
       }
     }
   }
+}
+
+/**
+ * Sends terminal transfer outcome events only to the host and the specific sender socket.
+ * Other connected clients will never receive terminal transfer events of unrelated transfers.
+ * @param {object} wss
+ * @param {string} event
+ * @param {object} data
+ * @param {object} [sender]
+ */
+export function sendTransferTerminalEvent(wss, event, data, sender = null) {
+  broadcastEvent(wss, event, data, (client) => {
+    if (client.isHost) return true;
+    const hasSenderInfo = sender && (sender.connectionId || (sender.ip && sender.ip !== 'unknown'));
+    if (!hasSenderInfo) return true;
+    if (sender.connectionId && client.connectionId === sender.connectionId) {
+      return true;
+    }
+    if (
+      !sender.connectionId &&
+      sender.ip &&
+      sender.ip !== 'unknown' &&
+      (client._remoteIp === sender.ip || client.ip === sender.ip)
+    ) {
+      return true;
+    }
+    return false;
+  });
 }

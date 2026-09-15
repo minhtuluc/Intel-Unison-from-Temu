@@ -91,6 +91,9 @@ class App {
       const json = await res.json();
       if (json.success && json.data) {
         this.serverInfo = json.data;
+        if (json.data.maxConcurrentTransfers) {
+          transferEngine.maxConcurrent = json.data.maxConcurrentTransfers;
+        }
         const nameEl = document.getElementById('header-server-name');
         if (nameEl) {
           nameEl.textContent = `${json.data.serverName} (${json.data.ip})`;
@@ -948,6 +951,10 @@ class App {
       this.isHost = data?.device?.isHost === true;
       // Server-issued identity for this connection; used only to flag "This Device".
       this.localDeviceId = data?.device?.id || this.localDeviceId;
+      if (data?.connectionId) {
+        window.utransConnectionId = data.connectionId;
+        transferEngine.connectionId = data.connectionId;
+      }
       this._loadPendingApprovals();
     });
 

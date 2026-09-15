@@ -17,7 +17,9 @@ export const DEFAULT_CONFIG = {
   // Non-empty = every staged source path must live inside one of these roots.
   allowedSourceDirs: [],
   maxConcurrentTransfers: 5,
+  maxUploadSessions: 10,
   maxConnectedDevices: 20,
+  storageQuota: 20 * 1024 * 1024 * 1024, // 20GB default storage quota
   uploadExpiry: 60 * 60 * 1000, // 1 hour
   thumbnailSize: 200,
   thumbnailQuality: 80,
@@ -88,9 +90,19 @@ export function validateConfig(cfg) {
     throw new AppError('CONFIG_INVALID', 500, 'maxConcurrentTransfers must be an integer >= 1.');
   }
 
+  const maxUploadSessions = Number(cfg.maxUploadSessions ?? DEFAULT_CONFIG.maxUploadSessions);
+  if (!Number.isInteger(maxUploadSessions) || maxUploadSessions < 1) {
+    throw new AppError('CONFIG_INVALID', 500, 'maxUploadSessions must be an integer >= 1.');
+  }
+
   const maxDevices = Number(cfg.maxConnectedDevices);
   if (!Number.isInteger(maxDevices) || maxDevices < 1) {
     throw new AppError('CONFIG_INVALID', 500, 'maxConnectedDevices must be an integer >= 1.');
+  }
+
+  const storageQuota = Number(cfg.storageQuota ?? DEFAULT_CONFIG.storageQuota);
+  if (!Number.isFinite(storageQuota) || storageQuota <= 0) {
+    throw new AppError('CONFIG_INVALID', 500, 'storageQuota must be greater than 0.');
   }
 
   const sessionTtlMs = Number(cfg.sessionTtlMs);
@@ -144,9 +156,15 @@ export function loadConfig(overrides = {}) {
     maxConcurrentTransfers: env.UTRANS_MAX_CONCURRENT
       ? parseInt(env.UTRANS_MAX_CONCURRENT, 10)
       : DEFAULT_CONFIG.maxConcurrentTransfers,
+    maxUploadSessions: env.UTRANS_MAX_UPLOAD_SESSIONS
+      ? parseInt(env.UTRANS_MAX_UPLOAD_SESSIONS, 10)
+      : DEFAULT_CONFIG.maxUploadSessions,
     maxConnectedDevices: env.UTRANS_MAX_DEVICES
       ? parseInt(env.UTRANS_MAX_DEVICES, 10)
       : DEFAULT_CONFIG.maxConnectedDevices,
+    storageQuota: env.UTRANS_STORAGE_QUOTA
+      ? parseInt(env.UTRANS_STORAGE_QUOTA, 10)
+      : DEFAULT_CONFIG.storageQuota,
     uploadExpiry: env.UTRANS_UPLOAD_EXPIRY
       ? parseInt(env.UTRANS_UPLOAD_EXPIRY, 10)
       : DEFAULT_CONFIG.uploadExpiry,

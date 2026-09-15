@@ -8,7 +8,7 @@ import { Router } from 'express';
 import fs from 'node:fs';
 import path from 'node:path';
 import multer from 'multer';
-import { broadcastEvent } from '../websocket/handlers.js';
+import { broadcastEvent, sendTransferTerminalEvent } from '../websocket/handlers.js';
 import { AppError } from '../middleware/error-handler.js';
 import { sanitizeFileName, parseRange } from '../utils/file-utils.js';
 import { requireHost } from '../middleware/host-auth.js';
@@ -22,6 +22,7 @@ export const transferRouter = Router();
  */
 function describeSender(req) {
   return {
+    connectionId: req.headers['x-connection-id'] || req.body?.connectionId || null,
     ip: req.ip || req.socket?.remoteAddress || 'unknown',
     label: req.headers['x-device-name'] || req.body?.deviceName || 'Unknown device',
     labelUntrusted: true,
@@ -80,6 +81,30 @@ function simpleUploadFor(runtime) {
 /** Parses simple multipart uploads and reports oversized files as 413. */
 function parseSimpleUpload(req, res, next) {
   const runtime = req.app.locals.runtime;
+  if (runtime.getActiveTransferCount() >= runtime.config.maxConcurrentTransfers) {
+    return next(
+      new AppError(
+        'TOO_MANY_TRANSFERS',
+        429,
+        `Maximum concurrent transfers (${runtime.config.maxConcurrentTransfers}) reached. Try again later.`
+      )
+    );
+  }
+
+  const contentLength = Number(req.headers['content-length'] || 0);
+  if (runtime.quotaTracker && contentLength > 0) {
+    const stats = runtime.quotaTracker.getStats();
+    if (contentLength > stats.available) {
+      return next(
+        new AppError(
+          'STORAGE_QUOTA_EXCEEDED',
+          507,
+          `Storage quota exceeded: required ${contentLength} bytes, available ${stats.available} bytes`
+        )
+      );
+    }
+  }
+
   const limit = Math.min(runtime.config.maxFileSize, SIMPLE_UPLOAD_CEILING);
   simpleUploadFor(runtime).array('files')(req, res, async (err) => {
     if (!err) return next();
@@ -236,6 +261,8 @@ transferRouter.get('/api/thumbnail/:fileId', (req, res) => {
  * Simple upload endpoint for single/multiple files (<100MB).
  */
 transferRouter.post('/api/upload', parseSimpleUpload, async (req, res, next) => {
+  const runtime = req.app.locals.runtime;
+  runtime.inFlightSimpleUploads++;
   try {
     const files = req.files || [];
     if (files.length === 0) {
@@ -250,7 +277,7 @@ transferRouter.post('/api/upload', parseSimpleUpload, async (req, res, next) => 
     const wss = req.app.get('wss');
 
     for (const f of files) {
-      const record = req.app.locals.runtime.pendingUploadManager.createPending({
+      const record = runtime.pendingUploadManager.createPending({
         fileName: f.originalname || f.filename,
         fileSize: f.size,
         mimeType: f.mimetype,
@@ -276,6 +303,8 @@ transferRouter.post('/api/upload', parseSimpleUpload, async (req, res, next) => 
     });
   } catch (error) {
     next(error);
+  } finally {
+    runtime.inFlightSimpleUploads = Math.max(0, runtime.inFlightSimpleUploads - 1);
   }
 });
 
@@ -285,11 +314,21 @@ transferRouter.post('/api/upload', parseSimpleUpload, async (req, res, next) => 
  */
 transferRouter.post('/api/upload/init', async (req, res, next) => {
   try {
-    const { fileName, fileSize, mimeType } = req.body || {};
-    const result = await req.app.locals.runtime.chunkedUploadManager.initUpload({
+    const runtime = req.app.locals.runtime;
+    if (runtime.getActiveTransferCount() >= runtime.config.maxConcurrentTransfers) {
+      throw new AppError(
+        'TOO_MANY_TRANSFERS',
+        429,
+        `Maximum concurrent transfers (${runtime.config.maxConcurrentTransfers}) reached. Try again later.`
+      );
+    }
+
+    const { fileName, fileSize, mimeType, checksum } = req.body || {};
+    const result = await runtime.chunkedUploadManager.initUpload({
       fileName,
       fileSize,
       mimeType,
+      checksum,
     });
 
     res.json({
@@ -472,16 +511,24 @@ transferRouter.post('/api/upload/decision', requireHost, async (req, res, next) 
       throw new AppError('INVALID_INPUT', 400, 'transferId and action are required');
     }
 
+    const runtime = req.app.locals.runtime;
     const wss = req.app.get('wss');
+    const record = runtime.pendingUploadManager.getTransferRecord(transferId);
+    const sender = record?.sender || null;
 
     if (action === 'accept') {
-      const accepted = await req.app.locals.runtime.pendingUploadManager.accept(transferId);
+      const accepted = await runtime.pendingUploadManager.accept(transferId);
       if (wss) {
-        broadcastEvent(wss, 'transfer:complete', {
-          transferId,
-          fileName: accepted.fileName,
-          size: accepted.size,
-        });
+        sendTransferTerminalEvent(
+          wss,
+          'transfer:complete',
+          {
+            transferId,
+            fileName: accepted.fileName,
+            size: accepted.size,
+          },
+          sender
+        );
       }
       return res.json({
         success: true,
@@ -490,12 +537,17 @@ transferRouter.post('/api/upload/decision', requireHost, async (req, res, next) 
     }
 
     if (action === 'decline') {
-      const declined = await req.app.locals.runtime.pendingUploadManager.decline(transferId);
+      const declined = await runtime.pendingUploadManager.decline(transferId);
       if (wss) {
-        broadcastEvent(wss, 'transfer:rejected', {
-          transferId,
-          reason: 'REJECTED_BY_PC',
-        });
+        sendTransferTerminalEvent(
+          wss,
+          'transfer:rejected',
+          {
+            transferId,
+            reason: 'REJECTED_BY_PC',
+          },
+          sender
+        );
       }
       return res.json({
         success: true,

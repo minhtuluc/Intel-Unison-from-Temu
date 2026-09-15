@@ -30,13 +30,29 @@ export class PendingUploadService {
   createPending({ fileName, fileSize, mimeType, tempPath, sender = {}, ttlMs = 300000 }) {
     const transferId = generateUploadId();
     const cleanName = sanitizeFileName(fileName || 'unnamed_file');
+    const size = Number(fileSize) || 0;
+    const finalTtl = Number(ttlMs) || 300000;
+
+    if (this.config.quotaTracker) {
+      this.config.quotaTracker.reserve(size);
+    }
 
     const timeoutId = setTimeout(async () => {
+      // If record is already being accepted, rejected, or completed, abort
+      if (record.state !== 'pending') {
+        return;
+      }
+      record.state = 'expiring';
+
       logger.warn('Pending upload timed out, removing temp file', {
         transferId,
         fileName: cleanName,
       });
       await this._deleteTemp(tempPath);
+      if (this.config.quotaTracker) {
+        this.config.quotaTracker.release(size);
+      }
+      record.state = 'expired';
       this.pending.delete(transferId);
       this._recordOutcome(transferId, {
         status: 'expired',
@@ -46,12 +62,12 @@ export class PendingUploadService {
       });
       if (typeof this.onTimeout === 'function') {
         try {
-          this.onTimeout({ transferId, fileName: cleanName });
+          this.onTimeout({ transferId, fileName: cleanName, sender: record.sender });
         } catch (err) {
           logger.error('Error in onTimeout handler', err);
         }
       }
-    }, ttlMs);
+    }, finalTtl);
 
     // Prevent timer from keeping Node process alive if exiting
     if (timeoutId.unref) {
@@ -60,17 +76,20 @@ export class PendingUploadService {
 
     const record = {
       transferId,
+      state: 'pending', // 'pending' | 'accepting' | 'rejecting' | 'expiring' | 'completed' | 'rejected' | 'expired'
       fileName: cleanName,
-      fileSize: Number(fileSize) || 0,
+      fileSize: size,
       mimeType: mimeType || 'application/octet-stream',
       tempPath,
       sender: {
+        connectionId: sender.connectionId || null,
         ip: sender.ip || 'unknown',
         label: sender.label || 'Unknown device',
         labelUntrusted: true,
         platform: sender.platform || 'unknown',
       },
       createdAt: Date.now(),
+      ttlMs: finalTtl,
       timeoutId,
     };
 
@@ -99,33 +118,44 @@ export class PendingUploadService {
    * @param {string} transferId
    * @returns {Promise<{ transferId: string, fileName: string, size: number }>}
    */
-  async accept(transferId) {
+  async accept(transferId, targetDir = this.config.uploadDir) {
     const record = this.pending.get(transferId);
     if (!record) {
+      const outcome = this.recentOutcomes?.get(transferId);
+      if (outcome) {
+        throw new AppError(
+          'TRANSFER_IN_PROGRESS',
+          409,
+          `Transfer ${transferId} has already finished with status: ${outcome.status}`
+        );
+      }
       throw new AppError('PENDING_NOT_FOUND', 404, `Pending transfer ${transferId} not found`);
     }
 
-    if (record.isAccepting) {
+    if (record.state !== 'pending') {
       throw new AppError(
         'TRANSFER_IN_PROGRESS',
         409,
-        `Transfer ${transferId} is already being accepted`
+        `Transfer ${transferId} is currently in state: ${record.state}`
       );
     }
-    record.isAccepting = true;
+    record.state = 'accepting';
 
     // Pause timeout while move is in progress
     clearTimeout(record.timeoutId);
 
     try {
       // Ensure upload directory exists
-      await fs.promises.mkdir(this.config.uploadDir, { recursive: true });
+      await fs.promises.mkdir(targetDir, { recursive: true });
 
       // Atomic move with race-free collision resolution
-      const moved = await atomicMove(record.tempPath, this.config.uploadDir, record.fileName);
+      const moved = await atomicMove(record.tempPath, targetDir, record.fileName);
 
-      // Only delete record from pending map after the file is successfully moved to uploadDir
+      record.state = 'completed';
       this.pending.delete(transferId);
+      if (this.config.quotaTracker) {
+        this.config.quotaTracker.release(record.fileSize);
+      }
       this._recordOutcome(transferId, {
         status: 'completed',
         fileName: moved.fileName,
@@ -146,17 +176,23 @@ export class PendingUploadService {
         size: record.fileSize,
       };
     } catch (err) {
-      record.isAccepting = false;
+      record.state = 'pending';
 
-      // Re-arm timeout with remaining TTL (minimum 10 seconds) so user can resolve issue and retry
+      // Re-arm timeout with remaining TTL based on original ttlMs (minimum 10 seconds)
       const elapsed = Date.now() - record.createdAt;
-      const remainingTtl = Math.max(10000, 300000 - elapsed);
+      const remainingTtl = Math.max(10000, record.ttlMs - elapsed);
       record.timeoutId = setTimeout(async () => {
+        if (record.state !== 'pending') return;
+        record.state = 'expiring';
         logger.warn('Pending upload timed out, removing temp file', {
           transferId,
           fileName: record.fileName,
         });
         await this._deleteTemp(record.tempPath);
+        if (this.config.quotaTracker) {
+          this.config.quotaTracker.release(record.fileSize);
+        }
+        record.state = 'expired';
         this.pending.delete(transferId);
         this._recordOutcome(transferId, {
           status: 'expired',
@@ -166,9 +202,9 @@ export class PendingUploadService {
         });
         if (typeof this.onTimeout === 'function') {
           try {
-            this.onTimeout({ transferId, fileName: record.fileName });
-          } catch (err) {
-            logger.error('Error in onTimeout handler', err);
+            this.onTimeout({ transferId, fileName: record.fileName, sender: record.sender });
+          } catch (tErr) {
+            logger.error('Error in onTimeout handler', tErr);
           }
         }
       }, remainingTtl);
@@ -186,18 +222,41 @@ export class PendingUploadService {
   async decline(transferId) {
     const record = this.pending.get(transferId);
     if (!record) {
+      const outcome = this.recentOutcomes?.get(transferId);
+      if (outcome) {
+        throw new AppError(
+          'TRANSFER_IN_PROGRESS',
+          409,
+          `Transfer ${transferId} has already finished with status: ${outcome.status}`
+        );
+      }
       throw new AppError('PENDING_NOT_FOUND', 404, `Pending transfer ${transferId} not found`);
     }
 
-    clearTimeout(record.timeoutId);
-    this.pending.delete(transferId);
-    this._recordOutcome(transferId, {
-      status: 'rejected',
-      reason: 'REJECTED_BY_PC',
-      timestamp: Date.now(),
-    });
+    if (record.state !== 'pending') {
+      throw new AppError(
+        'TRANSFER_IN_PROGRESS',
+        409,
+        `Transfer ${transferId} is currently in state: ${record.state}`
+      );
+    }
+    record.state = 'rejecting';
 
-    await this._deleteTemp(record.tempPath);
+    clearTimeout(record.timeoutId);
+    try {
+      await this._deleteTemp(record.tempPath);
+      if (this.config.quotaTracker) {
+        this.config.quotaTracker.release(record.fileSize);
+      }
+    } finally {
+      record.state = 'rejected';
+      this.pending.delete(transferId);
+      this._recordOutcome(transferId, {
+        status: 'rejected',
+        reason: 'REJECTED_BY_PC',
+        timestamp: Date.now(),
+      });
+    }
 
     logger.info('Pending transfer declined by PC, file deleted', {
       transferId,
@@ -208,6 +267,15 @@ export class PendingUploadService {
       transferId,
       declined: true,
     };
+  }
+
+  /**
+   * Gets internal transfer record (e.g. for sender metadata).
+   * @param {string} transferId
+   * @returns {object|null}
+   */
+  getTransferRecord(transferId) {
+    return this.pending.get(transferId) || this.recentOutcomes?.get(transferId) || null;
   }
 
   _recordOutcome(transferId, outcome) {
