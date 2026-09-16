@@ -38,6 +38,10 @@ Hệ quả cụ thể của trạng thái cũ:
 
 10. **Số lượng và thời hạn có trần rõ ràng.** Offer tối đa 50 file và hết hạn sau `offerTtlMs` (mặc định 2 phút); grant sống theo `uploadExpiry`; lịch sử giữ 500 entry và mỗi lần đọc tối đa 200. Offer hết hạn phát `transfer:offer:expired` cho đúng socket đã gửi, không để phía gửi chờ vô hạn.
 
+11. **Client offer phải có danh tính connection đã xác minh.** Frontend gửi `X-Connection-Id` do server cấp khi tạo và polling offer. Server từ chối client offer thiếu/sai connection ID thay vì phát grant có owner rỗng. Host capability là ngoại lệ duy nhất theo mục 4.
+
+12. **Chunk được authorize trước parser và có capability resume cho no-PIN.** Mọi `POST /api/upload/chunk` phải gửi `X-Upload-Id`; middleware tìm session và kiểm quyền trước Multer, sau đó yêu cầu bản sao `uploadId` trong multipart body phải khớp header. Khi PIN tắt, init trả một capability upload ngẫu nhiên 256-bit và server chỉ giữ SHA-256 hash; capability này chứng minh quyền status/chunk/cancel/complete sau khi WebSocket reconnect. Khi PIN bật, session đã xác thực vẫn là authority và server không phát capability upload riêng.
+
 ## Consequences
 
 - Host thấy tên/cỡ/loại và duyệt trước; đĩa và băng thông của host không còn bị chiếm bởi một lô chưa được đồng ý.
@@ -46,4 +50,5 @@ Hệ quả cụ thể của trạng thái cũ:
 - `dataDir` trở thành state thật của app: xoá nó là mất danh sách thiết bị tin cậy và lịch sử, nhưng không ảnh hưởng file đã nhận.
 - Consent không thay thế TLS: kẻ nghe lén trong LAN vẫn đọc được nội dung. Đây vẫn là giới hạn đã ghi ở ADR-0002.
 - Offer/decision/quota/history là các API **mới**, chưa có client ngoài browser này; chưa có versioning API.
+- `X-Upload-Id` là thay đổi phá vỡ tương thích của chunk endpoint; client và server phải được nâng cấp cùng nhau. Upload capability là bearer secret chỉ tồn tại trong response init và RAM của task, không được đưa vào QR, `/api/info`, history hay broadcast.
 - Chưa kiểm chứng trên điện thoại thật, chưa có HTTPS LAN, và vòng đời cache service worker chưa được kiểm trên browser thật — repo không có E2E browser.

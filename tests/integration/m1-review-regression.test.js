@@ -250,9 +250,11 @@ describe('M1 Review Regression: R1 to R5', () => {
 
       try {
         const engine = new TransferEngine();
+        engine.connectionId = 'conn-test-123';
         const fakeBlob = new Blob(['0123456789']);
         const fakeTask = {
           uploadId: 'up-123',
+          uploadToken: 'upload-secret-123',
           speedSamples: [],
           xhr: null,
         };
@@ -268,6 +270,18 @@ describe('M1 Review Regression: R1 to R5', () => {
 
         assert.ok(openIdx !== -1, 'xhr.open must be called');
         assert.ok(headerIdx !== -1, 'xhr.setRequestHeader must be called');
+        assert.ok(
+          callLog.includes('setRequestHeader:X-Upload-Id=up-123'),
+          'chunk request must expose upload id before the multipart parser runs'
+        );
+        assert.ok(
+          callLog.includes('setRequestHeader:X-Connection-Id=conn-test-123'),
+          'chunk request must carry the server-issued connection id'
+        );
+        assert.ok(
+          callLog.includes('setRequestHeader:X-Upload-Token=upload-secret-123'),
+          'chunk request must carry the resumable upload capability'
+        );
         assert.ok(sendIdx !== -1, 'xhr.send must be called');
         assert.ok(openIdx < headerIdx, 'xhr.open must be called before xhr.setRequestHeader');
         assert.ok(headerIdx < sendIdx, 'xhr.setRequestHeader must be called before xhr.send');

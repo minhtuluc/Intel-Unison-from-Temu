@@ -126,6 +126,20 @@ describe('M3 QC Review Regression Suite (M3-QC-01 to M3-QC-04)', () => {
   });
 
   describe('M3-QC-01: Grant bound to connection requires valid connection ID', () => {
+    it('refuses a client offer that cannot be bound to a server-issued connection', async () => {
+      const response = await fetch(`${baseUrl}/api/transfer/offer`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Session-Token': tokenA,
+        },
+        body: JSON.stringify({ files: [{ name: 'unbound.txt', size: 7 }] }),
+      });
+
+      assert.equal(response.status, 403);
+      assert.equal((await response.json()).error.code, 'INVALID_CONNECTION_ID');
+    });
+
     it('enforces connection identity on simple upload and allows owner retry', async () => {
       const bodyText = 'alpha payload secret content';
       const bodyBytes = Buffer.from(bodyText);
@@ -853,6 +867,7 @@ describe('M3 QC Review Regression Suite (M3-QC-01 to M3-QC-04)', () => {
           headers: {
             'X-Session-Token': tokenB,
             'X-Connection-Id': connIdB,
+            'X-Upload-Id': uploadId,
           },
           body: formChunkB,
         });
@@ -918,6 +933,7 @@ describe('M3 QC Review Regression Suite (M3-QC-01 to M3-QC-04)', () => {
           headers: {
             'X-Session-Token': tokenA,
             'X-Connection-Id': connIdA,
+            'X-Upload-Id': uploadId,
           },
           body: formChunkA0,
         });
@@ -940,6 +956,7 @@ describe('M3 QC Review Regression Suite (M3-QC-01 to M3-QC-04)', () => {
           headers: {
             'X-Session-Token': tokenA,
             'X-Connection-Id': connIdA2,
+            'X-Upload-Id': uploadId,
           },
           body: formChunkA1,
         });

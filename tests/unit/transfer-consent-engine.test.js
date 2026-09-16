@@ -72,6 +72,25 @@ describe('UT-012 TransferEngine consent', () => {
     assert.equal(engine.activeTransfers.size, 0);
   });
 
+  it('binds the offer request to the server-issued connection identity', async () => {
+    engine.connectionId = 'conn_sender_1';
+    respond = () =>
+      offerResponse({
+        success: true,
+        data: {
+          offer: { offerId: 'of_bound', state: 'pending' },
+          autoApproved: false,
+          decisions: [decision(0, 'pending', null)],
+        },
+      });
+
+    engine.addFiles([file('bound.bin', 10)]);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const headers = new Headers(calls[0].options.headers);
+    assert.equal(headers.get('X-Connection-Id'), 'conn_sender_1');
+  });
+
   it('queues an approved file with the grant the host issued', async () => {
     respond = () =>
       offerResponse({

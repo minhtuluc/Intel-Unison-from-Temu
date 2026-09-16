@@ -404,6 +404,7 @@ export class ChunkedUploadManager {
       duration: parseFloat(duration.toFixed(1)),
       averageSpeed: `${speedMBs} MB/s`,
       sender: session.sender || null,
+      ownerTokenHash: session.ownerTokenHash || null,
     };
 
     this.recordCompletedOutcome(uploadId, completionResult);

@@ -92,6 +92,40 @@
 
 ---
 
+## Phản hồi thi công QC vòng 3
+
+Ba finding M3-QC-R3-01 đến R3-03 đã được vá trực tiếp trên nhánh `m3-core-ux-consent`.
+
+### M3-QC-R3-01 — resolved
+
+- `TransferEngine` gắn `X-Connection-Id` hiện tại vào offer và polling request.
+- Server từ chối client offer không bind được vào connection ID do server cấp; host capability vẫn giữ policy riêng.
+- Unit test khẳng định frontend gửi connection ID; integration test khẳng định offer thiếu identity trả `403 INVALID_CONNECTION_ID`.
+
+### M3-QC-R3-02 — resolved
+
+- Frontend đồng bộ ownership headers cho init, status, chunk, cancel và complete.
+- Với no-PIN, init phát capability ngẫu nhiên 256-bit riêng cho upload; server chỉ giữ SHA-256 hash. Capability cho phép đúng owner resume/cancel/complete sau khi WebSocket reconnect mà không dựa vào tên thiết bị, OS hay IP.
+- Với PIN, session đã xác thực vẫn là authority và capability upload không được phát.
+- Integration test no-PIN dùng WebSocket thật kiểm tra reconnect, status, chunk, complete và cancel; test PIN hiện hữu tiếp tục kiểm tra reconnect bằng session và cô lập client A/B.
+
+### M3-QC-R3-03 — resolved
+
+- Chunk request bắt buộc gửi `X-Upload-Id`; middleware tìm session và kiểm owner/host trước `parseChunkUpload`.
+- `uploadId` trong multipart body phải trùng header, ngăn header/body confusion.
+- Negative test gửi multipart cố ý hỏng từ foreign connection và vẫn nhận `403 UPLOAD_FORBIDDEN`, chứng minh request bị chặn trước parser.
+
+### Bằng chứng gate sau vá
+
+- `npm run quality`: **438/438 test pass**, 119 suites, 0 fail/skip.
+- Coverage local Node trên Windows: **90.64% line / 82.18% branch / 88.37% function**.
+- `git diff --check`: pass.
+- Chưa claim browser/device thật hoặc Linux smoke test.
+
+**QC status:** Đủ điều kiện merge M3 sau khi commit/push nhánh và CI từ xa xanh.
+
+---
+
 ## Kết quả khắc phục (Resolution Summary)
 
 Đã hoàn thành toàn bộ 4 finding P1 và các vấn đề nhỏ theo đúng acceptance criteria:

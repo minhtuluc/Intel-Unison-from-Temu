@@ -104,7 +104,11 @@ describe('M2 QC Review Regression Suite (R1 to R13)', () => {
         f0.append('uploadId', uploadId);
         f0.append('chunkIndex', '0');
         f0.append('chunk', new Blob([chunk1]), 'c0');
-        const res0 = await fetch(`${baseUrl}/api/upload/chunk`, { method: 'POST', body: f0 });
+        const res0 = await fetch(`${baseUrl}/api/upload/chunk`, {
+          method: 'POST',
+          headers: { 'X-Upload-Id': uploadId, ...hostHeaders },
+          body: f0,
+        });
         assert.equal(res0.status, 200);
 
         // 3. Upload chunk 1
@@ -112,19 +116,23 @@ describe('M2 QC Review Regression Suite (R1 to R13)', () => {
         f1.append('uploadId', uploadId);
         f1.append('chunkIndex', '1');
         f1.append('chunk', new Blob([chunk2]), 'c1');
-        const res1 = await fetch(`${baseUrl}/api/upload/chunk`, { method: 'POST', body: f1 });
+        const res1 = await fetch(`${baseUrl}/api/upload/chunk`, {
+          method: 'POST',
+          headers: { 'X-Upload-Id': uploadId, ...hostHeaders },
+          body: f1,
+        });
         assert.equal(res1.status, 200);
 
         // 4. Concurrent complete requests
         const [comp1, comp2] = await Promise.all([
           fetch(`${baseUrl}/api/upload/complete`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: { 'Content-Type': 'application/json', ...hostHeaders },
             body: JSON.stringify({ uploadId }),
           }),
           fetch(`${baseUrl}/api/upload/complete`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: { 'Content-Type': 'application/json', ...hostHeaders },
             body: JSON.stringify({ uploadId }),
           }),
         ]);
@@ -184,18 +192,22 @@ describe('M2 QC Review Regression Suite (R1 to R13)', () => {
         f0.append('uploadId', uploadId);
         f0.append('chunkIndex', '0');
         f0.append('chunk', new Blob([chunk1]), 'c0');
-        await fetch(`${baseUrl}/api/upload/chunk`, { method: 'POST', body: f0 });
+        await fetch(`${baseUrl}/api/upload/chunk`, {
+          method: 'POST',
+          headers: { 'X-Upload-Id': uploadId, ...hostHeaders },
+          body: f0,
+        });
 
         // Fire complete and cancel simultaneously
         const [compRes, cancelRes] = await Promise.all([
           fetch(`${baseUrl}/api/upload/complete`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: { 'Content-Type': 'application/json', ...hostHeaders },
             body: JSON.stringify({ uploadId }),
           }),
           fetch(`${baseUrl}/api/upload/cancel`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: { 'Content-Type': 'application/json', ...hostHeaders },
             body: JSON.stringify({ uploadId }),
           }),
         ]);
@@ -287,12 +299,16 @@ describe('M2 QC Review Regression Suite (R1 to R13)', () => {
         f0.append('uploadId', uploadId);
         f0.append('chunkIndex', '0');
         f0.append('chunk', new Blob([tamperedChunk]), 'c0');
-        await fetch(`${baseUrl}/api/upload/chunk`, { method: 'POST', body: f0 });
+        await fetch(`${baseUrl}/api/upload/chunk`, {
+          method: 'POST',
+          headers: { 'X-Upload-Id': uploadId, ...hostHeaders },
+          body: f0,
+        });
 
         // Complete should fail with CHECKSUM_MISMATCH
         const compRes = await fetch(`${baseUrl}/api/upload/complete`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', ...hostHeaders },
           body: JSON.stringify({ uploadId }),
         });
         assert.equal(compRes.status, 400);
@@ -476,7 +492,7 @@ describe('M2 QC Review Regression Suite (R1 to R13)', () => {
 
       await fetch(`${baseUrl}/api/upload/cancel`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...hostHeaders },
         body: JSON.stringify({ uploadId }),
       });
       assert.equal(runtime.quotaTracker.getStats().used, initialUsed);
@@ -1072,6 +1088,7 @@ describe('M2 QC Review Regression Suite (R1 to R13)', () => {
         form.append('chunk', new Blob([chunkData]), 'chunk0');
         const chunkRes = await fetch(`${baseUrl}/api/upload/chunk`, {
           method: 'POST',
+          headers: { 'X-Upload-Id': uploadId, ...hostHeaders },
           body: form,
         });
         assert.equal(chunkRes.status, 200);
@@ -1079,7 +1096,7 @@ describe('M2 QC Review Regression Suite (R1 to R13)', () => {
         // 3. First complete call -> 200 OK
         const completeRes1 = await fetch(`${baseUrl}/api/upload/complete`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', ...hostHeaders },
           body: JSON.stringify({ uploadId }),
         });
         assert.equal(completeRes1.status, 200);
@@ -1090,7 +1107,7 @@ describe('M2 QC Review Regression Suite (R1 to R13)', () => {
         // 4. Sequential retry of complete call with same uploadId -> must return 200 OK with identical transferId
         const completeRes2 = await fetch(`${baseUrl}/api/upload/complete`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', ...hostHeaders },
           body: JSON.stringify({ uploadId }),
         });
         assert.equal(completeRes2.status, 200, 'Retry of complete must return 200, not 410');
@@ -1674,7 +1691,7 @@ describe('M2 QC Review Regression Suite (R1 to R13)', () => {
           chunkForm.append('chunk', new Blob([chunkPayload]), 'chunk_0');
           const chunkRes = await fetch(`${base}/api/upload/chunk`, {
             method: 'POST',
-            headers: { 'X-Host-Token': hostToken },
+            headers: { 'X-Host-Token': hostToken, 'X-Upload-Id': uploadId },
             body: chunkForm,
           });
           assert.equal(chunkRes.status, 200, `Host chunk upload must succeed with ${policyLabel}`);

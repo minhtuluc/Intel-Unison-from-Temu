@@ -225,6 +225,7 @@ describe('Integration: API Transfer (Download & Upload)', () => {
         assert.equal(initRes.status, 200);
         const initBody = await initRes.json();
         const uploadId = initBody.data.uploadId;
+        const uploadToken = initBody.data.uploadToken;
         assert.ok(uploadId);
         assert.equal(initBody.data.totalChunks, 2);
 
@@ -236,6 +237,7 @@ describe('Integration: API Transfer (Download & Upload)', () => {
 
         const chunk0Res = await fetch(`${baseUrl}/api/upload/chunk`, {
           method: 'POST',
+          headers: { 'X-Upload-Id': uploadId, 'X-Upload-Token': uploadToken },
           body: formChunk0,
         });
         assert.equal(chunk0Res.status, 200);
@@ -248,12 +250,15 @@ describe('Integration: API Transfer (Download & Upload)', () => {
 
         const chunk1Res = await fetch(`${baseUrl}/api/upload/chunk`, {
           method: 'POST',
+          headers: { 'X-Upload-Id': uploadId, 'X-Upload-Token': uploadToken },
           body: formChunk1,
         });
         assert.equal(chunk1Res.status, 200);
 
         // 4. Status Check
-        const statusRes = await fetch(`${baseUrl}/api/upload/status/${uploadId}`);
+        const statusRes = await fetch(`${baseUrl}/api/upload/status/${uploadId}`, {
+          headers: { 'X-Upload-Token': uploadToken },
+        });
         assert.equal(statusRes.status, 200);
         const statusBody = await statusRes.json();
         assert.equal(statusBody.data.receivedChunks.length, 2);
@@ -261,7 +266,10 @@ describe('Integration: API Transfer (Download & Upload)', () => {
         // 5. Complete
         const completeRes = await fetch(`${baseUrl}/api/upload/complete`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Upload-Token': uploadToken,
+          },
           body: JSON.stringify({ uploadId }),
         });
 

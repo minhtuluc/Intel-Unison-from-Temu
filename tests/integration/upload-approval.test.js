@@ -14,6 +14,8 @@ describe('Upload Approval & Decision Integration Tests', () => {
   let uploadDir;
   let runtime;
   let hostHeaders;
+  let clientConnectionId;
+  let clientWs;
 
   before(async () => {
     tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'utrans-approval-test-'));
@@ -32,9 +34,26 @@ describe('Upload Approval & Decision Integration Tests', () => {
     const addr = serverInstance.server.address();
     baseUrl = `http://127.0.0.1:${addr.port}`;
     hostHeaders = { 'X-Host-Token': serverInstance.app.locals.hostAuth.token };
+
+    clientWs = new WebSocket(`ws://127.0.0.1:${addr.port}/ws`);
+    const registered = new Promise((resolve) => {
+      clientWs.on('message', (raw) => {
+        const message = JSON.parse(raw.toString());
+        if (message.event === 'client:registered') resolve(message.data.connectionId);
+      });
+    });
+    await new Promise((resolve) => clientWs.on('open', resolve));
+    clientWs.send(
+      JSON.stringify({
+        event: 'client:register',
+        data: { deviceName: 'Approval Test Client', platform: 'test' },
+      })
+    );
+    clientConnectionId = await registered;
   });
 
   after(async () => {
+    clientWs?.terminate();
     if (serverInstance?.wss) {
       for (const client of serverInstance.wss.clients) {
         client.terminate();
@@ -65,6 +84,7 @@ describe('Upload Approval & Decision Integration Tests', () => {
         'x-device-id': 'dev_phone_1',
         'x-device-name': 'Pixel Phone',
         'x-platform': 'android',
+        'X-Connection-Id': clientConnectionId,
       },
       body: JSON.stringify({
         files: [{ name: 'photo_from_phone.jpg', size: payload.length, mimeType: 'text/plain' }],
@@ -105,7 +125,10 @@ describe('Upload Approval & Decision Integration Tests', () => {
     formData.append('files', new Blob([payload], { type: 'text/plain' }), 'photo_from_phone.jpg');
     const uploadRes = await fetch(`${baseUrl}/api/upload`, {
       method: 'POST',
-      headers: { 'X-Transfer-Grant': grantId },
+      headers: {
+        'X-Transfer-Grant': grantId,
+        'X-Connection-Id': clientConnectionId,
+      },
       body: formData,
     });
     assert.equal(uploadRes.status, 201);
@@ -122,7 +145,10 @@ describe('Upload Approval & Decision Integration Tests', () => {
 
     const offerRes = await fetch(`${baseUrl}/api/transfer/offer`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Connection-Id': clientConnectionId,
+      },
       body: JSON.stringify({ files: [{ name: 'unwanted_file.exe', size: payload.length }] }),
     });
     const offer = (await offerRes.json()).data.offer;
@@ -189,18 +215,26 @@ describe('Upload Approval & Decision Integration Tests', () => {
       f0.append('uploadId', uploadId);
       f0.append('chunkIndex', '0');
       f0.append('chunk', new Blob([c0]), 'c0');
-      await fetch(`${baseUrl}/api/upload/chunk`, { method: 'POST', body: f0 });
+      await fetch(`${baseUrl}/api/upload/chunk`, {
+        method: 'POST',
+        headers: { 'X-Upload-Id': uploadId, ...hostHeaders },
+        body: f0,
+      });
 
       const f1 = new FormData();
       f1.append('uploadId', uploadId);
       f1.append('chunkIndex', '1');
       f1.append('chunk', new Blob([c1]), 'c1');
-      await fetch(`${baseUrl}/api/upload/chunk`, { method: 'POST', body: f1 });
+      await fetch(`${baseUrl}/api/upload/chunk`, {
+        method: 'POST',
+        headers: { 'X-Upload-Id': uploadId, ...hostHeaders },
+        body: f1,
+      });
 
       // Call complete
       const compRes = await fetch(`${baseUrl}/api/upload/complete`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...hostHeaders },
         body: JSON.stringify({ uploadId }),
       });
 

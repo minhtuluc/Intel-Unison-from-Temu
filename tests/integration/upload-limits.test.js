@@ -58,14 +58,18 @@ describe('Upload limits are per runtime and enforced before buffering', () => {
       }),
     });
     assert.equal(init.status, 200);
-    const { uploadId } = (await init.json()).data;
+    const { uploadId, uploadToken } = (await init.json()).data;
 
     const oversized = new FormData();
     oversized.append('uploadId', uploadId);
     oversized.append('chunkIndex', '0');
     oversized.append('chunk', new Blob([new Uint8Array(4 * 1024 * 1024)]), 'chunk_0');
 
-    const res = await fetch(`${base}/api/upload/chunk`, { method: 'POST', body: oversized });
+    const res = await fetch(`${base}/api/upload/chunk`, {
+      method: 'POST',
+      headers: { 'X-Upload-Id': uploadId, 'X-Upload-Token': uploadToken },
+      body: oversized,
+    });
     assert.equal(res.status, 413);
     assert.equal((await res.json()).error.code, 'CHUNK_TOO_LARGE');
 
@@ -78,7 +82,11 @@ describe('Upload limits are per runtime and enforced before buffering', () => {
     ok.append('uploadId', uploadId);
     ok.append('chunkIndex', '0');
     ok.append('chunk', new Blob([new Uint8Array(CHUNK_SIZE)]), 'chunk_0');
-    const okRes = await fetch(`${base}/api/upload/chunk`, { method: 'POST', body: ok });
+    const okRes = await fetch(`${base}/api/upload/chunk`, {
+      method: 'POST',
+      headers: { 'X-Upload-Id': uploadId, 'X-Upload-Token': uploadToken },
+      body: ok,
+    });
     assert.equal(okRes.status, 200);
   });
 

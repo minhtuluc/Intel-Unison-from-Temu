@@ -7,6 +7,7 @@
 import { Router } from 'express';
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import multer from 'multer';
 import { broadcastEvent, sendTransferTerminalEvent } from '../websocket/handlers.js';
 import { AppError } from '../middleware/error-handler.js';
@@ -18,6 +19,18 @@ import { hashDeviceToken } from '../services/trusted-devices.js';
 import { resolveSender } from '../utils/connection-identity.js';
 
 export const transferRouter = Router();
+
+function hashUploadToken(token) {
+  return crypto.createHash('sha256').update(token).digest();
+}
+
+function hasValidUploadToken(req, session) {
+  const token = req.headers['x-upload-token'];
+  if (typeof token !== 'string' || !session?.ownerTokenHash) return false;
+  const actual = hashUploadToken(token);
+  const expected = Buffer.from(session.ownerTokenHash, 'hex');
+  return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
+}
 
 /**
  * Custom Multer storage engine that streams files to pending staging area while atomically
@@ -280,19 +293,22 @@ function buildOfferDecisionPayload(offerService, offer, autoApproved) {
  * @throws {AppError} 403 UPLOAD_FORBIDDEN if caller is neither host nor the session owner
  */
 export function assertChunkSessionOwner(req, session) {
-  if (!session || !session.sender) return;
+  if (!session) return;
 
   const hostAuth = req.app.locals.hostAuth || req.app.locals.runtime?.hostAuth;
   const isHost = Boolean(hostAuth?.verify(req, req.headers['x-host-token']));
   if (isHost) return;
+  const isPinRequired = req.app.locals.pinRequired ?? req.app.locals.runtime?.pinRequired ?? false;
+  if (!isPinRequired && hasValidUploadToken(req, session)) return;
+  if (!session.sender) {
+    throw new AppError('UPLOAD_FORBIDDEN', 403, 'Upload session has no verified owner');
+  }
 
   const caller = resolveSender(req);
   const reqToken = extractSessionToken(req);
   const sessions = req.app.locals.sessions || req.app.locals.runtime?.sessions;
 
   const ownerSender = session.sender;
-  const isPinRequired = req.app.locals.pinRequired ?? req.app.locals.runtime?.pinRequired ?? false;
-
   if (isPinRequired || ownerSender.sessionToken || reqToken) {
     const sessionMatch = Boolean(
       reqToken && ownerSender.sessionToken && reqToken === ownerSender.sessionToken
@@ -313,6 +329,28 @@ export function assertChunkSessionOwner(req, session) {
     if (!caller.connectionId || caller.connectionId !== ownerSender.connectionId) {
       throw new AppError('UPLOAD_FORBIDDEN', 403, 'Upload session belongs to another connection');
     }
+    return;
+  }
+
+  throw new AppError('UPLOAD_FORBIDDEN', 403, 'Upload capability is required');
+}
+
+/** Authorizes a chunk request before Multer can buffer any attacker-controlled bytes. */
+function requireChunkSessionOwner(req, res, next) {
+  try {
+    const uploadId = req.headers['x-upload-id'];
+    if (typeof uploadId !== 'string' || !uploadId) {
+      throw new AppError('UPLOAD_ID_REQUIRED', 400, 'X-Upload-Id header is required');
+    }
+    const session = req.app.locals.runtime.chunkedUploadManager.sessions.get(uploadId);
+    if (!session) {
+      throw new AppError('UPLOAD_EXPIRED', 410, 'Upload session not found or has expired');
+    }
+    assertChunkSessionOwner(req, session);
+    req.authorizedUploadId = uploadId;
+    next();
+  } catch (error) {
+    next(error);
   }
 }
 
@@ -325,7 +363,7 @@ export function assertChunkSessionOwner(req, session) {
 transferRouter.post('/api/transfer/offer', async (req, res, next) => {
   try {
     const runtime = req.app.locals.runtime;
-    const sender = resolveSender(req);
+    const sender = resolveSender(req, { required: true });
     const deviceToken = readDeviceToken(req);
     const trusted = Boolean(deviceToken && runtime.trustedDevices.isTrusted(deviceToken));
     const reqToken = extractSessionToken(req);
@@ -737,13 +775,15 @@ transferRouter.post('/api/upload/init', requireTransferGrant(), async (req, res,
     });
 
     const session = runtime.chunkedUploadManager.sessions.get(result.uploadId);
+    const uploadToken = runtime.pinRequired ? null : crypto.randomBytes(32).toString('hex');
     if (session) {
       session.sender = sender;
+      if (uploadToken) session.ownerTokenHash = hashUploadToken(uploadToken).toString('hex');
     }
 
     res.json({
       success: true,
-      data: result,
+      data: uploadToken ? { ...result, uploadToken } : result,
     });
   } catch (error) {
     next(error);
@@ -754,52 +794,56 @@ transferRouter.post('/api/upload/init', requireTransferGrant(), async (req, res,
  * POST /api/upload/chunk
  * Uploads a single chunk of a large file.
  */
-transferRouter.post('/api/upload/chunk', parseChunkUpload, async (req, res, next) => {
-  try {
-    const { uploadId, chunkIndex, checksum } = req.body || {};
+transferRouter.post(
+  '/api/upload/chunk',
+  requireChunkSessionOwner,
+  parseChunkUpload,
+  async (req, res, next) => {
+    try {
+      const { uploadId, chunkIndex, checksum } = req.body || {};
 
-    if (!uploadId || chunkIndex === undefined || chunkIndex === null || chunkIndex === '') {
-      throw new AppError('INVALID_INPUT', 400, 'uploadId and chunkIndex are required');
-    }
+      if (!uploadId || chunkIndex === undefined || chunkIndex === null || chunkIndex === '') {
+        throw new AppError('INVALID_INPUT', 400, 'uploadId and chunkIndex are required');
+      }
+      if (uploadId !== req.authorizedUploadId) {
+        throw new AppError('UPLOAD_ID_MISMATCH', 400, 'Multipart uploadId must match X-Upload-Id');
+      }
 
-    const runtime = req.app.locals.runtime;
-    const session = runtime.chunkedUploadManager.sessions.get(uploadId);
-    if (session) {
-      assertChunkSessionOwner(req, session);
-    }
+      const runtime = req.app.locals.runtime;
 
-    const idx = Number(chunkIndex);
-    if (!Number.isInteger(idx) || idx < 0) {
-      throw new AppError('INVALID_INPUT', 400, 'chunkIndex must be a non-negative integer');
-    }
+      const idx = Number(chunkIndex);
+      if (!Number.isInteger(idx) || idx < 0) {
+        throw new AppError('INVALID_INPUT', 400, 'chunkIndex must be a non-negative integer');
+      }
 
-    if (!req.file || !req.file.buffer) {
-      throw new AppError('CHUNK_INVALID', 400, 'No chunk data provided');
-    }
+      if (!req.file || !req.file.buffer) {
+        throw new AppError('CHUNK_INVALID', 400, 'No chunk data provided');
+      }
 
-    if (req.file.size > runtime.config.chunkSize + CHUNK_HEADROOM) {
-      throw new AppError(
-        'CHUNK_TOO_LARGE',
-        413,
-        `Chunk exceeds the allowed size (${runtime.config.chunkSize} + headroom bytes)`
+      if (req.file.size > runtime.config.chunkSize + CHUNK_HEADROOM) {
+        throw new AppError(
+          'CHUNK_TOO_LARGE',
+          413,
+          `Chunk exceeds the allowed size (${runtime.config.chunkSize} + headroom bytes)`
+        );
+      }
+
+      const result = await runtime.chunkedUploadManager.addChunk(
+        uploadId,
+        idx,
+        req.file.buffer,
+        checksum
       );
+
+      res.json({
+        success: true,
+        data: result,
+      });
+    } catch (error) {
+      next(error);
     }
-
-    const result = await runtime.chunkedUploadManager.addChunk(
-      uploadId,
-      idx,
-      req.file.buffer,
-      checksum
-    );
-
-    res.json({
-      success: true,
-      data: result,
-    });
-  } catch (error) {
-    next(error);
   }
-});
+);
 
 /**
  * GET /api/upload/status/:uploadId
@@ -939,6 +983,7 @@ transferRouter.post('/api/upload/complete', async (req, res, next) => {
       savedAs: preApproved ? record.fileName : null,
       filePath: result.filePath,
       sender: session?.sender || result.sender || sender || null,
+      ownerTokenHash: session?.ownerTokenHash || result.ownerTokenHash || null,
     };
 
     runtime.chunkedUploadManager.recordCompletedOutcome(uploadId, outcomeData);

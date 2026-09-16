@@ -131,25 +131,31 @@ describe('UT-015: no internal paths and no client-asserted identity', () => {
       headers: { 'Content-Type': 'application/json', 'X-Transfer-Grant': grantHeader },
       body: JSON.stringify({ fileName: 'chunked-leak.bin', fileSize: 8, checksum }),
     });
-    const { uploadId } = (await init.json()).data;
+    const { uploadId, uploadToken } = (await init.json()).data;
 
     const chunk = new FormData();
     chunk.append('uploadId', uploadId);
     chunk.append('chunkIndex', '0');
     chunk.append('chunk', new Blob(['12345678']), 'chunk_0');
-    const chunkRes = await fetch(`${base}/api/upload/chunk`, { method: 'POST', body: chunk });
+    const chunkRes = await fetch(`${base}/api/upload/chunk`, {
+      method: 'POST',
+      headers: { 'X-Upload-Id': uploadId, 'X-Upload-Token': uploadToken },
+      body: chunk,
+    });
     assert.equal(chunkRes.status, 200);
     assertNoHostPath(await chunkRes.json(), 'POST /api/upload/chunk');
 
     const complete = await fetch(`${base}/api/upload/complete`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'X-Upload-Token': uploadToken },
       body: JSON.stringify({ uploadId }),
     });
     assert.equal(complete.status, 200);
     assertNoHostPath(await complete.json(), 'POST /api/upload/complete');
 
-    const status = await fetch(`${base}/api/upload/status/${uploadId}`);
+    const status = await fetch(`${base}/api/upload/status/${uploadId}`, {
+      headers: { 'X-Upload-Token': uploadToken },
+    });
     if (status.status === 200) {
       assertNoHostPath(await status.json(), 'GET /api/upload/status');
     }

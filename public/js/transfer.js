@@ -104,6 +104,18 @@ export class TransferEngine {
     }
   }
 
+  _getConnectionId() {
+    return this.connectionId || (typeof window !== 'undefined' ? window.utransConnectionId : null);
+  }
+
+  _ownershipHeaders(task = null, initial = {}) {
+    const headers = { ...initial };
+    const connectionId = this._getConnectionId();
+    if (connectionId) headers['X-Connection-Id'] = connectionId;
+    if (task?.uploadToken) headers['X-Upload-Token'] = task.uploadToken;
+    return headers;
+  }
+
   /**
    * Adds files to the upload queue and initiates processing.
    * @param {FileList|File[]} files
@@ -134,6 +146,7 @@ export class TransferEngine {
         etaFormatted: '--',
         isChunked,
         uploadId: null,
+        uploadToken: null,
         transferId: null,
         currentChunk: 0,
         totalChunks: isChunked ? Math.ceil(file.size / this.chunkSize) : 1,
@@ -173,9 +186,10 @@ export class TransferEngine {
 
     let body;
     try {
+      const headers = this._ownershipHeaders(null, { 'Content-Type': 'application/json' });
       const response = await apiFetch('/api/transfer/offer', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({ files: manifest }),
       });
       body = await response.json();
@@ -261,7 +275,9 @@ export class TransferEngine {
 
     const poller = setInterval(async () => {
       try {
-        const response = await apiFetch(`/api/transfer/offer/${offerId}`);
+        const response = await apiFetch(`/api/transfer/offer/${offerId}`, {
+          headers: this._ownershipHeaders(),
+        });
         if (!response.ok) return;
         const { data } = await response.json();
         if (data.offer.state === 'pending') return;
@@ -428,8 +444,7 @@ export class TransferEngine {
       // The server derives identity itself; only the display label is reported.
       xhr.setRequestHeader('X-Device-Name', this._getDeviceName());
       xhr.setRequestHeader('X-Platform', this._getPlatform());
-      const connectionId =
-        this.connectionId || (typeof window !== 'undefined' ? window.utransConnectionId : null);
+      const connectionId = this._getConnectionId();
       if (connectionId) xhr.setRequestHeader('X-Connection-Id', connectionId);
       // The grant is what makes the server accept these bytes (UT-012).
       if (task.grantId) xhr.setRequestHeader('X-Transfer-Grant', task.grantId);
@@ -463,10 +478,7 @@ export class TransferEngine {
           }
           throw err;
         }
-        const connectionId =
-          this.connectionId || (typeof window !== 'undefined' ? window.utransConnectionId : null);
-        const headers = { 'Content-Type': 'application/json' };
-        if (connectionId) headers['X-Connection-Id'] = connectionId;
+        const headers = this._ownershipHeaders(task, { 'Content-Type': 'application/json' });
         // Consent is checked when the session starts; chunks then ride on it.
         if (task.grantId) headers['X-Transfer-Grant'] = task.grantId;
 
@@ -490,6 +502,7 @@ export class TransferEngine {
 
         const initData = await initRes.json();
         task.uploadId = initData.data.uploadId;
+        task.uploadToken = initData.data.uploadToken;
         task.chunkSize = initData.data.chunkSize || this.chunkSize;
         task.totalChunks = initData.data.totalChunks;
       }
@@ -556,14 +569,11 @@ export class TransferEngine {
       if (task.status === 'paused' || task.status === 'cancelled') return task;
 
       // Step 3: Complete upload
-      const connectionId =
-        this.connectionId || (typeof window !== 'undefined' ? window.utransConnectionId : null);
-      const compHeaders = {
+      const compHeaders = this._ownershipHeaders(task, {
         'Content-Type': 'application/json',
         'X-Device-Name': this._getDeviceName(),
         'X-Platform': this._getPlatform(),
-      };
-      if (connectionId) compHeaders['X-Connection-Id'] = connectionId;
+      });
 
       const compRes = await apiFetch('/api/upload/complete', {
         method: 'POST',
@@ -677,6 +687,10 @@ export class TransferEngine {
       if (sessionToken) xhr.setRequestHeader('X-Session-Token', sessionToken);
       const hostToken = getHostToken();
       if (hostToken) xhr.setRequestHeader('X-Host-Token', hostToken);
+      xhr.setRequestHeader('X-Upload-Id', task.uploadId);
+      const connectionId = this._getConnectionId();
+      if (connectionId) xhr.setRequestHeader('X-Connection-Id', connectionId);
+      if (task.uploadToken) xhr.setRequestHeader('X-Upload-Token', task.uploadToken);
       xhr.send(formData);
     });
   }
@@ -750,10 +764,13 @@ export class TransferEngine {
 
     if (task.isChunked && task.uploadId) {
       try {
-        const res = await apiFetch(`/api/upload/status/${task.uploadId}`);
+        const res = await apiFetch(`/api/upload/status/${task.uploadId}`, {
+          headers: this._ownershipHeaders(task),
+        });
         if (res.status === 404 || res.status === 410) {
           // Session expired or cancelled on server; re-init from scratch
           task.uploadId = null;
+          task.uploadToken = null;
           task.currentChunk = 0;
           task.bytesUploaded = 0;
           task.progress = 0;
@@ -817,7 +834,7 @@ export class TransferEngine {
       if (task.isChunked && task.uploadId) {
         apiFetch('/api/upload/cancel', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: this._ownershipHeaders(task, { 'Content-Type': 'application/json' }),
           body: JSON.stringify({ uploadId: task.uploadId }),
         }).catch(() => {});
       }
@@ -844,9 +861,12 @@ export class TransferEngine {
 
     if (task.isChunked && task.uploadId) {
       try {
-        const res = await apiFetch(`/api/upload/status/${task.uploadId}`);
+        const res = await apiFetch(`/api/upload/status/${task.uploadId}`, {
+          headers: this._ownershipHeaders(task),
+        });
         if (res.status === 404 || res.status === 410) {
           task.uploadId = null;
+          task.uploadToken = null;
           task.currentChunk = 0;
           task.bytesUploaded = 0;
           task.progress = 0;
@@ -860,6 +880,7 @@ export class TransferEngine {
         }
       } catch {
         task.uploadId = null;
+        task.uploadToken = null;
         task.currentChunk = 0;
         task.bytesUploaded = 0;
         task.progress = 0;

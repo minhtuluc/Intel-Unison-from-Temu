@@ -11,6 +11,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import WebSocket from 'ws';
 import { startServer } from '../../src/server.js';
 import { approveUpload, offerBatch, requestOffer, decideOffer } from '../helpers/consent.js';
@@ -42,6 +43,7 @@ describe('UT-012: transfer consent before bytes move', () => {
   let base;
   let runtime;
   let hostToken;
+  let defaultConnectionId;
   const sockets = [];
 
   before(async () => {
@@ -62,6 +64,23 @@ describe('UT-012: transfer consent before bytes move', () => {
     runtime = serverInstance.runtime;
     base = `http://127.0.0.1:${serverInstance.server.address().port}`;
     hostToken = serverInstance.app.locals.hostAuth.token;
+
+    const ws = new WebSocket(`ws://127.0.0.1:${serverInstance.server.address().port}/ws`);
+    sockets.push(ws);
+    const registered = new Promise((resolve) => {
+      ws.on('message', (raw) => {
+        const message = JSON.parse(raw.toString());
+        if (message.event === 'client:registered') resolve(message.data.connectionId);
+      });
+    });
+    await new Promise((resolve) => ws.on('open', resolve));
+    ws.send(
+      JSON.stringify({
+        event: 'client:register',
+        data: { deviceName: 'Consent Test Client', platform: 'test' },
+      })
+    );
+    defaultConnectionId = await registered;
   });
 
   after(async () => {
@@ -233,6 +252,154 @@ describe('UT-012: transfer consent before bytes move', () => {
     assert.equal(ownerRes.status, 201);
   });
 
+  it('resumes a no-PIN chunk session with an opaque capability and authorizes before parsing bytes', async () => {
+    const payload = Buffer.from('resume-me');
+    const checksum = crypto.createHash('sha256').update(payload).digest('hex');
+    const { grantHeader } = await offerBatch(base, {
+      files: [{ name: 'resume.bin', size: payload.length, checksum }],
+      connectionId: defaultConnectionId,
+      hostToken,
+    });
+
+    const init = await fetch(`${base}/api/upload/init`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Connection-Id': defaultConnectionId,
+        'X-Transfer-Grant': grantHeader,
+      },
+      body: JSON.stringify({ fileName: 'resume.bin', fileSize: payload.length, checksum }),
+    });
+    assert.equal(init.status, 200);
+    const initData = (await init.json()).data;
+    assert.ok(initData.uploadId);
+    assert.match(initData.uploadToken, /^[a-f0-9]{64}$/);
+
+    const reconnect = new WebSocket(`ws://127.0.0.1:${serverInstance.server.address().port}/ws`);
+    sockets.push(reconnect);
+    const reconnected = new Promise((resolve) => {
+      reconnect.on('message', (raw) => {
+        const message = JSON.parse(raw.toString());
+        if (message.event === 'client:registered') resolve(message.data.connectionId);
+      });
+    });
+    await new Promise((resolve) => reconnect.on('open', resolve));
+    reconnect.send(
+      JSON.stringify({
+        event: 'client:register',
+        data: { deviceName: 'Reconnected Client', platform: 'test' },
+      })
+    );
+    const reconnectId = await reconnected;
+    assert.notEqual(reconnectId, defaultConnectionId);
+
+    const denied = await fetch(`${base}/api/upload/chunk`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'multipart/form-data; boundary=broken',
+        'X-Connection-Id': reconnectId,
+        'X-Upload-Id': initData.uploadId,
+      },
+      body: 'not-a-valid-multipart-body',
+    });
+    assert.equal(denied.status, 403);
+    assert.equal((await denied.json()).error.code, 'UPLOAD_FORBIDDEN');
+
+    const status = await fetch(`${base}/api/upload/status/${initData.uploadId}`, {
+      headers: {
+        'X-Connection-Id': reconnectId,
+        'X-Upload-Token': initData.uploadToken,
+      },
+    });
+    assert.equal(status.status, 200);
+
+    const chunk = new FormData();
+    chunk.append('uploadId', initData.uploadId);
+    chunk.append('chunkIndex', '0');
+    chunk.append('chunk', new Blob([payload]), 'chunk_0');
+    const chunkResponse = await fetch(`${base}/api/upload/chunk`, {
+      method: 'POST',
+      headers: {
+        'X-Connection-Id': reconnectId,
+        'X-Upload-Id': initData.uploadId,
+        'X-Upload-Token': initData.uploadToken,
+      },
+      body: chunk,
+    });
+    assert.equal(chunkResponse.status, 200);
+
+    const complete = await fetch(`${base}/api/upload/complete`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Connection-Id': reconnectId,
+        'X-Upload-Token': initData.uploadToken,
+      },
+      body: JSON.stringify({ uploadId: initData.uploadId }),
+    });
+    assert.equal(complete.status, 200);
+    assert.deepEqual(await fs.promises.readFile(path.join(uploadDir, 'resume.bin')), payload);
+
+    const cancelPayload = Buffer.from('cancel-me');
+    const cancelChecksum = crypto.createHash('sha256').update(cancelPayload).digest('hex');
+    const cancelGrant = await offerBatch(base, {
+      files: [{ name: 'cancel.bin', size: cancelPayload.length, checksum: cancelChecksum }],
+      connectionId: defaultConnectionId,
+      hostToken,
+    });
+    const cancelInit = await fetch(`${base}/api/upload/init`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Connection-Id': defaultConnectionId,
+        'X-Transfer-Grant': cancelGrant.grantHeader,
+      },
+      body: JSON.stringify({
+        fileName: 'cancel.bin',
+        fileSize: cancelPayload.length,
+        checksum: cancelChecksum,
+      }),
+    });
+    assert.equal(cancelInit.status, 200);
+    const cancelSession = (await cancelInit.json()).data;
+
+    const cancel = await fetch(`${base}/api/upload/cancel`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Connection-Id': reconnectId,
+        'X-Upload-Token': cancelSession.uploadToken,
+      },
+      body: JSON.stringify({ uploadId: cancelSession.uploadId }),
+    });
+    assert.equal(cancel.status, 200);
+    assert.equal((await cancel.json()).data.cancelled, true);
+    assert.equal(runtime.chunkedUploadManager.sessions.has(cancelSession.uploadId), false);
+
+    const hostOwned = await fetch(`${base}/api/upload/init`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Host-Token': hostToken,
+      },
+      body: JSON.stringify({
+        fileName: 'host-owned.bin',
+        fileSize: payload.length,
+        checksum,
+      }),
+    });
+    assert.equal(hostOwned.status, 200);
+    const hostOwnedId = (await hostOwned.json()).data.uploadId;
+    const unprivilegedStatus = await fetch(`${base}/api/upload/status/${hostOwnedId}`);
+    assert.equal(unprivilegedStatus.status, 403);
+    assert.equal((await unprivilegedStatus.json()).error.code, 'UPLOAD_FORBIDDEN');
+    await fetch(`${base}/api/upload/cancel`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Host-Token': hostToken },
+      body: JSON.stringify({ uploadId: hostOwnedId }),
+    });
+  });
+
   it('ends an unanswered offer on timeout and leaves no bytes behind', async () => {
     const ws = new WebSocket(`ws://127.0.0.1:${serverInstance.server.address().port}/ws`);
     sockets.push(ws);
@@ -273,10 +440,14 @@ describe('UT-012: transfer consent before bytes move', () => {
 
   it('gives a rejected file no grant, while approving its sibling in the same batch', async () => {
     const keepBody = 'keep this one';
-    const { res, body } = await requestOffer(base, [
-      { name: 'reject_me.bin', size: 12 },
-      { name: 'keep_me.bin', size: keepBody.length },
-    ]);
+    const { res, body } = await requestOffer(
+      base,
+      [
+        { name: 'reject_me.bin', size: 12 },
+        { name: 'keep_me.bin', size: keepBody.length },
+      ],
+      { connectionId: defaultConnectionId }
+    );
     assert.equal(res.status, 201);
     const offerId = body.data.offer.offerId;
 
@@ -312,14 +483,19 @@ describe('UT-012: transfer consent before bytes move', () => {
     const approvedRes = await fetch(`${base}/api/upload`, {
       method: 'POST',
       body: approvedForm,
-      headers: { 'X-Transfer-Grant': approved.grantId },
+      headers: {
+        'X-Transfer-Grant': approved.grantId,
+        'X-Connection-Id': defaultConnectionId,
+      },
     });
     assert.equal(approvedRes.status, 201);
     assert.equal(await fs.promises.readFile(path.join(uploadDir, 'keep_me.bin'), 'utf8'), keepBody);
   });
 
   it('requires host authority to decide an offer', async () => {
-    const { body } = await requestOffer(base, [{ name: 'gated.bin', size: 4 }]);
+    const { body } = await requestOffer(base, [{ name: 'gated.bin', size: 4 }], {
+      connectionId: defaultConnectionId,
+    });
     const offerId = body.data.offer.offerId;
 
     for (const headers of [
@@ -342,7 +518,9 @@ describe('UT-012: transfer consent before bytes move', () => {
       name: `bulk_${index}.bin`,
       size: 1,
     }));
-    const { res, body } = await requestOffer(base, files);
+    const { res, body } = await requestOffer(base, files, {
+      connectionId: defaultConnectionId,
+    });
     assert.equal(res.status, 400);
     assert.equal(body.error.code, 'TOO_MANY_FILES');
   });
@@ -352,7 +530,10 @@ describe('UT-012: transfer consent before bytes move', () => {
 
     it('records a device only when the host asks for it, then approves it silently', async () => {
       // First offer: the host approves and remembers this device.
-      const first = await requestOffer(base, [{ name: 'first.txt', size: 5 }], { deviceToken });
+      const first = await requestOffer(base, [{ name: 'first.txt', size: 5 }], {
+        deviceToken,
+        connectionId: defaultConnectionId,
+      });
       assert.equal(first.res.status, 201);
       assert.equal(first.body.data.autoApproved, false);
 
@@ -369,6 +550,7 @@ describe('UT-012: transfer consent before bytes move', () => {
       const secondBody = 'hello';
       const second = await requestOffer(base, [{ name: 'second.txt', size: secondBody.length }], {
         deviceToken,
+        connectionId: defaultConnectionId,
       });
       assert.equal(second.res.status, 201);
       assert.equal(second.body.data.autoApproved, true);
@@ -380,7 +562,10 @@ describe('UT-012: transfer consent before bytes move', () => {
       const res = await fetch(`${base}/api/upload`, {
         method: 'POST',
         body: form,
-        headers: { 'X-Transfer-Grant': grant },
+        headers: {
+          'X-Transfer-Grant': grant,
+          'X-Connection-Id': defaultConnectionId,
+        },
       });
       assert.equal(res.status, 201);
     });
@@ -389,6 +574,7 @@ describe('UT-012: transfer consent before bytes move', () => {
       // A token that was never trusted must not be auto-approved.
       const stranger = await requestOffer(base, [{ name: 'stranger.txt', size: 3 }], {
         deviceToken: 'd'.repeat(64),
+        connectionId: defaultConnectionId,
       });
       assert.equal(stranger.body.data.autoApproved, false);
 
@@ -411,6 +597,7 @@ describe('UT-012: transfer consent before bytes move', () => {
       // Once revoked, the device goes back to needing an explicit decision.
       const afterRevoke = await requestOffer(base, [{ name: 'after.txt', size: 7 }], {
         deviceToken,
+        connectionId: defaultConnectionId,
       });
       assert.equal(afterRevoke.body.data.autoApproved, false);
     });

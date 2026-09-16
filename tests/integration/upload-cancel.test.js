@@ -60,7 +60,7 @@ describe('Integration: POST /api/upload/cancel (Server-side Cancel & Cleanup)', 
       }),
     });
     assert.equal(initRes.status, 200);
-    const { uploadId } = (await initRes.json()).data;
+    const { uploadId, uploadToken } = (await initRes.json()).data;
 
     // 2. Upload chunk 0
     const form = new FormData();
@@ -70,6 +70,7 @@ describe('Integration: POST /api/upload/cancel (Server-side Cancel & Cleanup)', 
 
     const chunkRes = await fetch(`${baseUrl}/api/upload/chunk`, {
       method: 'POST',
+      headers: { 'X-Upload-Id': uploadId, 'X-Upload-Token': uploadToken },
       body: form,
     });
     assert.equal(chunkRes.status, 200);
@@ -80,7 +81,7 @@ describe('Integration: POST /api/upload/cancel (Server-side Cancel & Cleanup)', 
     // 3. Cancel upload
     const cancelRes = await fetch(`${baseUrl}/api/upload/cancel`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'X-Upload-Token': uploadToken },
       body: JSON.stringify({ uploadId }),
     });
     assert.equal(cancelRes.status, 200);
