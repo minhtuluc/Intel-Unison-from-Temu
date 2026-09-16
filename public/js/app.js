@@ -8,7 +8,7 @@ import { FileBrowser } from './file-browser.js';
 import { DropZone } from './drop-zone.js';
 import { transferEngine } from './transfer.js';
 import { createElement, getFileSvg, showModal, closeModal, showQrModal, showToast } from './ui.js';
-import { formatFileSize, formatRelativeTime } from './utils.js';
+import { describeReason, formatFileSize, formatRelativeTime } from './utils.js';
 import { initializeHostSession, hostHeaders } from './host-session.js';
 import {
   UNAUTHORIZED_EVENT,
@@ -102,7 +102,7 @@ class App {
         }
       }
     } catch {
-      showToast('Could not fetch server info', 'warning');
+      showToast({ message: 'Could not fetch server info', type: 'warning' });
     }
   }
 
@@ -332,7 +332,7 @@ class App {
     transferEngine.addFiles(this.selectedUploadFiles);
     this.selectedUploadFiles = [];
     window.location.hash = '#transfers';
-    showToast('Upload queued! View progress in Transfers tab', 'info');
+    showToast({ message: 'Upload queued! View progress in Transfers tab', type: 'info' });
   }
 
   /* ==========================================================================
@@ -985,7 +985,7 @@ class App {
 
     transferEngine.on('task:completed', (task) => {
       this._updateWakeLock();
-      showToast(`Transferred ${task.name} successfully!`, 'success');
+      showToast({ message: `Transferred ${task.name} successfully!`, type: 'success' });
       if (this.currentView === 'transfers') {
         this._renderTransfersView();
       }
@@ -993,14 +993,14 @@ class App {
 
     transferEngine.on('task:error', (task) => {
       this._updateWakeLock();
-      showToast(`Upload failed: ${task.name} (${task.error})`, 'danger');
+      showToast({ message: `Upload failed: ${task.name} (${task.error})`, type: 'danger' });
       if (this.currentView === 'transfers') {
         this._renderTransfersView();
       }
     });
 
     transferEngine.on('task:awaiting_approval', (task) => {
-      showToast(`Uploaded ${task.name}. Awaiting PC acceptance...`, 'info');
+      showToast({ message: `Uploaded ${task.name}. Awaiting PC acceptance...`, type: 'info' });
       if (this.currentView === 'transfers') {
         this._renderTransfersView();
       }
@@ -1041,7 +1041,7 @@ class App {
     connection.on('share:update', (data) => {
       if (data && data.files) {
         this.fileBrowser.setFiles(data.files);
-        showToast('Shared file list updated', 'info');
+        showToast({ message: 'Shared file list updated', type: 'info' });
       }
     });
 
@@ -1060,7 +1060,7 @@ class App {
         this.connectedDevices = this.connectedDevices
           .filter((d) => d.id !== data.device.id)
           .concat(data.device);
-        showToast(`${data.device.label} joined the network`, 'info');
+        showToast({ message: `${data.device.label} joined the network`, type: 'info' });
         if (this.currentView === 'devices') {
           this._renderDevicesView();
         }
@@ -1070,7 +1070,7 @@ class App {
     connection.on('device:leave', (data) => {
       if (data && data.deviceId) {
         this.connectedDevices = this.connectedDevices.filter((d) => d.id !== data.deviceId);
-        showToast(`${data.label || 'A device'} left`, 'warning');
+        showToast({ message: `${data.label || 'A device'} left`, type: 'warning' });
         if (this.currentView === 'devices') {
           this._renderDevicesView();
         }
@@ -1159,7 +1159,7 @@ class App {
         if (this.serverInfo && this.serverInfo.qrCode) {
           showQrModal(this.serverInfo.qrCode, this.serverInfo.connectUrl);
         } else {
-          showToast('QR code not ready yet', 'warning');
+          showToast({ message: 'QR code not ready yet', type: 'warning' });
         }
       });
     }
@@ -1194,7 +1194,7 @@ class App {
     window.addEventListener('appinstalled', () => {
       this.deferredPrompt = null;
       pwaBtn.style.display = 'none';
-      showToast('UniversalTrans installed successfully!', 'success');
+      showToast({ message: 'UniversalTrans installed successfully!', type: 'success' });
     });
   }
 
@@ -1314,7 +1314,7 @@ class App {
             if (newWorker) {
               newWorker.addEventListener('statechange', () => {
                 if (newWorker.state === 'installed' && navigator.serviceWorker.controller) {
-                  showToast('New version available. Refresh to update.', 'info');
+                  showToast({ message: 'New version available. Refresh to update.', type: 'info' });
                 }
               });
             }
@@ -1328,11 +1328,13 @@ class App {
 
   _setupErrorBoundary() {
     window.addEventListener('error', (event) => {
-      showToast(`App error: ${event.message}`, 'danger');
+      showToast({ message: `App error: ${event.message}`, type: 'danger' });
     });
 
     window.addEventListener('unhandledrejection', (event) => {
-      showToast(`Request error: ${event.reason?.message || event.reason}`, 'danger');
+      // A rejection reason is not always an Error: a bare object used to stringify
+      // to "[object Object]", which told the user nothing at all.
+      showToast({ message: `Request error: ${describeReason(event.reason)}`, type: 'danger' });
     });
   }
 }

@@ -99,7 +99,7 @@ export class DropZone {
       }
 
       if (pastedFiles.length > 0) {
-        showToast('Pasting image from clipboard...', 'info');
+        showToast({ message: 'Pasting image from clipboard...', type: 'info' });
         await this._shareFiles(pastedFiles);
       }
     });
@@ -188,7 +188,7 @@ export class DropZone {
 
   async _shareFiles(files) {
     try {
-      showToast(`Staging ${files.length} file(s) for sharing...`, 'info');
+      showToast({ message: `Staging ${files.length} file(s) for sharing...`, type: 'info' });
 
       const formData = new FormData();
       for (const file of files) {
@@ -207,13 +207,13 @@ export class DropZone {
 
       const data = await res.json();
       const count = data.data?.shared?.length || files.length;
-      showToast(`Shared ${count} file(s) successfully!`, 'success');
+      showToast({ message: `Shared ${count} file(s) successfully!`, type: 'success' });
 
       if (this.onFilesShared) {
         this.onFilesShared(data.data?.shared);
       }
     } catch (err) {
-      showToast(`Failed to share files: ${err.message}`, 'danger');
+      showToast({ message: `Failed to share files: ${err.message}`, type: 'danger' });
     }
   }
 }

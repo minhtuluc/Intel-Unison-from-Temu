@@ -19,6 +19,27 @@ export function debounce(fn, delay = 300) {
 }
 
 /**
+ * Turns an arbitrary thrown or rejected value into something a person can read.
+ * A bare object would otherwise render as "[object Object]", which says nothing.
+ * @param {unknown} reason
+ * @returns {string}
+ */
+export function describeReason(reason) {
+  if (reason === null || reason === undefined) return 'Unknown error';
+  if (typeof reason === 'string') return reason;
+  if (typeof reason === 'number' || typeof reason === 'boolean') return String(reason);
+  if (typeof reason.message === 'string' && reason.message) return reason.message;
+  try {
+    const json = JSON.stringify(reason);
+    if (json && json !== '{}') return json;
+  } catch {
+    // Circular or otherwise unserializable; fall through to the type tag.
+  }
+  const tag = Object.prototype.toString.call(reason);
+  return tag === '[object Object]' ? 'Unknown error' : tag;
+}
+
+/**
  * Formats a byte number into human-readable string.
  * @param {number} bytes
  * @returns {string} e.g. "4.3 MB"

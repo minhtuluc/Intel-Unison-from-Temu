@@ -98,25 +98,63 @@ export function getFileSvg(type) {
   return svg;
 }
 
+/** The only toast types the stylesheet knows how to render. */
+export const TOAST_TYPES = Object.freeze(['info', 'success', 'warning', 'danger']);
+
+const TOAST_TITLES = Object.freeze({
+  success: 'Success',
+  warning: 'Notice',
+  danger: 'Error',
+  info: 'Information',
+});
+
+/**
+ * Resolves what a toast will actually show. Kept separate from the DOM so the
+ * contract can be tested without a browser.
+ * @param {object} options
+ * @returns {{ type: string, title: string, message: string, duration: number }}
+ */
+export function resolveToastContent({ type = 'info', title = '', message, duration = 3500 } = {}) {
+  const safeType = TOAST_TYPES.includes(type) ? type : 'info';
+  return {
+    type: safeType,
+    title: title || TOAST_TITLES[safeType] || 'Notice',
+    message: message === undefined || message === null ? '' : String(message),
+    duration: Number.isFinite(duration) ? duration : 3500,
+  };
+}
+
 /**
  * Displays a toast notification on screen.
- * @param {{ type?: 'info'|'success'|'warning'|'danger', title?: string, message: string, duration?: number }} options
+ *
+ * Takes a single options object. Callers used to pass `(message, type)` as two
+ * strings, which destructured to an empty message and silently rendered a blank
+ * info toast; that shape is now normalized and reported instead of swallowed.
+ * @param {{ type?: 'info'|'success'|'warning'|'danger', title?: string, message: string, duration?: number }|string} options
+ * @param {string} [legacyType]
  */
-export function showToast({ type = 'info', title = '', message, duration = 3500 }) {
+export function showToast(options, legacyType) {
   const container = document.getElementById('toast-container');
   if (!container) return;
 
-  const defaultTitle =
-    {
-      success: 'Success',
-      warning: 'Notice',
-      danger: 'Error',
-      info: 'Information',
-    }[type] || 'Notice';
+  let resolved;
+  if (typeof options === 'string') {
+    // Deprecated shape: keep it visible rather than blank, and make it loud in dev.
+    console.warn('[showToast] called with (message, type); pass a single options object instead.');
+    resolved = resolveToastContent({ message: options, type: legacyType || 'info' });
+  } else {
+    resolved = resolveToastContent(options || {});
+  }
+
+  if (!resolved.message) {
+    console.warn('[showToast] called without a message; nothing useful to show.');
+  }
+
+  const { type, title, message, duration } = resolved;
 
   const toast = createElement('div', { class: `toast toast--${type}` }, [
     createElement('div', { class: 'toast__content' }, [
-      createElement('div', { class: 'toast__title' }, title || defaultTitle),
+      createElement('div', { class: 'toast__title' }, title),
       createElement('div', { class: 'toast__message' }, message),
     ]),
     createElement(
