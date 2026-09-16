@@ -1,0 +1,89 @@
+# M3 QC review — consent, settings, history và UX
+
+**Branch/commit reviewed:** `m3-core-ux-consent` @ `b0ce319`
+
+**Kết luận:** **BLOCK MERGE**. M3 có nền tảng tốt và quality runner xanh, nhưng còn các lỗi P1 liên quan đến quyền sở hữu transfer và tính toàn vẹn consent. Theo release gate trong `docs/agents/quality.md`, P1 liên quan mất dữ liệu phải bằng 0 trước khi merge/release.
+
+## Bằng chứng kiểm thử
+
+- `npm run quality`: **424/424 test pass**, 112 suites; coverage 90.13% line / 82.87% branch / 87.66% function. Đây là coverage Node, chưa phải browser/device E2E.
+- Probe HTTP + WebSocket trên server PIN thật, với hai session và hai connection ID độc lập. Probe dùng thư mục tạm và đã dọn sau khi chạy.
+- `git diff --check origin/main...HEAD`: **fail** vì trailing whitespace tại `README.md:150`.
+
+## Findings cần sửa
+
+### M3-QC-01 — Grant bound to connection nhưng thiếu header lại được chấp nhận (P1)
+
+**Bằng chứng:** tạo offer/approve trên connection A, sau đó gửi multipart bằng session B, grant của A nhưng **không gửi `X-Connection-Id`**. Kết quả thực tế `POST /api/upload` = **201** và payload được ghi vào receive directory; expected là 403.
+
+**Nguyên nhân:** `src/services/transfer-offer.js:280` chỉ từ chối khi `grant.connectionId && context.connectionId` cùng tồn tại. Khi header bị bỏ qua, điều kiện không chạy. `resolveSender(req)` cũng không biến một connection thiếu thành capability hợp lệ.
+
+**Yêu cầu vá / acceptance criteria:**
+
+1. Nếu grant có `connectionId`, mọi đường upload/chunk phải yêu cầu connection ID hiện tại và phải khớp; thiếu hoặc sai đều trả 403 trước mọi thay đổi đĩa.
+2. Không dùng tên thiết bị, `isHost`, IP hay header do client tự khai làm fallback identity.
+3. Thêm integration regression qua `/api/upload` và `/api/upload/init`: owner succeeds; foreign, missing và forged connection đều 403; grant vẫn retry được bởi owner sau các request bị từ chối.
+
+### M3-QC-02 — Chunked init không bind tên file với grant (P1)
+
+**Bằng chứng:** host duyệt grant cho `approved.bin`, size 16; gọi `/api/upload/init` với cùng size nhưng `fileName: different.exe` và checksum hợp lệ. Kết quả thực tế **200**, server cấp `uploadId` cho tên chưa được duyệt; expected là 403.
+
+**Nguyên nhân:** `src/routes/transfer.js:688-727` chỉ kiểm tra số grant và `fileSize`; không so sánh `fileName` (và cần thống nhất checksum/mime theo hợp đồng grant) với file đã được host approve. Simple upload đã có đường kiểm tra riêng nên hai pipeline đang lệch policy.
+
+**Yêu cầu vá / acceptance criteria:**
+
+1. Chunked init phải dùng cùng một hàm đối chiếu `(name, size, checksum[, mime])` như simple upload.
+2. Từ chối trước khi tạo session/chạm đĩa; grant không bị fulfill khi init thất bại.
+3. Regression test cho tên khác, size khác, checksum khác, thiếu checksum; test owner đúng metadata vẫn init được.
+
+### M3-QC-03 — Identity của history/offer chỉ dựa trên header do client khai (P1)
+
+**Bằng chứng history:** session B gọi `GET /api/transfers/history` với `X-Connection-Id` của A và nhận entry `private-a.bin` của A (`200`, `scope: self`). Expected là 403 hoặc danh sách rỗng của B.
+
+**Nguyên nhân:** `src/routes/settings.js:150-166` truyền thẳng `req.headers['x-connection-id']` vào `runtime.history.list()` mà không bind connection ID với session/socket đã xác thực.
+
+**Cùng lớp lỗi ở offer:**
+
+- `src/routes/transfer.js:380-395`: GET offer tin `X-Connection-Id` để quyết định owner.
+- `src/services/transfer-offer.js:350-356`: cancel chỉ kiểm tra mismatch khi **cả** stored ID và context ID tồn tại; bỏ header sẽ bypass ownership.
+
+**Yêu cầu vá / acceptance criteria:**
+
+1. Server phải map session capability ↔ connection(s) đã đăng ký; mọi self-scoped endpoint lấy identity từ mapping server-side, không lấy từ header tùy ý.
+2. Client B không được đọc/cancel offer hoặc history của A dù biết ID; thiếu identity cũng bị từ chối khi endpoint yêu cầu owner.
+3. Thêm integration test với hai PIN session + hai WebSocket connection cho history, GET offer, cancel và retry sau reconnect.
+
+### M3-QC-04 — Host có thể approve cùng một file nhiều lần và phát nhiều grant (P1)
+
+**Bằng chứng:** offer hai file; quyết định `approve index 0` hai request liên tiếp khi offer còn pending. Cả hai trả **200** và phát hai grant ID khác nhau cho cùng file. Điều này cho phép một thao tác/retry của UI tạo nhiều quyền upload cho một approval.
+
+**Nguyên nhân:** `src/services/transfer-offer.js:167-207` không reject target đã có quyết định và không loại duplicate index trước khi mutate; `_applyDecisions()` luôn gọi `_issueGrant()` cho mỗi approval. Việc mutate trước khi validate toàn bộ request cũng có thể để offer ở trạng thái dở dang nếu entry sau invalid.
+
+**Yêu cầu vá / acceptance criteria:**
+
+1. Mỗi `(offerId, fileIndex)` chỉ có tối đa một grant; quyết định lại phải trả lỗi idempotent/409 và không tạo grant mới.
+2. Reject duplicate index và mọi decision trên file không còn `pending` trước khi mutate.
+3. Decision batch phải atomic: nếu một entry invalid, không file nào đổi trạng thái và không grant nào được phát.
+4. Regression test duplicate trong cùng request, approve lặp qua hai request, partial batch lỗi và retry hợp lệ.
+
+## Vấn đề chất lượng nhỏ hơn
+
+- `README.md:150` có hai khoảng trắng cuối dòng, làm `git diff --check` fail; dọn whitespace trước merge.
+- `GET /api/settings` kiểm tra `mkdir/stat` nhưng chưa probe khả năng ghi thực tế. Nên thêm write probe an toàn hoặc báo rõ “path exists” thay vì khẳng định writable; kèm test permission denied trên OS hỗ trợ.
+- Chưa có Playwright/browser matrix hay thiết bị Android/iOS thật. Không xem quality runner Node là bằng chứng cho UX đa client, reconnect hoặc PWA.
+
+## Những phần đã đạt
+
+- Host-only broadcast/decision và pre-transfer gate có test integration tốt; chưa thấy payload đi qua trước khi có grant trong các ca đã chạy.
+- Trusted-device persistence có rollback khi persist lỗi; runtime state nằm trong `app.locals.runtime`, phù hợp ADR.
+- Upload directory runtime và history có test isolation; quality runner không ghi vào Downloads thật.
+
+## Trình tự sửa đề xuất
+
+1. **M3-QC-01 + M3-QC-03:** củng cố capability binding server-side (đây là biên quyền chung và cần làm trước).
+2. **M3-QC-02:** hợp nhất validator metadata cho simple/chunked.
+3. **M3-QC-04:** làm decision transaction/idempotency.
+4. Bổ sung regression tests theo acceptance criteria, chạy `npm run quality`, rồi chạy `git diff --check`.
+5. Sau khi P1 = 0 mới review lại branch; browser/device E2E và packaging Windows/Linux vẫn là gate riêng trước release.
+
+**QC status:** Changes requested — chưa đủ điều kiện merge vào `main`.
