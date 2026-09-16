@@ -7,72 +7,29 @@
 import { Router } from 'express';
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import multer from 'multer';
 import { broadcastEvent, sendTransferTerminalEvent } from '../websocket/handlers.js';
 import { AppError } from '../middleware/error-handler.js';
 import { parseRange, reserveWritableFile } from '../utils/file-utils.js';
 import { requireHost } from '../middleware/host-auth.js';
 import { extractSessionToken } from '../middleware/session-auth.js';
+import { requireTransferGrant, assertGrantsMatchFiles } from '../middleware/transfer-grant.js';
+import { hashDeviceToken } from '../services/trusted-devices.js';
+import { resolveSender } from '../utils/connection-identity.js';
 
 export const transferRouter = Router();
 
-/**
- * Resolves and strictly validates sender attribution from request headers/body against
- * observed connection state. Throws 403 INVALID_CONNECTION_ID if connectionId is spoofed
- * or belongs to a different socket IP / session.
- * @param {import('express').Request} req
- */
-function resolveSender(req) {
-  const connectionId = req.headers['x-connection-id'] || req.body?.connectionId || null;
-  const rawReqIp = req.ip || req.socket?.remoteAddress || 'unknown';
-  const cleanReqIp = rawReqIp.replace(/^::ffff:/, '');
+function hashUploadToken(token) {
+  return crypto.createHash('sha256').update(token).digest();
+}
 
-  if (connectionId) {
-    const wss = req.app.get('wss') || req.app.locals.runtime?.wss;
-    if (wss && wss.clients) {
-      let matchedClient = null;
-      for (const client of wss.clients) {
-        if (client.connectionId === connectionId) {
-          matchedClient = client;
-          break;
-        }
-      }
-      if (!matchedClient) {
-        throw new AppError('INVALID_CONNECTION_ID', 403, 'Connection ID not found or expired');
-      }
-
-      const clientIp = (matchedClient._remoteIp || '').replace(/^::ffff:/, '');
-      if (clientIp && cleanReqIp && cleanReqIp !== 'unknown' && clientIp !== cleanReqIp) {
-        throw new AppError('INVALID_CONNECTION_ID', 403, 'Connection ID does not match sender IP');
-      }
-
-      // If PIN is required (or socket is bound to a session), verify that session matches
-      const isPinRequired =
-        req.app.locals.pinRequired ?? req.app.locals.runtime?.pinRequired ?? false;
-      const hostAuth = req.app.locals.hostAuth || req.app.locals.runtime?.hostAuth;
-      const hostToken = req.headers['x-host-token'];
-      const isHostReq = Boolean(hostToken && hostAuth?.verify(req, hostToken));
-
-      if (!isHostReq && (isPinRequired || matchedClient.sessionToken)) {
-        const reqToken = extractSessionToken(req);
-        if (!reqToken || !matchedClient.sessionToken || matchedClient.sessionToken !== reqToken) {
-          throw new AppError(
-            'INVALID_CONNECTION_ID',
-            403,
-            'Connection ID belongs to a different session'
-          );
-        }
-      }
-    }
-  }
-
-  return {
-    connectionId,
-    ip: rawReqIp,
-    label: req.headers['x-device-name'] || req.body?.deviceName || 'Unknown device',
-    labelUntrusted: true,
-    platform: req.headers['x-platform'] || req.body?.platform || 'unknown',
-  };
+function hasValidUploadToken(req, session) {
+  const token = req.headers['x-upload-token'];
+  if (typeof token !== 'string' || !session?.ownerTokenHash) return false;
+  const actual = hashUploadToken(token);
+  const expected = Buffer.from(session.ownerTokenHash, 'hex');
+  return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
 }
 
 /**
@@ -296,6 +253,306 @@ function parseChunkUpload(req, res, next) {
   });
 }
 
+/** Device tokens are client-generated; the server only ever compares stored hashes. */
+function readDeviceToken(req) {
+  const token = req.headers['x-device-token'];
+  return typeof token === 'string' && token ? token : null;
+}
+
+/**
+ * Decision payload shared by the HTTP response and the WebSocket event, so a sender
+ * sees the same result whether it learned it by event or by polling.
+ * @param {import('../services/transfer-offer.js').TransferOfferService} offerService
+ * @param {object} offer
+ * @param {boolean} autoApproved
+ */
+function buildOfferDecisionPayload(offerService, offer, autoApproved) {
+  const grantByIndex = new Map(
+    offerService.getGrantsForOffer(offer.offerId).map((grant) => [grant.index, grant.grantId])
+  );
+  return {
+    offerId: offer.offerId,
+    autoApproved: Boolean(autoApproved),
+    decisions: offer.files.map((file) => ({
+      index: file.index,
+      name: file.name,
+      size: file.size,
+      mimeType: file.mimeType,
+      decision: file.decision,
+      grantId: grantByIndex.get(file.index) || null,
+    })),
+  };
+}
+
+/**
+ * Verifies that the caller is authorized to view or mutate an active/completed chunk session.
+ * Only host authority or the verified session/connection owner may access it (M3-QC-R2-02).
+ *
+ * @param {import('express').Request} req
+ * @param {object} session
+ * @throws {AppError} 403 UPLOAD_FORBIDDEN if caller is neither host nor the session owner
+ */
+export function assertChunkSessionOwner(req, session) {
+  if (!session) return;
+
+  const hostAuth = req.app.locals.hostAuth || req.app.locals.runtime?.hostAuth;
+  const isHost = Boolean(hostAuth?.verify(req, req.headers['x-host-token']));
+  if (isHost) return;
+  const isPinRequired = req.app.locals.pinRequired ?? req.app.locals.runtime?.pinRequired ?? false;
+  if (!isPinRequired && hasValidUploadToken(req, session)) return;
+  if (!session.sender) {
+    throw new AppError('UPLOAD_FORBIDDEN', 403, 'Upload session has no verified owner');
+  }
+
+  const caller = resolveSender(req);
+  const reqToken = extractSessionToken(req);
+  const sessions = req.app.locals.sessions || req.app.locals.runtime?.sessions;
+
+  const ownerSender = session.sender;
+  if (isPinRequired || ownerSender.sessionToken || reqToken) {
+    const sessionMatch = Boolean(
+      reqToken && ownerSender.sessionToken && reqToken === ownerSender.sessionToken
+    );
+    const sessionConnMatch = Boolean(
+      reqToken &&
+      ownerSender.connectionId &&
+      sessions?.hasConnection?.(reqToken, ownerSender.connectionId)
+    );
+    if (!sessionMatch && !sessionConnMatch) {
+      throw new AppError('UPLOAD_FORBIDDEN', 403, 'Upload session belongs to another client');
+    }
+    return;
+  }
+
+  // Without PIN, check connection ID
+  if (ownerSender.connectionId) {
+    if (!caller.connectionId || caller.connectionId !== ownerSender.connectionId) {
+      throw new AppError('UPLOAD_FORBIDDEN', 403, 'Upload session belongs to another connection');
+    }
+    return;
+  }
+
+  throw new AppError('UPLOAD_FORBIDDEN', 403, 'Upload capability is required');
+}
+
+/** Authorizes a chunk request before Multer can buffer any attacker-controlled bytes. */
+function requireChunkSessionOwner(req, res, next) {
+  try {
+    const uploadId = req.headers['x-upload-id'];
+    if (typeof uploadId !== 'string' || !uploadId) {
+      throw new AppError('UPLOAD_ID_REQUIRED', 400, 'X-Upload-Id header is required');
+    }
+    const session = req.app.locals.runtime.chunkedUploadManager.sessions.get(uploadId);
+    if (!session) {
+      throw new AppError('UPLOAD_EXPIRED', 410, 'Upload session not found or has expired');
+    }
+    assertChunkSessionOwner(req, session);
+    req.authorizedUploadId = uploadId;
+    next();
+  } catch (error) {
+    next(error);
+  }
+}
+
+/**
+ * POST /api/transfer/offer
+ * Declares a batch the sender intends to upload. No payload moves yet: the host
+ * reviews name/size/type and decides per file. A remembered device is approved
+ * immediately, but the offer is still recorded so the host can see what arrived.
+ */
+transferRouter.post('/api/transfer/offer', async (req, res, next) => {
+  try {
+    const runtime = req.app.locals.runtime;
+    const sender = resolveSender(req, { required: true });
+    const deviceToken = readDeviceToken(req);
+    const trusted = Boolean(deviceToken && runtime.trustedDevices.isTrusted(deviceToken));
+    const reqToken = extractSessionToken(req);
+    if (reqToken) sender.sessionToken = reqToken;
+    if (deviceToken) sender.deviceTokenHash = hashDeviceToken(deviceToken);
+
+    const { offer, autoApproved } = runtime.offerService.createOffer({
+      files: req.body?.files,
+      sender,
+      trusted,
+    });
+
+    const wss = req.app.get('wss');
+    const sanitized = runtime.offerService.sanitize(offer);
+    if (wss) {
+      broadcastEvent(wss, 'transfer:offer', {
+        offer: sanitized,
+        autoApproved: Boolean(autoApproved),
+      });
+    }
+
+    res.status(201).json({
+      success: true,
+      data: {
+        offer: sanitized,
+        autoApproved: Boolean(autoApproved),
+        decisions: buildOfferDecisionPayload(runtime.offerService, offer, autoApproved).decisions,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * GET /api/transfer/offer/:offerId
+ * Lets a sender that missed the WebSocket event read the host's decision.
+ */
+transferRouter.get('/api/transfer/offer/:offerId', (req, res, next) => {
+  try {
+    const runtime = req.app.locals.runtime;
+    const offer = runtime.offerService.getOffer(req.params.offerId);
+    if (!offer) {
+      throw new AppError('OFFER_NOT_FOUND', 404, `Offer ${req.params.offerId} not found`);
+    }
+
+    const hostAuth = req.app.locals.hostAuth || runtime.hostAuth;
+    const isHost = Boolean(hostAuth?.verify(req, req.headers['x-host-token']));
+
+    if (!isHost && offer.sender?.connectionId) {
+      const sender = resolveSender(req, { required: true });
+      const reqToken = extractSessionToken(req);
+      const sessions = req.app.locals.sessions || runtime.sessions;
+      const isOwnerConn = offer.sender.connectionId === sender.connectionId;
+      const isOwnerSession = Boolean(
+        reqToken &&
+        ((offer.sender.sessionToken && offer.sender.sessionToken === reqToken) ||
+          sessions?.hasConnection?.(reqToken, offer.sender.connectionId))
+      );
+      if (!isOwnerConn && !isOwnerSession) {
+        throw new AppError('OFFER_FORBIDDEN', 403, 'Offer belongs to another connection');
+      }
+    }
+
+    res.json({
+      success: true,
+      data: {
+        offer: runtime.offerService.sanitize(offer),
+        decisions: buildOfferDecisionPayload(runtime.offerService, offer, offer.trusted).decisions,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/** POST /api/transfer/offer/cancel — sender abandons the batch before the host acts. */
+transferRouter.post('/api/transfer/offer/cancel', (req, res, next) => {
+  try {
+    const { offerId } = req.body || {};
+    if (!offerId) {
+      throw new AppError('INVALID_INPUT', 400, 'offerId is required');
+    }
+    const hostAuth = req.app.locals.hostAuth || req.app.locals.runtime?.hostAuth;
+    const isHost = Boolean(hostAuth?.verify(req, req.headers['x-host-token']));
+    const sender = isHost ? { connectionId: null } : resolveSender(req, { required: true });
+    const reqToken = extractSessionToken(req);
+    const sessions = req.app.locals.sessions || req.app.locals.runtime?.sessions;
+    const canceled = req.app.locals.runtime.offerService.cancelOffer(offerId, {
+      connectionId: sender.connectionId,
+      sessionToken: reqToken,
+      isSessionOwner: (offerConnId) =>
+        Boolean(reqToken && sessions?.hasConnection?.(reqToken, offerConnId)),
+      isHost,
+    });
+    res.json({ success: true, data: canceled });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/** GET /api/transfer/offers — open offers, for the host to re-sync after a reload. */
+transferRouter.get('/api/transfer/offers', requireHost, (req, res) => {
+  res.json({
+    success: true,
+    data: req.app.locals.runtime.offerService.listPending(),
+  });
+});
+
+/**
+ * POST /api/transfer/offer/decision
+ * Host approves or rejects individual files in an offer. Approving issues the
+ * single-use grants that authorize the upload.
+ */
+transferRouter.post('/api/transfer/offer/decision', requireHost, async (req, res, next) => {
+  try {
+    const { offerId, decisions, trustDevice } = req.body || {};
+    if (!offerId) {
+      throw new AppError('INVALID_INPUT', 400, 'offerId is required');
+    }
+
+    const runtime = req.app.locals.runtime;
+    const { offer } = runtime.offerService.decide(offerId, decisions);
+
+    let trustedDevice = null;
+    if (trustDevice) {
+      const tokenHash = offer.sender?.deviceTokenHash;
+      if (!tokenHash) {
+        throw new AppError(
+          'DEVICE_TOKEN_UNAVAILABLE',
+          400,
+          'This sender presented no device token, so it cannot be remembered'
+        );
+      }
+      trustedDevice = await runtime.trustedDevices.trustByHash({
+        tokenHash,
+        label: offer.sender?.label || 'Unknown device',
+        platform: offer.sender?.platform || 'unknown',
+      });
+    }
+
+    const payload = buildOfferDecisionPayload(runtime.offerService, offer, false);
+
+    // A rejected file never reaches the upload pipeline, so nothing else would
+    // record it; without this the host's "Decline" leaves no trace at all.
+    for (const decision of payload.decisions) {
+      if (decision.decision !== 'rejected') continue;
+      runtime.history.record({
+        status: 'rejected',
+        reason: 'REJECTED_BY_PC',
+        source: 'offer',
+        fileName: decision.name,
+        size: decision.size,
+        sender: offer.sender,
+      });
+    }
+
+    const wss = req.app.get('wss');
+    if (wss) {
+      sendTransferTerminalEvent(wss, 'transfer:offer:decision', payload, offer.sender);
+    }
+
+    res.json({
+      success: true,
+      data: { ...payload, trustedDevice },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/** GET /api/devices/trusted — host-facing list; never exposes stored token hashes. */
+transferRouter.get('/api/devices/trusted', requireHost, (req, res) => {
+  res.json({
+    success: true,
+    data: req.app.locals.runtime.trustedDevices.list(),
+  });
+});
+
+/** DELETE /api/devices/trusted/:id — revoke a remembered device. */
+transferRouter.delete('/api/devices/trusted/:id', requireHost, async (req, res, next) => {
+  try {
+    const result = await req.app.locals.runtime.trustedDevices.revoke(req.params.id);
+    res.json({ success: true, data: result });
+  } catch (error) {
+    next(error);
+  }
+});
+
 /**
  * GET /api/download/:fileId
  * Streams a staged file to client with Range header (resume & seeking) support.
@@ -388,67 +645,94 @@ transferRouter.get('/api/thumbnail/:fileId', (req, res) => {
  * POST /api/upload
  * Simple upload endpoint for single/multiple files (<100MB).
  */
-transferRouter.post('/api/upload', parseSimpleUpload, async (req, res, next) => {
-  const runtime = req.app.locals.runtime;
-  try {
-    const files = req.files || [];
-    if (files.length === 0) {
-      throw new AppError('NO_FILES_UPLOADED', 400, 'No files provided in upload');
-    }
-
-    // Sender attribution is strictly verified against active connection and remote IP
-    const sender = resolveSender(req);
-
-    const uploaded = [];
-    const pending = [];
-    const wss = req.app.get('wss');
-
-    for (const f of files) {
-      const record = runtime.pendingUploadManager.createPending({
-        fileName: f.originalname || f.filename,
-        fileSize: f.size,
-        mimeType: f.mimetype,
-        tempPath: f.path,
-        sender,
-        quotaAlreadyReserved: true,
-      });
-
-      uploaded.push({
-        name: f.filename,
-        size: f.size,
-        transferId: record.transferId,
-      });
-      pending.push(record);
-
-      if (wss) {
-        broadcastEvent(wss, 'upload:request', { pending: record });
+transferRouter.post(
+  '/api/upload',
+  requireTransferGrant(),
+  parseSimpleUpload,
+  async (req, res, next) => {
+    const runtime = req.app.locals.runtime;
+    try {
+      const files = req.files || [];
+      if (files.length === 0) {
+        throw new AppError('NO_FILES_UPLOADED', 400, 'No files provided in upload');
       }
-    }
 
-    res.status(201).json({
-      success: true,
-      data: { uploaded, pending },
-    });
-  } catch (error) {
-    if (req.files && Array.isArray(req.files)) {
-      for (const f of req.files) {
-        try {
-          if (fs.existsSync(f.path)) await fs.promises.unlink(f.path);
-        } catch {
-          // ignore unlink failure
+      // The gate ran before Multer, so this is what binds the parsed bytes to what
+      // the host actually approved: wrong name, wrong size or extra files all fail.
+      assertGrantsMatchFiles(req, files);
+
+      // Sender attribution is strictly verified against active connection and remote IP
+      const sender = resolveSender(req);
+      const consented = Boolean(req.transferGrants?.length);
+
+      const uploaded = [];
+      const pending = [];
+      const wss = req.app.get('wss');
+
+      for (const f of files) {
+        const recordParams = {
+          fileName: f.originalname || f.filename,
+          fileSize: f.size,
+          mimeType: f.mimetype,
+          tempPath: f.path,
+          sender,
+          quotaAlreadyReserved: true,
+        };
+
+        if (consented) {
+          // Host consent already happened at offer time, so the file goes straight to
+          // the receive dir. Asking again here would be the duplicate consent UT-012
+          // sets out to remove, and the size already matched the approved manifest.
+          const saved = await runtime.pendingUploadManager.createPreApproved(recordParams);
+          uploaded.push({
+            name: f.filename,
+            size: f.size,
+            transferId: saved.transferId,
+            savedAs: saved.fileName,
+            status: 'saved',
+          });
+          continue;
         }
-        if (runtime.quotaTracker) runtime.quotaTracker.release(f.size);
+
+        const record = runtime.pendingUploadManager.createPending(recordParams);
+
+        uploaded.push({
+          name: f.filename,
+          size: f.size,
+          transferId: record.transferId,
+        });
+        pending.push(record);
+
+        if (wss) {
+          broadcastEvent(wss, 'upload:request', { pending: record });
+        }
       }
+
+      res.status(201).json({
+        success: true,
+        data: { uploaded, pending },
+      });
+    } catch (error) {
+      if (req.files && Array.isArray(req.files)) {
+        for (const f of req.files) {
+          try {
+            if (fs.existsSync(f.path)) await fs.promises.unlink(f.path);
+          } catch {
+            // ignore unlink failure
+          }
+          if (runtime.quotaTracker) runtime.quotaTracker.release(f.size);
+        }
+      }
+      next(error);
     }
-    next(error);
   }
-});
+);
 
 /**
  * POST /api/upload/init
  * Initializes a chunked upload session for large files.
  */
-transferRouter.post('/api/upload/init', async (req, res, next) => {
+transferRouter.post('/api/upload/init', requireTransferGrant(), async (req, res, next) => {
   try {
     const runtime = req.app.locals.runtime;
     if (runtime.getActiveTransferCount() >= runtime.config.maxConcurrentTransfers) {
@@ -462,21 +746,44 @@ transferRouter.post('/api/upload/init', async (req, res, next) => {
     const sender = resolveSender(req);
 
     const { fileName, fileSize, mimeType, checksum } = req.body || {};
+    const grants = req.transferGrants || [];
+    if (grants.length > 1) {
+      throw new AppError(
+        'GRANT_FILE_COUNT_MISMATCH',
+        403,
+        'A chunked session is initialized for exactly one approved file'
+      );
+    }
+    const grant = grants[0] || null;
+    if (grant) {
+      assertGrantsMatchFiles(req, [
+        {
+          fileName,
+          fileSize: Number(fileSize),
+          mimeType,
+          checksum,
+        },
+      ]);
+    }
+
     const result = await runtime.chunkedUploadManager.initUpload({
       fileName,
       fileSize,
       mimeType,
       checksum,
+      preApproved: Boolean(grant),
     });
 
     const session = runtime.chunkedUploadManager.sessions.get(result.uploadId);
+    const uploadToken = runtime.pinRequired ? null : crypto.randomBytes(32).toString('hex');
     if (session) {
       session.sender = sender;
+      if (uploadToken) session.ownerTokenHash = hashUploadToken(uploadToken).toString('hex');
     }
 
     res.json({
       success: true,
-      data: result,
+      data: uploadToken ? { ...result, uploadToken } : result,
     });
   } catch (error) {
     next(error);
@@ -487,47 +794,56 @@ transferRouter.post('/api/upload/init', async (req, res, next) => {
  * POST /api/upload/chunk
  * Uploads a single chunk of a large file.
  */
-transferRouter.post('/api/upload/chunk', parseChunkUpload, async (req, res, next) => {
-  try {
-    const { uploadId, chunkIndex, checksum } = req.body || {};
+transferRouter.post(
+  '/api/upload/chunk',
+  requireChunkSessionOwner,
+  parseChunkUpload,
+  async (req, res, next) => {
+    try {
+      const { uploadId, chunkIndex, checksum } = req.body || {};
 
-    if (!uploadId || chunkIndex === undefined || chunkIndex === null || chunkIndex === '') {
-      throw new AppError('INVALID_INPUT', 400, 'uploadId and chunkIndex are required');
-    }
+      if (!uploadId || chunkIndex === undefined || chunkIndex === null || chunkIndex === '') {
+        throw new AppError('INVALID_INPUT', 400, 'uploadId and chunkIndex are required');
+      }
+      if (uploadId !== req.authorizedUploadId) {
+        throw new AppError('UPLOAD_ID_MISMATCH', 400, 'Multipart uploadId must match X-Upload-Id');
+      }
 
-    const idx = Number(chunkIndex);
-    if (!Number.isInteger(idx) || idx < 0) {
-      throw new AppError('INVALID_INPUT', 400, 'chunkIndex must be a non-negative integer');
-    }
+      const runtime = req.app.locals.runtime;
 
-    if (!req.file || !req.file.buffer) {
-      throw new AppError('CHUNK_INVALID', 400, 'No chunk data provided');
-    }
+      const idx = Number(chunkIndex);
+      if (!Number.isInteger(idx) || idx < 0) {
+        throw new AppError('INVALID_INPUT', 400, 'chunkIndex must be a non-negative integer');
+      }
 
-    const runtime = req.app.locals.runtime;
-    if (req.file.size > runtime.config.chunkSize + CHUNK_HEADROOM) {
-      throw new AppError(
-        'CHUNK_TOO_LARGE',
-        413,
-        `Chunk exceeds the allowed size (${runtime.config.chunkSize} + headroom bytes)`
+      if (!req.file || !req.file.buffer) {
+        throw new AppError('CHUNK_INVALID', 400, 'No chunk data provided');
+      }
+
+      if (req.file.size > runtime.config.chunkSize + CHUNK_HEADROOM) {
+        throw new AppError(
+          'CHUNK_TOO_LARGE',
+          413,
+          `Chunk exceeds the allowed size (${runtime.config.chunkSize} + headroom bytes)`
+        );
+      }
+
+      const result = await runtime.chunkedUploadManager.addChunk(
+        uploadId,
+        idx,
+        req.file.buffer,
+        checksum
       );
+
+      res.json({
+        success: true,
+        data: result,
+      });
+    } catch (error) {
+      next(error);
     }
-
-    const result = await runtime.chunkedUploadManager.addChunk(
-      uploadId,
-      idx,
-      req.file.buffer,
-      checksum
-    );
-
-    res.json({
-      success: true,
-      data: result,
-    });
-  } catch (error) {
-    next(error);
   }
-});
+);
 
 /**
  * GET /api/upload/status/:uploadId
@@ -536,7 +852,12 @@ transferRouter.post('/api/upload/chunk', parseChunkUpload, async (req, res, next
 transferRouter.get('/api/upload/status/:uploadId', (req, res, next) => {
   try {
     const { uploadId } = req.params;
-    const status = req.app.locals.runtime.chunkedUploadManager.getStatus(uploadId);
+    const runtime = req.app.locals.runtime;
+    const session = runtime.chunkedUploadManager.sessions.get(uploadId);
+    if (session) {
+      assertChunkSessionOwner(req, session);
+    }
+    const status = runtime.chunkedUploadManager.getStatus(uploadId);
 
     res.json({
       success: true,
@@ -558,7 +879,13 @@ transferRouter.post('/api/upload/cancel', async (req, res, next) => {
       throw new AppError('INVALID_INPUT', 400, 'uploadId is required');
     }
 
-    const cancelled = await req.app.locals.runtime.chunkedUploadManager.cancelUpload(uploadId);
+    const runtime = req.app.locals.runtime;
+    const session = runtime.chunkedUploadManager.sessions.get(uploadId);
+    if (session) {
+      assertChunkSessionOwner(req, session);
+    }
+
+    const cancelled = await runtime.chunkedUploadManager.cancelUpload(uploadId);
     res.json({
       success: true,
       data: { uploadId, cancelled },
@@ -581,19 +908,31 @@ transferRouter.post('/api/upload/complete', async (req, res, next) => {
 
     const runtime = req.app.locals.runtime;
     const existingOutcome = runtime.chunkedUploadManager.getCompletedOutcome(uploadId);
-    if (existingOutcome && existingOutcome.pending) {
-      return res.json({
-        success: true,
-        data: {
-          fileName: existingOutcome.fileName,
-          size: existingOutcome.size,
-          duration: existingOutcome.duration,
-          averageSpeed: existingOutcome.averageSpeed,
-          pending: existingOutcome.pending,
-          transferId: existingOutcome.transferId,
-        },
-      });
+    if (existingOutcome) {
+      assertChunkSessionOwner(req, existingOutcome);
+      if (existingOutcome.pending) {
+        return res.json({
+          success: true,
+          data: {
+            fileName: existingOutcome.fileName,
+            size: existingOutcome.size,
+            duration: existingOutcome.duration,
+            averageSpeed: existingOutcome.averageSpeed,
+            pending: existingOutcome.pending,
+            transferId: existingOutcome.transferId,
+            savedAs: existingOutcome.savedAs || null,
+          },
+        });
+      }
     }
+
+    // Read before completion clears the session: this is the consent the host gave
+    // at offer time, and it decides whether a second prompt happens.
+    const session = runtime.chunkedUploadManager.sessions.get(uploadId);
+    if (session) {
+      assertChunkSessionOwner(req, session);
+    }
+    const preApproved = Boolean(session?.preApproved);
 
     const pendingDir = path.join(runtime.config.tempDir, 'pending');
     const result = await runtime.chunkedUploadManager.complete(uploadId, pendingDir);
@@ -607,6 +946,7 @@ transferRouter.post('/api/upload/complete', async (req, res, next) => {
           averageSpeed: result.averageSpeed,
           pending: result.pending,
           transferId: result.transferId,
+          savedAs: result.savedAs || null,
         },
       });
     }
@@ -618,14 +958,20 @@ transferRouter.post('/api/upload/complete', async (req, res, next) => {
       sender = result.sender || resolveSender(req);
     }
 
-    const record = runtime.pendingUploadManager.createPending({
+    const recordParams = {
       fileName: result.fileName,
       fileSize: result.size,
       mimeType: result.mimeType || 'application/octet-stream',
       tempPath: result.filePath,
       sender,
       quotaAlreadyReserved: true,
-    });
+    };
+
+    // A consented session already carries the whole-file checksum the client
+    // declared and `complete` verified it, so the file can be saved directly.
+    const record = preApproved
+      ? await runtime.pendingUploadManager.createPreApproved(recordParams)
+      : runtime.pendingUploadManager.createPending(recordParams);
 
     const outcomeData = {
       fileName: result.fileName,
@@ -634,13 +980,16 @@ transferRouter.post('/api/upload/complete', async (req, res, next) => {
       averageSpeed: result.averageSpeed,
       pending: record,
       transferId: record.transferId,
+      savedAs: preApproved ? record.fileName : null,
       filePath: result.filePath,
+      sender: session?.sender || result.sender || sender || null,
+      ownerTokenHash: session?.ownerTokenHash || result.ownerTokenHash || null,
     };
 
     runtime.chunkedUploadManager.recordCompletedOutcome(uploadId, outcomeData);
 
     const wss = req.app.get('wss');
-    if (wss) {
+    if (wss && !preApproved) {
       broadcastEvent(wss, 'upload:request', { pending: record });
     }
 
@@ -653,6 +1002,7 @@ transferRouter.post('/api/upload/complete', async (req, res, next) => {
         averageSpeed: outcomeData.averageSpeed,
         pending: outcomeData.pending,
         transferId: outcomeData.transferId,
+        savedAs: outcomeData.savedAs,
       },
     });
   } catch (error) {

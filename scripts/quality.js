@@ -68,6 +68,9 @@ try {
         ...process.env,
         UTRANS_UPLOAD_DIR: path.join(sandbox, 'received'),
         UTRANS_TEMP_DIR: path.join(sandbox, 'temp'),
+        // Trusted-device and history stores are durable, so they must point at the
+        // sandbox too — never the developer's real home directory.
+        UTRANS_DATA_DIR: path.join(sandbox, 'data'),
         UTRANS_AUTO_OPEN: 'false',
         UTRANS_PIN: '',
       },

@@ -3,7 +3,9 @@
  * Network-first for API transfers & WebSocket, cache-first for app shell.
  */
 
-const CACHE_NAME = 'utrans-shell-v6';
+// Replaced by the server with a version-derived name before this file is served,
+// so the cache rolls over on every release without anyone editing it by hand.
+const CACHE_NAME = '__SHELL_CACHE_NAME__';
 
 const STATIC_ASSETS = [
   '/',
@@ -17,6 +19,7 @@ const STATIC_ASSETS = [
   '/css/animations.css',
   '/js/api.js',
   '/js/app.js',
+  '/js/capabilities.js',
   '/js/connection.js',
   '/js/host-session.js',
   '/js/file-browser.js',
@@ -35,7 +38,14 @@ self.addEventListener('install', (event) => {
       .then((cache) => cache.addAll(STATIC_ASSETS))
       .catch((err) => console.warn('Failed to cache assets during install:', err))
   );
-  self.skipWaiting();
+  // Activation deliberately waits: a new shell is applied when the page asks for it
+  // via SKIP_WAITING, so an update cannot swap assets out mid-transfer.
+});
+
+self.addEventListener('message', (event) => {
+  if (event.data?.type === 'SKIP_WAITING') {
+    self.skipWaiting();
+  }
 });
 
 self.addEventListener('activate', (event) => {

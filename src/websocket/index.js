@@ -54,6 +54,10 @@ export function setupWebSocket(server, auth = {}) {
     ws.authorized = !ws.pinRequired;
     ws.cookieToken = extractSessionCookie(req);
     ws.sessionToken = null;
+    ws.sessions = sessions;
+    if (ws.cookieToken) {
+      sessions?.addConnection?.(ws.cookieToken, ws.connectionId);
+    }
 
     ws.verifySession = (token) => {
       if (!sessions) return null;

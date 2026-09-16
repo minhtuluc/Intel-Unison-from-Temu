@@ -154,6 +154,26 @@ export function createSessionStore({
     revokeAll,
     sweep,
     size: () => sessions.size,
+    addConnection: (token, connectionId) => {
+      if (typeof token !== 'string' || !connectionId) return false;
+      const session = sessions.get(token);
+      if (!session) return false;
+      if (!session.connectionIds) session.connectionIds = new Set();
+      session.connectionIds.add(connectionId);
+      return true;
+    },
+    getConnections: (token) => {
+      if (typeof token !== 'string') return [];
+      const session = sessions.get(token);
+      if (!session || !session.connectionIds) return [];
+      return Array.from(session.connectionIds);
+    },
+    hasConnection: (token, connectionId) => {
+      if (typeof token !== 'string' || !connectionId) return false;
+      const session = sessions.get(token);
+      if (!session || !session.connectionIds) return false;
+      return session.connectionIds.has(connectionId);
+    },
     onRevoke: (listener) => {
       revokeListeners.add(listener);
       return () => revokeListeners.delete(listener);

@@ -11,6 +11,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createRuntime } from '../../src/runtime.js';
 import { createServer } from '../../src/server.js';
+import { approveUpload } from '../helpers/consent.js';
 
 describe('Upload limits are per runtime and enforced before buffering', () => {
   let app, server, base, root, runtime;
@@ -38,24 +39,37 @@ describe('Upload limits are per runtime and enforced before buffering', () => {
   });
 
   it('rejects an oversized chunk with 413 and keeps no session data on disk', async () => {
+    const checksum = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
+    // The host must consent to this exact name/size before a session can start.
+    const grantHeader = await approveUpload(base, {
+      name: 'big.bin',
+      data: Buffer.alloc(2048),
+      checksum,
+      hostToken: runtime.hostAuth.token,
+    });
+
     const init = await fetch(`${base}/api/upload/init`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'X-Transfer-Grant': grantHeader },
       body: JSON.stringify({
         fileName: 'big.bin',
         fileSize: 2048,
-        checksum: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+        checksum,
       }),
     });
     assert.equal(init.status, 200);
-    const { uploadId } = (await init.json()).data;
+    const { uploadId, uploadToken } = (await init.json()).data;
 
     const oversized = new FormData();
     oversized.append('uploadId', uploadId);
     oversized.append('chunkIndex', '0');
     oversized.append('chunk', new Blob([new Uint8Array(4 * 1024 * 1024)]), 'chunk_0');
 
-    const res = await fetch(`${base}/api/upload/chunk`, { method: 'POST', body: oversized });
+    const res = await fetch(`${base}/api/upload/chunk`, {
+      method: 'POST',
+      headers: { 'X-Upload-Id': uploadId, 'X-Upload-Token': uploadToken },
+      body: oversized,
+    });
     assert.equal(res.status, 413);
     assert.equal((await res.json()).error.code, 'CHUNK_TOO_LARGE');
 
@@ -68,7 +82,11 @@ describe('Upload limits are per runtime and enforced before buffering', () => {
     ok.append('uploadId', uploadId);
     ok.append('chunkIndex', '0');
     ok.append('chunk', new Blob([new Uint8Array(CHUNK_SIZE)]), 'chunk_0');
-    const okRes = await fetch(`${base}/api/upload/chunk`, { method: 'POST', body: ok });
+    const okRes = await fetch(`${base}/api/upload/chunk`, {
+      method: 'POST',
+      headers: { 'X-Upload-Id': uploadId, 'X-Upload-Token': uploadToken },
+      body: ok,
+    });
     assert.equal(okRes.status, 200);
   });
 
@@ -92,9 +110,20 @@ describe('Upload limits are per runtime and enforced before buffering', () => {
     assert.equal(runtime.shareManager.listFiles().fileCount, 1);
 
     // Same runtime ceiling applies to /api/upload, which has its own 100MB cap.
+    const uploadGrant = await approveUpload(base, {
+      name: 'ok.bin',
+      data: Buffer.alloc(2048),
+      hostToken: runtime.hostAuth.token,
+    });
     const uploadForm = new FormData();
     uploadForm.append('files', new Blob([new Uint8Array(2048)]), 'ok.bin');
-    const uploadRes = await fetch(`${base}/api/upload`, { method: 'POST', body: uploadForm });
+    const uploadRes = await fetch(`${base}/api/upload`, {
+      method: 'POST',
+      body: uploadForm,
+      headers: { 'X-Transfer-Grant': uploadGrant },
+    });
     assert.equal(uploadRes.status, 201);
+    // Consent already happened, so the file is saved rather than held for approval.
+    assert.equal((await uploadRes.json()).data.pending.length, 0);
   });
 });

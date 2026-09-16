@@ -6,6 +6,7 @@ import path from 'node:path';
 import { createRuntime } from '../../src/runtime.js';
 import { createServer } from '../../src/server.js';
 import { validatePath } from '../../src/middleware/security.js';
+import { approveUpload, offerBatch } from '../helpers/consent.js';
 
 describe('Security: Penetration Test Cases (SEC-01 to SEC-07)', () => {
   let server;
@@ -74,12 +75,20 @@ describe('Security: Penetration Test Cases (SEC-01 to SEC-07)', () => {
   });
 
   it('SEC-04: should sanitize malicious uploaded filename (../../evil.js)', async () => {
+    const payload = 'console.log("evil")';
+    const grantHeader = await approveUpload(baseUrl, {
+      name: '../../../evil.js',
+      data: payload,
+      hostToken: app.locals.hostAuth.token,
+    });
+
     const formData = new FormData();
-    formData.append('files', new Blob(['console.log("evil")']), '../../../evil.js');
+    formData.append('files', new Blob([payload]), '../../../evil.js');
 
     const res = await fetch(`${baseUrl}/api/upload`, {
       method: 'POST',
       body: formData,
+      headers: { 'X-Transfer-Grant': grantHeader },
     });
 
     assert.equal(res.status, 201);
@@ -92,12 +101,19 @@ describe('Security: Penetration Test Cases (SEC-01 to SEC-07)', () => {
   });
 
   it('SEC-05: should reject oversized upload in /api/upload/init with 413 Payload Too Large', async () => {
+    // Size policy stays enforced at init, so the offer only has to be consented to.
+    const oversized = 100 * 1024 * 1024 * 1024; // 100GB > 10GB max
+    const { grantHeader } = await offerBatch(baseUrl, {
+      files: [{ name: 'overflow.bin', size: oversized }],
+      hostToken: app.locals.hostAuth.token,
+    });
+
     const res = await fetch(`${baseUrl}/api/upload/init`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'X-Transfer-Grant': grantHeader },
       body: JSON.stringify({
         fileName: 'overflow.bin',
-        fileSize: 100 * 1024 * 1024 * 1024, // 100GB > 10GB max
+        fileSize: oversized,
       }),
     });
 

@@ -12,6 +12,7 @@ import path from 'node:path';
 import WebSocket from 'ws';
 import { createRuntime } from '../../src/runtime.js';
 import { createServer } from '../../src/server.js';
+import { approveUpload } from '../helpers/consent.js';
 import { setupWebSocket } from '../../src/websocket/index.js';
 
 const PIN = '4321';
@@ -130,9 +131,19 @@ describe('UT-002: PIN policy gates every data route and WebSocket', () => {
     assert.equal(download.status, 200);
     assert.equal(await download.text(), 'session-gated-payload');
 
+    // Consent is a separate gate from the PIN session: the host still approves
+    // the file, and the same session token authenticates the offer.
+    const grantHeader = await approveUpload(base, {
+      name: 'big.bin',
+      data: Buffer.alloc(1024),
+      checksum: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+      sessionToken: pinToken,
+      hostToken,
+    });
+
     const init = await fetch(`${base}/api/upload/init`, {
       method: 'POST',
-      headers: sessionHeaders(),
+      headers: { ...sessionHeaders(), 'X-Transfer-Grant': grantHeader },
       body: JSON.stringify({
         fileName: 'big.bin',
         fileSize: 1024,
@@ -413,9 +424,20 @@ describe('UT-002: without a PIN the LAN behaviour is unchanged', () => {
     assert.equal(info.data.pinRequired, false);
     assert.equal((await fetch(`${base}/api/shared`)).status, 200);
 
+    // With no PIN the LAN is open, but host consent for the transfer still applies.
+    const grantHeader = await approveUpload(base, {
+      name: 'open.txt',
+      data: 'open-lan',
+      hostToken: runtime.hostAuth.token,
+    });
+
     const form = new FormData();
     form.append('files', new Blob(['open-lan']), 'open.txt');
-    const res = await fetch(`${base}/api/upload`, { method: 'POST', body: form });
+    const res = await fetch(`${base}/api/upload`, {
+      method: 'POST',
+      body: form,
+      headers: { 'X-Transfer-Grant': grantHeader },
+    });
     assert.equal(res.status, 201);
   });
 });

@@ -6,10 +6,31 @@
 
 export const SESSION_STORAGE_KEY = 'utrans_session_token';
 export const HOST_STORAGE_KEY = 'utrans_host_token';
+/**
+ * The device's own secret for "remember this device" trust. It lives in
+ * localStorage rather than sessionStorage because the whole point is to survive a
+ * restart; the server only ever stores its hash.
+ */
+export const DEVICE_TOKEN_KEY = 'utrans_device_token';
 export const UNAUTHORIZED_EVENT = 'utrans:unauthorized';
 
 function defaultStorage() {
   return typeof sessionStorage === 'undefined' ? null : sessionStorage;
+}
+
+function defaultDeviceStorage() {
+  return typeof localStorage === 'undefined' ? null : localStorage;
+}
+
+/** 256-bit random hex, matching the server's `^[a-f0-9]{64}$` contract. */
+function generateDeviceToken() {
+  const bytes = new Uint8Array(32);
+  if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
+    crypto.getRandomValues(bytes);
+  } else {
+    for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256);
+  }
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
 function isSameOriginRequest(url) {
@@ -32,6 +53,7 @@ function isSameOriginRequest(url) {
  */
 export function createApiClient({
   storage = defaultStorage(),
+  deviceStorage = defaultDeviceStorage(),
   fetchImpl,
   onUnauthorized = null,
 } = {}) {
@@ -46,6 +68,21 @@ export function createApiClient({
     return storage?.getItem(HOST_STORAGE_KEY) || '';
   }
 
+  /** Returns this device's token, minting one on first use so trust can be remembered. */
+  function getDeviceToken() {
+    if (!deviceStorage) return '';
+    let token = deviceStorage.getItem(DEVICE_TOKEN_KEY);
+    if (!/^[a-f0-9]{64}$/.test(token || '')) {
+      token = generateDeviceToken();
+      try {
+        deviceStorage.setItem(DEVICE_TOKEN_KEY, token);
+      } catch {
+        // A storage-blocked browser still works; it just cannot be remembered.
+      }
+    }
+    return token;
+  }
+
   async function apiFetch(url, options = {}) {
     const headers = new Headers(options.headers || {});
     if (isSameOriginRequest(url)) {
@@ -56,6 +93,10 @@ export function createApiClient({
       const hostToken = getHostToken();
       if (hostToken && !headers.has('X-Host-Token')) {
         headers.set('X-Host-Token', hostToken);
+      }
+      const deviceToken = getDeviceToken();
+      if (deviceToken && !headers.has('X-Device-Token')) {
+        headers.set('X-Device-Token', deviceToken);
       }
     }
 
@@ -77,6 +118,7 @@ export function createApiClient({
     apiFetch,
     getToken,
     getHostToken,
+    getDeviceToken,
     setToken(token) {
       if (token) storage?.setItem(SESSION_STORAGE_KEY, token);
     },
@@ -130,6 +172,10 @@ export function clearSessionToken() {
 
 export function getHostToken() {
   return apiClient().getHostToken();
+}
+
+export function getDeviceToken() {
+  return apiClient().getDeviceToken();
 }
 
 export function setHostToken(token) {

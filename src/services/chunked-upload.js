@@ -39,10 +39,12 @@ export class ChunkedUploadManager {
 
   /**
    * Initializes a chunked upload session.
-   * @param {{ fileName: string, fileSize: number, mimeType?: string }} params
+   * @param {{ fileName: string, fileSize: number, mimeType?: string, checksum?: string, preApproved?: boolean }} params
+   * `preApproved` marks a session the host already consented to via a transfer
+   * offer, so completion saves straight to the receive dir with no second prompt.
    * @returns {Promise<{ uploadId: string, chunkSize: number, totalChunks: number, expiresAt: string }>}
    */
-  async initUpload({ fileName, fileSize, mimeType = null, checksum = null }) {
+  async initUpload({ fileName, fileSize, mimeType = null, checksum = null, preApproved = false }) {
     await this.cleanup();
 
     const maxSessions =
@@ -111,6 +113,7 @@ export class ChunkedUploadManager {
       fileSize: size,
       mimeType: mimeType || 'application/octet-stream',
       expectedChecksum: normalizedChecksum,
+      preApproved: Boolean(preApproved),
       chunkSize,
       totalChunks,
       receivedChunks: new Set(),
@@ -400,6 +403,8 @@ export class ChunkedUploadManager {
       mimeType: session.mimeType,
       duration: parseFloat(duration.toFixed(1)),
       averageSpeed: `${speedMBs} MB/s`,
+      sender: session.sender || null,
+      ownerTokenHash: session.ownerTokenHash || null,
     };
 
     this.recordCompletedOutcome(uploadId, completionResult);

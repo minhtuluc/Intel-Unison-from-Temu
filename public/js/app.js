@@ -8,7 +8,12 @@ import { FileBrowser } from './file-browser.js';
 import { DropZone } from './drop-zone.js';
 import { transferEngine } from './transfer.js';
 import { createElement, getFileSvg, showModal, closeModal, showQrModal, showToast } from './ui.js';
-import { formatFileSize, formatRelativeTime } from './utils.js';
+import { describeReason, formatFileSize, formatRelativeTime, readApiError } from './utils.js';
+import {
+  describeMissingCapabilities,
+  isSecureContextOk,
+  supportsWakeLock,
+} from './capabilities.js';
 import { initializeHostSession, hostHeaders } from './host-session.js';
 import {
   UNAUTHORIZED_EVENT,
@@ -31,6 +36,12 @@ class App {
     this.deferredPrompt = null;
     this.isHost = false;
     this.pendingApprovals = [];
+    // Batches announced by senders (UT-012). Consent happens here, before any bytes.
+    this.pendingOffers = [];
+    // One-shot notices: each of these would otherwise repeat on every retry.
+    this.capabilityNoticeShown = false;
+    this.wakeLockNoticeShown = false;
+    this.updateOffered = false;
   }
 
   async init() {
@@ -100,7 +111,7 @@ class App {
         }
       }
     } catch {
-      showToast('Could not fetch server info', 'warning');
+      showToast({ message: 'Could not fetch server info', type: 'warning' });
     }
   }
 
@@ -154,6 +165,10 @@ class App {
 
       case 'devices':
         this._renderDevicesView();
+        break;
+
+      case 'settings':
+        this._renderSettingsView();
         break;
 
       default:
@@ -330,7 +345,7 @@ class App {
     transferEngine.addFiles(this.selectedUploadFiles);
     this.selectedUploadFiles = [];
     window.location.hash = '#transfers';
-    showToast('Upload queued! View progress in Transfers tab', 'info');
+    showToast({ message: 'Upload queued! View progress in Transfers tab', type: 'info' });
   }
 
   /* ==========================================================================
@@ -724,6 +739,144 @@ class App {
     }
   }
 
+  /**
+   * Consent dialog for one batch. The host sees name/size/type for each file and
+   * decides per file, because agreeing to a batch is not agreeing to every item in it.
+   */
+  _showOfferModal(offer) {
+    if (!offer || !this.isHost) return;
+
+    if (navigator.vibrate) {
+      navigator.vibrate([100, 50, 100]);
+    }
+
+    const senderTitle = offer.sender?.label || 'A device';
+    const selected = new Set(offer.files.map((file) => file.index));
+    const trustCheckbox = createElement('input', { type: 'checkbox', id: 'offer-trust-device' });
+
+    const fileRows = offer.files.map((file) =>
+      createElement('label', { class: 'offer-file-row' }, [
+        createElement('input', {
+          type: 'checkbox',
+          checked: true,
+          onchange: (event) => {
+            if (event.target.checked) selected.add(file.index);
+            else selected.delete(file.index);
+          },
+        }),
+        createElement('div', { class: 'offer-file-text' }, [
+          createElement('div', { class: 'approval-file-name' }, file.name),
+          createElement(
+            'div',
+            { class: 'approval-file-meta' },
+            `${formatFileSize(file.size)} • ${file.mimeType || 'file'}`
+          ),
+        ]),
+      ])
+    );
+
+    const content = createElement('div', { class: 'approval-modal-body' }, [
+      createElement(
+        'h4',
+        { style: 'margin-bottom: var(--space-1);' },
+        `${senderTitle} wants to send ${offer.files.length} file${offer.files.length === 1 ? '' : 's'}:`
+      ),
+      createElement('div', { class: 'offer-file-list' }, fileRows),
+      createElement(
+        'p',
+        { style: 'font-size: var(--font-size-xs); color: var(--color-text-secondary);' },
+        'Approved files transfer straight to your Downloads folder. Nothing is sent until you decide.'
+      ),
+      createElement('label', { class: 'offer-trust-row' }, [
+        trustCheckbox,
+        createElement(
+          'span',
+          {},
+          'Remember this device and skip this prompt next time (revocable in Settings)'
+        ),
+      ]),
+      createElement('div', { class: 'approval-actions' }, [
+        createElement(
+          'button',
+          {
+            class: 'btn btn--danger',
+            onclick: async () => {
+              closeModal();
+              await this._submitOfferDecision(
+                offer.offerId,
+                offer.files.map((file) => ({ index: file.index, action: 'reject' })),
+                trustCheckbox.checked
+              );
+            },
+          },
+          'Decline All'
+        ),
+        createElement(
+          'button',
+          {
+            class: 'btn btn--primary',
+            onclick: async () => {
+              closeModal();
+              await this._submitOfferDecision(
+                offer.offerId,
+                offer.files.map((file) => ({
+                  index: file.index,
+                  action: selected.has(file.index) ? 'approve' : 'reject',
+                })),
+                trustCheckbox.checked
+              );
+            },
+          },
+          'Approve Selected'
+        ),
+      ]),
+    ]);
+
+    showModal({
+      title: 'Incoming File Transfer',
+      contentNode: content,
+      actions: [],
+    });
+  }
+
+  async _submitOfferDecision(offerId, decisions, trustDevice = false) {
+    try {
+      const res = await apiFetch('/api/transfer/offer/decision', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...hostHeaders() },
+        body: JSON.stringify({ offerId, decisions, trustDevice }),
+      });
+      if (!res.ok) throw new Error(`Decision error: ${res.status}`);
+
+      const approved = decisions.filter((d) => d.action === 'approve').length;
+      if (approved === 0) {
+        showToast({ message: 'Transfer declined', type: 'warning' });
+      } else {
+        showToast({
+          message: `Approved ${approved} of ${decisions.length} file(s)`,
+          type: 'success',
+        });
+      }
+    } catch (err) {
+      showToast({ message: `Error processing transfer: ${err.message}`, type: 'danger' });
+    } finally {
+      await this._loadPendingOffers();
+    }
+  }
+
+  async _loadPendingOffers() {
+    if (!this.isHost) return;
+    try {
+      const res = await apiFetch('/api/transfer/offers', { headers: hostHeaders() });
+      if (!res.ok) return;
+      const body = await res.json();
+      this.pendingOffers = body.data || [];
+      if (this.pendingOffers.length) this._showOfferModal(this.pendingOffers[0]);
+    } catch {
+      // Reconnect registration will retry the authoritative offer list.
+    }
+  }
+
   async _loadPendingApprovals() {
     if (!this.isHost) return;
     try {
@@ -845,7 +998,7 @@ class App {
 
     transferEngine.on('task:completed', (task) => {
       this._updateWakeLock();
-      showToast(`Transferred ${task.name} successfully!`, 'success');
+      showToast({ message: `Transferred ${task.name} successfully!`, type: 'success' });
       if (this.currentView === 'transfers') {
         this._renderTransfersView();
       }
@@ -853,14 +1006,14 @@ class App {
 
     transferEngine.on('task:error', (task) => {
       this._updateWakeLock();
-      showToast(`Upload failed: ${task.name} (${task.error})`, 'danger');
+      showToast({ message: `Upload failed: ${task.name} (${task.error})`, type: 'danger' });
       if (this.currentView === 'transfers') {
         this._renderTransfersView();
       }
     });
 
     transferEngine.on('task:awaiting_approval', (task) => {
-      showToast(`Uploaded ${task.name}. Awaiting PC acceptance...`, 'info');
+      showToast({ message: `Uploaded ${task.name}. Awaiting PC acceptance...`, type: 'info' });
       if (this.currentView === 'transfers') {
         this._renderTransfersView();
       }
@@ -901,7 +1054,7 @@ class App {
     connection.on('share:update', (data) => {
       if (data && data.files) {
         this.fileBrowser.setFiles(data.files);
-        showToast('Shared file list updated', 'info');
+        showToast({ message: 'Shared file list updated', type: 'info' });
       }
     });
 
@@ -920,7 +1073,7 @@ class App {
         this.connectedDevices = this.connectedDevices
           .filter((d) => d.id !== data.device.id)
           .concat(data.device);
-        showToast(`${data.device.label} joined the network`, 'info');
+        showToast({ message: `${data.device.label} joined the network`, type: 'info' });
         if (this.currentView === 'devices') {
           this._renderDevicesView();
         }
@@ -930,7 +1083,7 @@ class App {
     connection.on('device:leave', (data) => {
       if (data && data.deviceId) {
         this.connectedDevices = this.connectedDevices.filter((d) => d.id !== data.deviceId);
-        showToast(`${data.label || 'A device'} left`, 'warning');
+        showToast({ message: `${data.label || 'A device'} left`, type: 'warning' });
         if (this.currentView === 'devices') {
           this._renderDevicesView();
         }
@@ -947,6 +1100,26 @@ class App {
       }
     });
 
+    // A sender announced a batch; nothing has been written yet (UT-012).
+    connection.on('transfer:offer', (data) => {
+      if (this.isHost && data?.offer) {
+        if (!this.pendingOffers.some((o) => o.offerId === data.offer.offerId)) {
+          this.pendingOffers.push(data.offer);
+        }
+        this._showOfferModal(this.pendingOffers[0]);
+      }
+    });
+
+    connection.on('transfer:offer:decision', (data) => {
+      transferEngine.handleWebSocketEvent('transfer:offer:decision', data);
+      if (this.isHost) this._loadPendingOffers();
+    });
+
+    connection.on('transfer:offer:expired', (data) => {
+      transferEngine.handleWebSocketEvent('transfer:offer:expired', data);
+      if (this.isHost) this._loadPendingOffers();
+    });
+
     connection.on('client:registered', (data) => {
       this.isHost = data?.device?.isHost === true;
       // Server-issued identity for this connection; used only to flag "This Device".
@@ -956,6 +1129,7 @@ class App {
         transferEngine.connectionId = data.connectionId;
       }
       this._loadPendingApprovals();
+      this._loadPendingOffers();
     });
 
     // Server refused the socket because this client holds no valid capability.
@@ -991,6 +1165,306 @@ class App {
     });
   }
 
+  /* ==========================================================================
+     Settings View
+     ========================================================================== */
+  _renderSettingsView() {
+    this.mainContainer.innerHTML = '';
+
+    const header = createElement('div', { class: 'view-header' }, [
+      createElement('h1', { class: 'view-title' }, 'Settings'),
+      createElement(
+        'p',
+        { class: 'view-subtitle' },
+        this.isHost
+          ? 'Receive folder, storage and remembered devices'
+          : 'Your recent transfers and host storage'
+      ),
+    ]);
+
+    const container = createElement('div', { class: 'settings-container' });
+    container.append(
+      header,
+      this._buildReceiveFolderCard(),
+      this._buildStorageCard(),
+      this._buildTrustedDevicesCard(),
+      this._buildHistoryCard()
+    );
+
+    this.mainContainer.appendChild(container);
+
+    this._loadSettingsData();
+  }
+
+  _settingsCard(title, subtitle = '') {
+    return createElement('section', { class: 'settings-card' }, [
+      createElement('h3', { class: 'settings-card__title' }, title),
+      subtitle ? createElement('p', { class: 'settings-card__subtitle' }, subtitle) : null,
+      createElement('div', { class: 'settings-card__body' }),
+    ]);
+  }
+
+  _buildReceiveFolderCard() {
+    const card = this._settingsCard(
+      'Receive folder',
+      this.isHost
+        ? 'Approved files are saved here. Changing it applies to the next file the host approves.'
+        : 'Only the host can change this.'
+    );
+
+    const body = card.querySelector('.settings-card__body');
+    const input = createElement('input', {
+      type: 'text',
+      class: 'settings-input',
+      id: 'settings-upload-dir',
+      placeholder: 'Loading…',
+      disabled: !this.isHost,
+    });
+    const save = createElement(
+      'button',
+      {
+        class: 'btn btn--primary btn--sm',
+        onclick: () => this._saveReceiveDir(input.value),
+      },
+      'Save'
+    );
+    if (!this.isHost) save.setAttribute('disabled', '');
+
+    body.append(input, save);
+    return card;
+  }
+
+  _buildStorageCard() {
+    const card = this._settingsCard('Storage', 'Space committed to files still being staged.');
+    const body = card.querySelector('.settings-card__body');
+    body.append(
+      createElement('div', { class: 'quota-row' }, [
+        createElement('span', { id: 'quota-used', class: 'quota-used' }, '—'),
+        createElement('span', { id: 'quota-limit', class: 'quota-limit' }, ''),
+      ]),
+      createElement('div', { class: 'quota-bar' }, [
+        createElement('div', { class: 'quota-bar__fill', id: 'quota-bar-fill' }),
+      ])
+    );
+    return card;
+  }
+
+  _buildTrustedDevicesCard() {
+    const card = this._settingsCard(
+      'Remembered devices',
+      'Devices that can send without a fresh approval. Revoke any you no longer trust.'
+    );
+    card
+      .querySelector('.settings-card__body')
+      .append(
+        createElement('ul', { class: 'settings-list', id: 'trusted-device-list' }, [
+          createElement('li', { class: 'settings-list__empty' }, 'Loading…'),
+        ])
+      );
+    return card;
+  }
+
+  _buildHistoryCard() {
+    const card = this._settingsCard(
+      'Recent transfers',
+      this.isHost ? 'Every transfer this host handled.' : 'Only the transfers this device sent.'
+    );
+    card
+      .querySelector('.settings-card__body')
+      .append(
+        createElement('ul', { class: 'settings-list', id: 'history-list' }, [
+          createElement('li', { class: 'settings-list__empty' }, 'Loading…'),
+        ])
+      );
+    return card;
+  }
+
+  async _loadSettingsData() {
+    await Promise.all([
+      this._loadReceiveDir(),
+      this._loadQuota(),
+      this._loadTrustedDevices(),
+      this._loadHistory(),
+    ]);
+  }
+
+  async _loadReceiveDir() {
+    if (!this.isHost) return;
+    const input = document.getElementById('settings-upload-dir');
+    if (!input) return;
+    try {
+      const res = await apiFetch('/api/settings', { headers: hostHeaders() });
+      if (!res.ok) return;
+      const { data } = await res.json();
+      input.value = data.uploadDir;
+    } catch {
+      input.placeholder = 'Could not load the receive folder';
+    }
+  }
+
+  async _saveReceiveDir(value) {
+    if (!this.isHost) return;
+    try {
+      const res = await apiFetch('/api/settings', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', ...hostHeaders() },
+        body: JSON.stringify({ uploadDir: value }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const { message } = readApiError(body, res.status);
+        showToast({ type: 'danger', message });
+        return;
+      }
+      document.getElementById('settings-upload-dir').value = body.data.uploadDir;
+      showToast({ type: 'success', message: 'Receive folder updated' });
+    } catch (err) {
+      showToast({ type: 'danger', message: `Could not save: ${describeReason(err)}` });
+    }
+  }
+
+  async _loadQuota() {
+    try {
+      const res = await apiFetch('/api/quota');
+      if (!res.ok) return;
+      const { data } = await res.json();
+      const used = document.getElementById('quota-used');
+      const limit = document.getElementById('quota-limit');
+      const fill = document.getElementById('quota-bar-fill');
+      if (!used || !limit || !fill) return;
+
+      const percent = data.limitBytes > 0 ? (data.usedBytes / data.limitBytes) * 100 : 0;
+      used.textContent = formatFileSize(data.usedBytes);
+      limit.textContent = `of ${formatFileSize(data.limitBytes)}`;
+      fill.style.width = `${Math.min(100, percent).toFixed(1)}%`;
+      fill.classList.toggle('quota-bar__fill--high', percent >= 90);
+    } catch {
+      // The card simply keeps its placeholder.
+    }
+  }
+
+  async _loadTrustedDevices() {
+    const list = document.getElementById('trusted-device-list');
+    if (!list) return;
+    if (!this.isHost) {
+      list.replaceChildren(
+        createElement('li', { class: 'settings-list__empty' }, 'Only the host can see this.')
+      );
+      return;
+    }
+
+    try {
+      const res = await apiFetch('/api/devices/trusted', { headers: hostHeaders() });
+      const { data } = await res.json();
+      if (data.length === 0) {
+        list.replaceChildren(
+          createElement('li', { class: 'settings-list__empty' }, 'No devices are remembered yet.')
+        );
+        return;
+      }
+      list.replaceChildren(
+        ...data.map((device) =>
+          createElement('li', { class: 'settings-list__row' }, [
+            createElement('div', { class: 'settings-list__text' }, [
+              createElement('div', { class: 'settings-list__name' }, device.label),
+              createElement(
+                'div',
+                { class: 'settings-list__meta' },
+                `${device.platform} • trusted ${formatRelativeTime(device.trustedAt)}`
+              ),
+            ]),
+            createElement(
+              'button',
+              {
+                class: 'btn btn--danger btn--sm',
+                onclick: () => this._revokeTrustedDevice(device.id),
+              },
+              'Revoke'
+            ),
+          ])
+        )
+      );
+    } catch {
+      list.replaceChildren(
+        createElement('li', { class: 'settings-list__empty' }, 'Could not load devices.')
+      );
+    }
+  }
+
+  async _revokeTrustedDevice(id) {
+    try {
+      const res = await apiFetch(`/api/devices/trusted/${id}`, {
+        method: 'DELETE',
+        headers: hostHeaders(),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      showToast({ type: 'success', message: 'Device revoked; it will be asked again' });
+    } catch (err) {
+      showToast({ type: 'danger', message: `Could not revoke: ${describeReason(err)}` });
+    } finally {
+      await this._loadTrustedDevices();
+    }
+  }
+
+  async _loadHistory() {
+    const list = document.getElementById('history-list');
+    if (!list) return;
+
+    try {
+      const res = await apiFetch('/api/transfers/history');
+      if (!res.ok) return;
+      const { data } = await res.json();
+      if (data.entries.length === 0) {
+        list.replaceChildren(
+          createElement(
+            'li',
+            { class: 'settings-list__empty' },
+            'Nothing has been transferred yet.'
+          )
+        );
+        return;
+      }
+
+      const tone = { completed: 'success', rejected: 'danger', expired: 'warning' };
+      list.replaceChildren(
+        ...data.entries.slice(0, 50).map((entry) =>
+          createElement('li', { class: 'settings-list__row' }, [
+            createElement('div', { class: 'settings-list__text' }, [
+              createElement(
+                'div',
+                { class: 'settings-list__name' },
+                entry.fileName || 'Unnamed file'
+              ),
+              createElement(
+                'div',
+                { class: 'settings-list__meta' },
+                [
+                  entry.status,
+                  entry.size !== null ? formatFileSize(entry.size) : null,
+                  entry.label,
+                  formatRelativeTime(entry.timestamp),
+                ]
+                  .filter(Boolean)
+                  .join(' • ')
+              ),
+            ]),
+            createElement(
+              'span',
+              {
+                class: `settings-list__badge settings-list__badge--${tone[entry.status] || 'info'}`,
+              },
+              entry.status
+            ),
+          ])
+        )
+      );
+    } catch {
+      list.replaceChildren(
+        createElement('li', { class: 'settings-list__empty' }, 'Could not load history.')
+      );
+    }
+  }
+
   _setupQrModal() {
     const qrBtn = document.getElementById('btn-qr-modal');
     if (qrBtn) {
@@ -998,7 +1472,7 @@ class App {
         if (this.serverInfo && this.serverInfo.qrCode) {
           showQrModal(this.serverInfo.qrCode, this.serverInfo.connectUrl);
         } else {
-          showToast('QR code not ready yet', 'warning');
+          showToast({ message: 'QR code not ready yet', type: 'warning' });
         }
       });
     }
@@ -1033,7 +1507,7 @@ class App {
     window.addEventListener('appinstalled', () => {
       this.deferredPrompt = null;
       pwaBtn.style.display = 'none';
-      showToast('UniversalTrans installed successfully!', 'success');
+      showToast({ message: 'UniversalTrans installed successfully!', type: 'success' });
     });
   }
 
@@ -1105,16 +1579,36 @@ class App {
   }
 
   async _acquireWakeLock() {
-    if ('wakeLock' in navigator && !this.wakeLockSentinel) {
-      try {
-        this.wakeLockSentinel = await navigator.wakeLock.request('screen');
-        this.wakeLockSentinel.addEventListener('release', () => {
-          this.wakeLockSentinel = null;
-        });
-      } catch {
-        // Silently handle if rejected or unsupported
-      }
+    if (!supportsWakeLock()) {
+      this._reportWakeLockUnavailable();
+      return;
     }
+    if (this.wakeLockSentinel) return;
+
+    try {
+      this.wakeLockSentinel = await navigator.wakeLock.request('screen');
+      this.wakeLockSentinel.addEventListener('release', () => {
+        this.wakeLockSentinel = null;
+      });
+    } catch (err) {
+      // An empty catch used to swallow this, so the screen slept mid-transfer and
+      // nothing explained why. Say it once, and only while it actually matters.
+      this._reportWakeLockUnavailable(err);
+    }
+  }
+
+  _reportWakeLockUnavailable(err) {
+    if (this.wakeLockNoticeShown) return;
+    if (!transferEngine.getStatus().active?.length) return;
+    this.wakeLockNoticeShown = true;
+
+    const detail = isSecureContextOk()
+      ? `Screen wake lock was refused${err ? `: ${describeReason(err)}` : ''}.`
+      : 'This page is open over plain HTTP on the LAN, where the browser blocks screen wake lock.';
+    showToast({
+      type: 'warning',
+      message: `The screen may sleep during this transfer. ${detail}`,
+    });
   }
 
   async _releaseWakeLock() {
@@ -1138,40 +1632,116 @@ class App {
   }
 
   _registerServiceWorker() {
-    if ('serviceWorker' in navigator) {
-      document.addEventListener('visibilitychange', () => {
-        if (document.visibilityState === 'visible') {
-          this._updateWakeLock();
-        }
-      });
+    // Re-arming the wake lock on focus has nothing to do with the service worker.
+    // It used to sit inside the serviceWorker guard, so a browser without one never
+    // re-acquired the lock after a tab switch.
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') {
+        this._updateWakeLock();
+      }
+    });
 
-      window.addEventListener('load', async () => {
-        try {
-          const registration = await navigator.serviceWorker.register('/sw.js', { scope: '/' });
-          registration.addEventListener('updatefound', () => {
-            const newWorker = registration.installing;
-            if (newWorker) {
-              newWorker.addEventListener('statechange', () => {
-                if (newWorker.state === 'installed' && navigator.serviceWorker.controller) {
-                  showToast('New version available. Refresh to update.', 'info');
-                }
-              });
-            }
-          });
-        } catch (err) {
-          console.warn('ServiceWorker registration skipped:', err.message);
+    const gap = describeMissingCapabilities().find(
+      (entry) => entry.key === 'secureContext' || entry.key === 'serviceWorker'
+    );
+    if (gap) {
+      this._announceCapabilityGap(gap);
+      return;
+    }
+
+    window.addEventListener('load', async () => {
+      try {
+        const registration = await navigator.serviceWorker.register('/sw.js', { scope: '/' });
+        this._watchForShellUpdate(registration);
+      } catch (err) {
+        console.warn('ServiceWorker registration skipped:', err.message);
+        this._announceCapabilityGap({
+          key: 'serviceWorker',
+          message: `The offline shell is unavailable: ${describeReason(err)}`,
+        });
+      }
+    });
+  }
+
+  /** The app still works without these; saying so beats leaving features unexplained. */
+  _announceCapabilityGap(gap) {
+    if (this.capabilityNoticeShown) return;
+    this.capabilityNoticeShown = true;
+    showToast({ type: 'info', message: gap.message });
+  }
+
+  _watchForShellUpdate(registration) {
+    registration.addEventListener('updatefound', () => {
+      const newWorker = registration.installing;
+      if (!newWorker) return;
+      newWorker.addEventListener('statechange', () => {
+        // `controller` is only set when an older shell is already running, which is
+        // exactly the update case; a first install must not reload the page.
+        if (newWorker.state === 'installed' && navigator.serviceWorker.controller) {
+          this._offerShellUpdate(newWorker);
         }
       });
-    }
+    });
+  }
+
+  /** Offers the update as a real choice, and applies it only when clicked. */
+  _offerShellUpdate(worker) {
+    if (this.updateOffered) return;
+    this.updateOffered = true;
+
+    let reloading = false;
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      if (reloading) return;
+      reloading = true;
+      window.location.reload();
+    });
+
+    showModal({
+      title: 'Update available',
+      contentNode: createElement('div', { class: 'update-prompt' }, [
+        createElement('p', {}, 'A new version of UniversalTrans is ready to install.'),
+        createElement(
+          'p',
+          { class: 'approval-file-meta' },
+          'Reloading applies it now; a transfer in progress would be interrupted.'
+        ),
+      ]),
+      actions: [
+        createElement(
+          'button',
+          {
+            class: 'btn btn--ghost',
+            onclick: () => {
+              this.updateOffered = false;
+              closeModal();
+            },
+          },
+          'Later'
+        ),
+        createElement(
+          'button',
+          {
+            class: 'btn btn--primary',
+            onclick: () => {
+              closeModal();
+              worker.postMessage({ type: 'SKIP_WAITING' });
+            },
+          },
+          'Reload now'
+        ),
+      ],
+    });
   }
 
   _setupErrorBoundary() {
     window.addEventListener('error', (event) => {
-      showToast(`App error: ${event.message}`, 'danger');
+      showToast({ message: `App error: ${event.message}`, type: 'danger' });
     });
 
     window.addEventListener('unhandledrejection', (event) => {
-      showToast(`Request error: ${event.reason?.message || event.reason}`, 'danger');
+      // A rejection reason is not always an Error: a bare object used to stringify
+      // to "[object Object]", which told the user nothing at all.
+      showToast({ message: `Request error: ${describeReason(event.reason)}`, type: 'danger' });
     });
   }
 }

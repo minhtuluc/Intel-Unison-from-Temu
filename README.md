@@ -1,6 +1,6 @@
 # UniversalTrans ⚡
 
-## Trạng thái thực tế và cách vận hành sau M1
+## Trạng thái thực tế và cách vận hành
 
 Chỉ phiên host đã xác thực được xem danh sách chờ và Accept/Decline. Chạy `npm start` và dùng browser do launcher mở; QR/public URL dành cho client. Khi không tự mở browser, dùng liên kết `Host approval URL` riêng được in ở terminal trên máy host. Không chia sẻ liên kết riêng này. Sau restart cần mở lại phiên host.
 
@@ -10,7 +10,9 @@ Stage đường dẫn nguồn (nhánh JSON của `POST /api/share`, dùng cho CL
 
 Mô hình hiện tại truyền qua host, chưa có P2P trực tiếp giữa client. Xem [báo cáo và roadmap](REPORT-ROADMAP.md), [quy chuẩn agent](AGENTS.md) và [quality system](docs/agents/quality.md). Chạy `npm run quality` trên Node 22/24 để kiểm tra lint, format, test và coverage.
 
-Đã hoàn thành và kiểm chứng toàn diện mốc M1 (đã merge vào `main` tại commit `64cff86`): 207 automated tests pass trên Node 22 và Node 24, coverage 93,68% line / 88,60% branch / 93,49% function; lint và format sạch; GitHub Actions CI matrix trên cả Ubuntu và Windows pass 100%. **Chưa** kiểm chứng: điện thoại thật (Android Chrome / iOS Safari), TLS LAN. Các tuyên bố bên dưới cần đối chiếu giới hạn còn mở trong báo cáo.
+M1 (commit `64cff86`) và M2 (PR #2, commit `047706f`) đã merge vào `main`. M3 (UT-011, UT-012, UT-016, UT-018) đang nằm trên nhánh `m3-core-ux-consent`, **chưa merge** — đang chờ QC quyết định.
+
+Số liệu đo trên trạng thái cuối của nhánh M3, ngày 2026-09-16, Node 24.15.0 / Windows: **424 automated tests pass**, coverage **90,18% line / 82,97% branch / 87,66% function**, lint và format sạch (`npm run quality`). **Chưa** kiểm chứng: điện thoại thật (Android Chrome / iOS Safari), TLS LAN, vòng đời cache service worker trên browser thật (repo không có E2E browser), và CI chưa chạy cho nhánh này. Các tuyên bố bên dưới cần đối chiếu giới hạn còn mở trong báo cáo.
 
 <p align="center">
   <img src="public/favicon.svg" alt="UniversalTrans Logo" width="96" height="96" />
@@ -23,8 +25,8 @@ Mô hình hiện tại truyền qua host, chưa có P2P trực tiếp giữa cli
 
 <p align="center">
   <img src="https://img.shields.io/badge/node-%3E%3D20.0.0-brightgreen" alt="Node Version" />
-  <img src="https://img.shields.io/badge/tests-207%20passed-success" alt="Tests" />
-  <img src="https://img.shields.io/badge/coverage-93.68%25-blue" alt="Coverage" />
+  <img src="https://img.shields.io/badge/tests-424%20passed-success" alt="Tests" />
+  <img src="https://img.shields.io/badge/coverage-90.18%25-blue" alt="Coverage" />
   <img src="https://img.shields.io/badge/port-8080%20default-orange" alt="Port 8080" />
   <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License" />
   <img src="https://img.shields.io/badge/pwa-standalone%20ready-purple" alt="PWA Ready" />
@@ -53,12 +55,13 @@ Mô hình hiện tại truyền qua host, chưa có P2P trực tiếp giữa cli
 - 📱 **Tương thích toàn diện đa nền tảng**:
   - **PC Host**: Windows 10/11, Linux (Ubuntu, Debian, Fedora, Arch...).
   - **Thiết bị di động**: Android (Chrome PWA), iPhone & iPad (Safari Standalone PWA).
-- 🔒 **Bảo vệ an toàn PC (PC Upload Approval Flow)**: Khi điện thoại gửi file lên, PC **luôn luôn** hiển thị popup xác nhận `Accept` / `Decline` trước khi lưu vào ổ cứng. Tự động dọn dẹp file tạm sau 5 phút (TTL) nếu không có phản hồi.
+- 🔒 **Host duyệt trước khi truyền (UT-012)**: Điện thoại công bố danh sách file (tên, cỡ, loại) trước; PC duyệt **từng file** trong lô, và **chưa một byte nào được ghi** cho tới lúc đó. File bị từ chối không bao giờ rời khỏi thiết bị. Offer không được trả lời sẽ hết hạn sau `offerTtlMs` (mặc định 2 phút) và phía gửi nhận thông báo rõ.
+- 🔁 **Thiết bị tin cậy (tùy chọn)**: Host có thể đánh dấu một thiết bị là tin cậy để lần sau không phải duyệt lại. Server chỉ lưu **hash** của token thiết bị, và host thu hồi được bất cứ lúc nào.
 - 🛡️ **Tự động chống ghi đè (Anti-collision Rename)**: Tự động đổi tên `file_(1).ext` nếu file đã tồn tại trên PC.
 - 📂 **Tệp lớn đến giới hạn cấu hình**: Mặc định tối đa 10 GiB với chunk 10 MiB. Pause / Resume / Retry cần tiếp tục được harden theo roadmap.
 - 🖐️ **Kéo thả thư mục đệ quy & Dán ảnh Clipboard**: Hỗ trợ kéo thả cả thư mục (kể cả sub-folder lồng nhau) từ PC hoặc bấm **`Ctrl+V`** để chia sẻ ảnh chụp màn hình ngay tức thì.
-- 💡 **Screen Wake Lock & Tab Guard (có điều kiện)**: Wake Lock chỉ hoạt động trong secure context — trên LAN HTTP (không phải `localhost`) trình duyệt không cấp API này và app không báo lỗi. Cảnh báo chống đóng tab dở dang (`beforeunload`) vẫn chạy.
-- 🎨 **Giao diện hiện đại Dark Glassmorphism**: Không dùng framework nặng, 100% Vanilla JS & Vanilla CSS hiệu năng cao, siêu mượt mà.
+- 💡 **Screen Wake Lock & Tab Guard (có điều kiện)**: Wake Lock chỉ hoạt động trong secure context — trên LAN HTTP (không phải `localhost`) trình duyệt từ chối API này. Từ M3, app **nói rõ lý do** khi không giữ được wake lock, thay vì im lặng để màn hình tự tắt giữa lúc truyền. Cảnh báo chống đóng tab dở dang (`beforeunload`) vẫn chạy.
+- 🎨 **Giao diện hiện đại Dark Glassmorphism**: Không dùng framework — 100% Vanilla JS & Vanilla CSS. Chưa có benchmark hiệu năng trên thiết bị thật; xem mục "Tối ưu cần đo" trong roadmap.
 
 ---
 
@@ -142,11 +145,13 @@ utrans -p 9090
 4. Bấm **Start Upload**:
    - Màn hình điện thoại tự động được giữ sáng (Screen Wake Lock).
    - Thanh tiến độ hiển thị % hoàn thành, tốc độ MB/s và thời gian còn lại (ETA).
-5. **Xác nhận trên PC (PC Approval Modal)**:
-   - Trên màn hình máy tính sẽ bật lên hộp thoại thông báo nổi:  
-     _“Thiết bị [Tên máy] muốn gửi tệp: file_name.ext (Dung lượng)”_
-   - Bấm **Accept File**: File được lưu an toàn vào thư mục `Downloads\UniversalTrans` của máy tính.
-   - Bấm **Decline**: Hủy nhận và xóa file tạm ngay lập tức.
+5. **Host duyệt trước khi truyền (UT-012)**:
+   - Ngay khi chọn file, điện thoại gửi **danh sách** (tên, cỡ, loại) — chưa có dữ liệu nào được gửi.
+   - Trên PC bật lên hộp thoại liệt kê từng file kèm checkbox:
+     _“Thiết bị [Tên máy] muốn gửi N file(s)”_
+   - Bấm **Approve Selected**: chỉ những file được tick mới được phép truyền, và chúng được lưu thẳng vào thư mục `Downloads\UniversalTrans` — không hỏi lại lần hai.
+   - Bấm **Decline All**: không file nào được gửi, không byte nào được ghi.
+   - Tick **Remember this device** để lần sau thiết bị đó không phải duyệt lại (thu hồi được).
 
 ### 3. Cài đặt PWA như Ứng dụng gốc
 
@@ -157,14 +162,15 @@ utrans -p 9090
 
 ## 🛡️ Cơ chế kiến trúc & An toàn dữ liệu
 
-| Cơ chế                          | Chi tiết kỹ thuật                                                                                                        |
-| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| **Staging Area**                | Lưu danh sách tệp đang chia sẻ trên RAM (`share-manager.js`), không quét tự động ổ cứng người dùng.                      |
-| **Streaming Range 206**         | Hỗ trợ HTTP Range Header cho phép tua video trực tuyến và tải file mượt mà trên iOS Safari không sợ tràn RAM.            |
-| **PC Confirmation & 5-min TTL** | File tải lên được đưa vào vùng tạm `temp/pending`. Tự động xóa sau 5 phút nếu PC không duyệt.                            |
-| **Anti-Traversal Protection**   | Chặn toàn bộ ký tự traversal `..`, `\0` null-bytes, kiểm tra quyền truy cập đĩa cứng an toàn.                            |
-| **Security Headers**            | Trang bị `X-Content-Type-Options: nosniff`, `X-Frame-Options: SAMEORIGIN`, tắt `x-powered-by`.                           |
-| **Offline Shell Cache**         | Service Worker `utrans-shell-v5` cache sẵn giao diện; đường truyền dữ liệu `/api/*` và `/ws` luôn đi thẳng qua mạng LAN. |
+| Cơ chế                        | Chi tiết kỹ thuật                                                                                                                                                                                                                |
+| ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Staging Area**              | Lưu danh sách tệp đang chia sẻ trên RAM (`share-manager.js`), không quét tự động ổ cứng người dùng.                                                                                                                              |
+| **Streaming Range 206**       | Hỗ trợ HTTP Range Header cho phép tua video trực tuyến và tải file mượt mà trên iOS Safari không sợ tràn RAM.                                                                                                                    |
+| **Consent trước truyền**      | Upload của client phải kèm grant do host cấp. Offer hết hạn sau `offerTtlMs` (mặc định 2 phút); grant dùng một lần, bind theo `(tên, cỡ)` đã duyệt và theo connection. Upload không grant bị chặn **trước khi** Multer chạm đĩa. |
+| **Pending & TTL**             | Upload do chính host khởi tạo vẫn đi qua vùng tạm `temp/pending` và tự xóa sau 5 phút nếu không duyệt. File đã có consent thì không đi qua bước này.                                                                             |
+| **Anti-Traversal Protection** | Chặn toàn bộ ký tự traversal `..`, `\0` null-bytes, kiểm tra quyền truy cập đĩa cứng an toàn.                                                                                                                                    |
+| **Security Headers**          | Trang bị `X-Content-Type-Options: nosniff`, `X-Frame-Options: SAMEORIGIN`, tắt `x-powered-by`.                                                                                                                                   |
+| **Offline Shell Cache**       | Service Worker cache sẵn giao diện; đường truyền dữ liệu `/api/*` và `/ws` luôn đi thẳng qua mạng LAN. Tên cache (`utrans-shell-<version>`) lấy từ `package.json` nên tự đổi mỗi bản phát hành.                                  |
 
 ---
 

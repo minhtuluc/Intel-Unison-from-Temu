@@ -11,6 +11,9 @@ export const DEFAULT_CONFIG = {
   port: 8080,
   uploadDir: path.join(os.homedir(), 'Downloads', 'UniversalTrans'),
   tempDir: path.join(process.cwd(), 'temp'),
+  // Durable app data, unlike tempDir: trusted devices and transfer history must
+  // survive a restart, and nothing here is disposable staging.
+  dataDir: path.join(os.homedir(), '.universaltrans'),
   chunkSize: 10 * 1024 * 1024, // 10MB
   maxFileSize: 10 * 1024 * 1024 * 1024, // 10GB
   // Empty array = host authority is the only gate for source paths.
@@ -21,6 +24,9 @@ export const DEFAULT_CONFIG = {
   maxConnectedDevices: 20,
   storageQuota: 20 * 1024 * 1024 * 1024, // 20GB default storage quota
   uploadExpiry: 60 * 60 * 1000, // 1 hour
+  // How long a transfer offer waits for the host before it is abandoned with no
+  // bytes moved. Kept short: the sender is blocked on this decision.
+  offerTtlMs: 2 * 60 * 1000, // 2 minutes
   thumbnailSize: 200,
   thumbnailQuality: 80,
   pin: null,
@@ -105,6 +111,11 @@ export function validateConfig(cfg) {
     throw new AppError('CONFIG_INVALID', 500, 'storageQuota must be greater than 0.');
   }
 
+  const offerTtlMs = Number(cfg.offerTtlMs ?? DEFAULT_CONFIG.offerTtlMs);
+  if (!Number.isInteger(offerTtlMs) || offerTtlMs <= 0) {
+    throw new AppError('CONFIG_INVALID', 500, 'offerTtlMs must be a positive integer.');
+  }
+
   const sessionTtlMs = Number(cfg.sessionTtlMs);
   if (!Number.isInteger(sessionTtlMs) || sessionTtlMs <= 0) {
     throw new AppError(
@@ -147,6 +158,7 @@ export function loadConfig(overrides = {}) {
       ? resolvePath(env.UTRANS_UPLOAD_DIR)
       : DEFAULT_CONFIG.uploadDir,
     tempDir: env.UTRANS_TEMP_DIR ? resolvePath(env.UTRANS_TEMP_DIR) : DEFAULT_CONFIG.tempDir,
+    dataDir: env.UTRANS_DATA_DIR ? resolvePath(env.UTRANS_DATA_DIR) : DEFAULT_CONFIG.dataDir,
     chunkSize: env.UTRANS_CHUNK_SIZE
       ? parseInt(env.UTRANS_CHUNK_SIZE, 10)
       : DEFAULT_CONFIG.chunkSize,
@@ -168,6 +180,9 @@ export function loadConfig(overrides = {}) {
     uploadExpiry: env.UTRANS_UPLOAD_EXPIRY
       ? parseInt(env.UTRANS_UPLOAD_EXPIRY, 10)
       : DEFAULT_CONFIG.uploadExpiry,
+    offerTtlMs: env.UTRANS_OFFER_TTL
+      ? parseInt(env.UTRANS_OFFER_TTL, 10)
+      : DEFAULT_CONFIG.offerTtlMs,
     thumbnailSize: DEFAULT_CONFIG.thumbnailSize,
     thumbnailQuality: DEFAULT_CONFIG.thumbnailQuality,
     pin: env.UTRANS_PIN ? env.UTRANS_PIN.trim() : DEFAULT_CONFIG.pin,
@@ -194,6 +209,7 @@ export function loadConfig(overrides = {}) {
   // Ensure paths are properly resolved
   if (rawConfig.uploadDir) rawConfig.uploadDir = resolvePath(rawConfig.uploadDir);
   if (rawConfig.tempDir) rawConfig.tempDir = resolvePath(rawConfig.tempDir);
+  if (rawConfig.dataDir) rawConfig.dataDir = resolvePath(rawConfig.dataDir);
   if (!Array.isArray(rawConfig.allowedSourceDirs)) {
     throw new AppError('CONFIG_INVALID', 500, 'allowedSourceDirs must be an array of paths.');
   }

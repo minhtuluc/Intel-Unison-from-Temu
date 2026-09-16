@@ -12,6 +12,7 @@ import crypto from 'node:crypto';
 import WebSocket from 'ws';
 import { createRuntime } from '../../src/runtime.js';
 import { createServer } from '../../src/server.js';
+import { approveUpload } from '../helpers/consent.js';
 import { setupWebSocket } from '../../src/websocket/index.js';
 
 describe('UT-015: no internal paths and no client-asserted identity', () => {
@@ -67,15 +68,42 @@ describe('UT-015: no internal paths and no client-asserted identity', () => {
   }
 
   it('omits internal paths from upload, complete and decision responses', async () => {
+    const payload = 'simple-upload-body';
+    const grantHeader = await approveUpload(base, {
+      name: 'leak-check.txt',
+      data: payload,
+      hostToken,
+    });
+
     const form = new FormData();
-    form.append('files', new Blob(['simple-upload-body']), 'leak-check.txt');
-    const upload = await fetch(`${base}/api/upload`, { method: 'POST', body: form });
+    form.append('files', new Blob([payload]), 'leak-check.txt');
+    const upload = await fetch(`${base}/api/upload`, {
+      method: 'POST',
+      body: form,
+      headers: { 'X-Transfer-Grant': grantHeader },
+    });
     assert.equal(upload.status, 201);
     const uploadBody = await upload.json();
     assertNoHostPath(uploadBody, 'POST /api/upload');
+    assert.equal(uploadBody.data.uploaded[0].path, undefined);
 
-    const transferId = uploadBody.data.pending[0].transferId;
-    assertNoHostPath(uploadBody.data.pending[0], 'pending record');
+    // Consent precedes the transfer, so this file is already saved, not queued.
+    const savedPath = path.join(runtime.config.uploadDir, uploadBody.data.uploaded[0].savedAs);
+    assert.equal(await fs.readFile(savedPath, 'utf8'), payload);
+
+    // The host's own upload still uses pending + decision; that path must not leak either.
+    const hostForm = new FormData();
+    hostForm.append('files', new Blob(['host-body']), 'host-pending.txt');
+    const hostUpload = await fetch(`${base}/api/upload`, {
+      method: 'POST',
+      body: hostForm,
+      headers: { 'X-Host-Token': hostToken },
+    });
+    assert.equal(hostUpload.status, 201);
+    const hostBody = await hostUpload.json();
+    assertNoHostPath(hostBody, 'host POST /api/upload');
+    assertNoHostPath(hostBody.data.pending[0], 'pending record');
+    const transferId = hostBody.data.pending[0].transferId;
     assert.ok(transferId);
 
     const decision = await fetch(`${base}/api/upload/decision`, {
@@ -86,38 +114,48 @@ describe('UT-015: no internal paths and no client-asserted identity', () => {
     assert.equal(decision.status, 200);
     const decisionBody = await decision.json();
     assertNoHostPath(decisionBody, 'POST /api/upload/decision');
-    assert.equal(decisionBody.data.fileName, 'leak-check.txt');
-
-    const saved = await fs.readFile(path.join(runtime.config.uploadDir, 'leak-check.txt'), 'utf8');
-    assert.equal(saved, 'simple-upload-body');
+    assert.equal(decisionBody.data.fileName, 'host-pending.txt');
   });
 
   it('omits internal paths from the chunked upload flow', async () => {
     const checksum = crypto.createHash('sha256').update('12345678').digest('hex');
+    const grantHeader = await approveUpload(base, {
+      name: 'chunked-leak.bin',
+      data: '12345678',
+      checksum,
+      hostToken,
+    });
+
     const init = await fetch(`${base}/api/upload/init`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'X-Transfer-Grant': grantHeader },
       body: JSON.stringify({ fileName: 'chunked-leak.bin', fileSize: 8, checksum }),
     });
-    const { uploadId } = (await init.json()).data;
+    const { uploadId, uploadToken } = (await init.json()).data;
 
     const chunk = new FormData();
     chunk.append('uploadId', uploadId);
     chunk.append('chunkIndex', '0');
     chunk.append('chunk', new Blob(['12345678']), 'chunk_0');
-    const chunkRes = await fetch(`${base}/api/upload/chunk`, { method: 'POST', body: chunk });
+    const chunkRes = await fetch(`${base}/api/upload/chunk`, {
+      method: 'POST',
+      headers: { 'X-Upload-Id': uploadId, 'X-Upload-Token': uploadToken },
+      body: chunk,
+    });
     assert.equal(chunkRes.status, 200);
     assertNoHostPath(await chunkRes.json(), 'POST /api/upload/chunk');
 
     const complete = await fetch(`${base}/api/upload/complete`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'X-Upload-Token': uploadToken },
       body: JSON.stringify({ uploadId }),
     });
     assert.equal(complete.status, 200);
     assertNoHostPath(await complete.json(), 'POST /api/upload/complete');
 
-    const status = await fetch(`${base}/api/upload/status/${uploadId}`);
+    const status = await fetch(`${base}/api/upload/status/${uploadId}`, {
+      headers: { 'X-Upload-Token': uploadToken },
+    });
     if (status.status === 200) {
       assertNoHostPath(await status.json(), 'GET /api/upload/status');
     }

@@ -78,13 +78,19 @@ describe('Host authorization at HTTP and WebSocket interfaces', () => {
     assert.equal(sender.registration.device.isHost, false);
     assert.equal(other.registration.device.isHost, false);
 
-    const form = new FormData();
-    form.append('files', new Blob(['host-only-proof']), 'proof.txt');
-    const upload = await fetch(`${base}/api/upload`, { method: 'POST', body: form });
-    assert.equal(upload.status, 201);
-    const transferId = (await upload.json()).data.pending[0].transferId;
+    const proofBody = 'host-only-proof';
+    const senderConnectionId = sender.registration.connectionId;
 
-    // Ping barriers ensure earlier upload events have traversed every socket.
+    // A client upload now begins as an offer: nothing reaches disk until the host agrees.
+    const offerRes = await fetch(`${base}/api/transfer/offer`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Connection-Id': senderConnectionId },
+      body: JSON.stringify({ files: [{ name: 'proof.txt', size: proofBody.length }] }),
+    });
+    assert.equal(offerRes.status, 201);
+    const offerId = (await offerRes.json()).data.offer.offerId;
+
+    // Ping barriers ensure earlier approval events have traversed every socket.
     for (const peer of [host, sender, other]) {
       await new Promise((resolve) => {
         const listener = (raw) => {
@@ -97,55 +103,76 @@ describe('Host authorization at HTTP and WebSocket interfaces', () => {
         peer.ws.send(JSON.stringify({ event: 'client:ping' }));
       });
     }
-    assert.equal(host.events.filter((e) => e.event === 'upload:request').length, 1);
+    assert.equal(host.events.filter((e) => e.event === 'transfer:offer').length, 1);
     for (const peer of [sender, other]) {
       assert.equal(
-        peer.events.some((e) => e.event === 'upload:request'),
+        peer.events.some((e) => e.event === 'transfer:offer'),
         false
       );
       assert.equal(JSON.stringify(peer.events).includes(hostToken), false);
     }
 
-    assert.equal((await fetch(`${base}/api/upload/pending`)).status, 403);
-    for (const action of ['accept', 'decline']) {
-      const response = await fetch(`${base}/api/upload/decision`, {
+    // Clients can neither list nor decide offers, whatever they claim to be.
+    assert.equal((await fetch(`${base}/api/transfer/offers`)).status, 403);
+    for (const action of ['approve', 'reject']) {
+      const response = await fetch(`${base}/api/transfer/offer/decision`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'X-Host-Token': 'wrong',
           'X-Forwarded-For': '127.0.0.1',
         },
-        body: JSON.stringify({ transferId, action, isHost: true }),
+        body: JSON.stringify({
+          offerId,
+          decisions: [{ index: 0, action }],
+          isHost: true,
+        }),
       });
       assert.equal(response.status, 403);
-      assert.ok(runtime.pendingUploadManager.getPending(transferId));
+      assert.equal(runtime.offerService.getOffer(offerId).state, 'pending');
     }
+
     const headers = { 'Content-Type': 'application/json', 'X-Host-Token': hostToken };
-    const missingToken = await fetch(`${base}/api/upload/decision`, {
+    const missingToken = await fetch(`${base}/api/transfer/offer/decision`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ transferId, action: 'accept' }),
+      body: JSON.stringify({ offerId, decisions: [{ index: 0, action: 'approve' }] }),
     });
     assert.equal(missingToken.status, 403);
-    const foreignOrigin = await fetch(`${base}/api/upload/decision`, {
+    const foreignOrigin = await fetch(`${base}/api/transfer/offer/decision`, {
       method: 'POST',
       headers: { ...headers, Origin: 'https://untrusted.example' },
-      body: JSON.stringify({ transferId, action: 'accept' }),
+      body: JSON.stringify({ offerId, decisions: [{ index: 0, action: 'approve' }] }),
     });
     assert.equal(foreignOrigin.status, 403);
     const info = await (await fetch(`${base}/api/info`)).text();
     assert.equal(info.includes(hostToken), false);
-    const pending = await fetch(`${base}/api/upload/pending`, { headers });
-    assert.equal(pending.status, 200);
-    const accepted = await fetch(`${base}/api/upload/decision`, {
+
+    const openOffers = await fetch(`${base}/api/transfer/offers`, { headers });
+    assert.equal(openOffers.status, 200);
+    assert.equal((await openOffers.json()).data.length, 1);
+
+    // The host's approval is what issues the grant the sender spends to upload.
+    const approved = await fetch(`${base}/api/transfer/offer/decision`, {
       method: 'POST',
       headers,
-      body: JSON.stringify({ transferId, action: 'accept' }),
+      body: JSON.stringify({ offerId, decisions: [{ index: 0, action: 'approve' }] }),
     });
-    assert.equal(accepted.status, 200);
+    assert.equal(approved.status, 200);
+    const grantId = (await approved.json()).data.decisions[0].grantId;
+    assert.ok(grantId);
+
+    const form = new FormData();
+    form.append('files', new Blob([proofBody]), 'proof.txt');
+    const upload = await fetch(`${base}/api/upload`, {
+      method: 'POST',
+      body: form,
+      headers: { 'X-Transfer-Grant': grantId, 'X-Connection-Id': senderConnectionId },
+    });
+    assert.equal(upload.status, 201);
     assert.equal(
       await fs.readFile(path.join(runtime.config.uploadDir, 'proof.txt'), 'utf8'),
-      'host-only-proof'
+      proofBody
     );
   });
 });

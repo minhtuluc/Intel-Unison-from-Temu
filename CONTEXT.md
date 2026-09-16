@@ -24,8 +24,12 @@ Mỗi app instance có một **runtime** riêng (`createRuntime`) giữ config, 
 | Staging             | Bản tạm app quản lý khi browser gửi file để chia sẻ. Khác file nguồn CLI.                                                                                           |
 | Source path         | Đường dẫn trên máy host được đưa vào staging qua nhánh JSON của `/api/share`; hành động host-only, có thể giới hạn bằng `allowedSourceDirs`.                        |
 | Upload session      | Tập chunk đang nhận; chưa đồng nghĩa file hoàn chỉnh hay đã được duyệt.                                                                                             |
-| Pending transfer    | File đã nhận vào đĩa tạm, đang chờ host duyệt để chuyển vào thư mục nhận.                                                                                           |
+| Transfer offer      | Lô file client công bố (tên/cỡ/loại, checksum tùy chọn) **trước** khi truyền. Metadata thuần, không tạo file. Host duyệt riêng từng file.                           |
+| Transfer grant      | Vé dùng một lần phát cho mỗi file được duyệt. Gửi qua header `X-Transfer-Grant`, bind theo `(tên, cỡ)` và `connectionId`; là thứ duy nhất mở được đường ghi.        |
+| Trusted device      | Thiết bị host đã đánh dấu tin cậy nên offer được tự duyệt, vẫn ghi lịch sử. Client giữ token 256-bit; server **chỉ lưu hash**. Thu hồi được.                        |
+| Pending transfer    | File đã nhận vào đĩa tạm, đang chờ host duyệt. Chỉ còn áp dụng cho upload do **chính host** khởi tạo; file đã có consent lưu thẳng, không qua bước này.             |
 | Accept / Decline    | Quyết định của host; accept chuyển file, decline xóa bản tạm.                                                                                                       |
+| Transfer history    | Bản ghi các kết cục giao dịch (completed/rejected/expired), lưu bền ở `dataDir`. Host thấy tất cả; client chỉ thấy giao dịch của chính connection mình.             |
 | Receiver            | Bên được chọn nhận trong thiết kế tương lai; hiện chỉ host nhận upload.                                                                                             |
 | Relay               | Client A → host → client B, dữ liệu đi qua host.                                                                                                                    |
 | P2P                 | Dữ liệu đi trực tiếp giữa hai client; host có thể làm signaling. Chưa triển khai.                                                                                   |
@@ -34,7 +38,9 @@ Mỗi app instance có một **runtime** riêng (`createRuntime`) giữ config, 
 ## Cam kết và giới hạn
 
 - Quyền host không đồng nghĩa đã sửa toàn bộ PIN/pairing hoặc bảo mật LAN.
-- Hiện upload ghi file tạm trước khi hỏi host. Duyệt trước truyền là thay đổi core tương lai (UT-012).
+- Từ M3 (nhánh `m3-core-ux-consent`, chưa merge): client phải có consent trước khi truyền. `POST /api/upload` và `/api/upload/init` từ chối request không kèm grant bằng `428 TRANSFER_GRANT_REQUIRED`, trừ khi request mang host capability đã xác minh. Chi tiết: `docs/adr/0003-consent-before-transfer.md`.
+- Trust là quyết định **bền** duy nhất trong hệ thống: nó sống qua restart ở `dataDir`, khác session và host capability đều mất khi restart. Xoá `dataDir` mất danh sách thiết bị tin cậy và lịch sử, không mất file đã nhận.
+- `uploadDir` là trường config **duy nhất** đổi được lúc chạy (host-only, có validate). Mọi trường khác vẫn bất biến trong vòng đời tiến trình.
 - Bật PIN làm client phải xác thực trước khi xem/gửi; tắt PIN giữ hành vi LAN mở và không có session.
 - Cookie phiên là HttpOnly/SameSite=Strict nhưng không `Secure` vì app chạy HTTP trên LAN; XSS cùng origin vẫn là rủi ro được ghi nhận.
 - Host mở từ liên kết riêng do launcher cấp; mở URL/QR client thông thường không tự nhận quyền host.

@@ -63,6 +63,15 @@ export class TransferEngine {
     this.completedTransfers = [];
     this.failedTransfers = [];
     this.pendingWsDecisions = new Map();
+    // Files announced to the host but not yet cleared to upload. They hold no
+    // concurrency slot and never touch the wire until the host approves them.
+    this.consentPending = [];
+    /** Polling fallbacks for offers, keyed by offerId, so a lost WebSocket cannot
+     *  leave a sender waiting on a decision that already happened. */
+    this.offerPollers = new Map();
+    /** The full task batch behind each offer. Decisions are indexed against the
+     *  offer manifest, so resolving them needs the whole batch, not the undecided subset. */
+    this.offerTasks = new Map();
 
     this.listeners = new Map();
   }
@@ -95,6 +104,18 @@ export class TransferEngine {
     }
   }
 
+  _getConnectionId() {
+    return this.connectionId || (typeof window !== 'undefined' ? window.utransConnectionId : null);
+  }
+
+  _ownershipHeaders(task = null, initial = {}) {
+    const headers = { ...initial };
+    const connectionId = this._getConnectionId();
+    if (connectionId) headers['X-Connection-Id'] = connectionId;
+    if (task?.uploadToken) headers['X-Upload-Token'] = task.uploadToken;
+    return headers;
+  }
+
   /**
    * Adds files to the upload queue and initiates processing.
    * @param {FileList|File[]} files
@@ -113,7 +134,10 @@ export class TransferEngine {
         name: file.name,
         size: file.size,
         type: file.type || 'application/octet-stream',
-        status: 'queued', // queued, uploading, awaiting_approval, completed, error, paused, cancelled
+        // awaiting_consent -> queued -> uploading -> (awaiting_approval) -> completed|error
+        status: 'awaiting_consent',
+        offerId: null,
+        grantId: null,
         bytesUploaded: 0,
         progress: 0,
         speed: 0,
@@ -122,6 +146,7 @@ export class TransferEngine {
         etaFormatted: '--',
         isChunked,
         uploadId: null,
+        uploadToken: null,
         transferId: null,
         currentChunk: 0,
         totalChunks: isChunked ? Math.ceil(file.size / this.chunkSize) : 1,
@@ -134,15 +159,151 @@ export class TransferEngine {
         backoffTimer: null,
       };
 
-      this.queue.push(task);
+      this.consentPending.push(task);
       addedTasks.push(task);
       this._emit('task:added', task);
     }
 
     this._emit('queue:updated', this.getStatus());
-    this._processQueue();
+    // Uploading starts only once the host has seen this batch (UT-012).
+    this._requestConsent(addedTasks);
 
     return addedTasks;
+  }
+
+  /**
+   * Announces a batch to the host and starts the approved files.
+   * Nothing is uploaded before a grant comes back: the server refuses payloads that
+   * were not approved, so asking first is the only way the transfer can succeed.
+   * @param {Array<object>} tasks
+   */
+  async _requestConsent(tasks) {
+    const manifest = tasks.map((task) => ({
+      name: task.name,
+      size: task.size,
+      mimeType: task.type,
+    }));
+
+    let body;
+    try {
+      const headers = this._ownershipHeaders(null, { 'Content-Type': 'application/json' });
+      const response = await apiFetch('/api/transfer/offer', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ files: manifest }),
+      });
+      body = await response.json();
+      if (!response.ok) {
+        throw new Error(body?.error?.message || `HTTP ${response.status}`);
+      }
+    } catch (err) {
+      for (const task of tasks) {
+        this._dropConsentTask(task);
+        this._markError(task, `Could not ask the host to approve: ${err.message}`);
+      }
+      this._emit('queue:updated', this.getStatus());
+      return;
+    }
+
+    const { offer, autoApproved, decisions } = body.data;
+    // Record the batch and stamp the offerId on every task up front: decisions are
+    // indexed against this manifest, and undecided tasks must stay findable by offer.
+    this.offerTasks.set(offer.offerId, tasks);
+    for (const task of tasks) task.offerId = offer.offerId;
+
+    const approved = this._applyOfferDecisions(tasks, offer.offerId, decisions, {
+      announce: true,
+    });
+
+    // The host still has to decide, so wait for the event (or poll if WS is down).
+    if (!autoApproved && approved < tasks.length) {
+      this._watchOffer(offer.offerId);
+    }
+    this._settleOffer(offer.offerId);
+  }
+
+  /**
+   * Applies host decisions to the tasks that produced them.
+   * @returns {number} how many tasks were cleared to upload
+   */
+  _applyOfferDecisions(tasks, offerId, decisions, { announce = false } = {}) {
+    let approved = 0;
+    for (const decision of decisions || []) {
+      const task = tasks[decision.index];
+      if (!task || task.status !== 'awaiting_consent') continue;
+
+      task.offerId = offerId;
+      if (decision.decision === 'approved' && decision.grantId) {
+        task.grantId = decision.grantId;
+        task.status = 'queued';
+        this._dropConsentTask(task);
+        this.queue.push(task);
+        approved++;
+      } else if (decision.decision === 'rejected') {
+        this._dropConsentTask(task);
+        this._markRejected(task);
+        if (announce) this._emit('queue:updated', this.getStatus());
+      }
+    }
+
+    if (approved > 0) {
+      this._emit('queue:updated', this.getStatus());
+      this._processQueue();
+    }
+    return approved;
+  }
+
+  /** Stops watching an offer once every task in it has been decided. */
+  _settleOffer(offerId) {
+    const stillWaiting = this.consentPending.some((task) => task.offerId === offerId);
+    if (stillWaiting) return;
+
+    const poller = this.offerPollers.get(offerId);
+    if (poller) {
+      clearInterval(poller);
+      this.offerPollers.delete(offerId);
+    }
+    this.offerTasks.delete(offerId);
+  }
+
+  /**
+   * Waits for a decision. The WebSocket event is the fast path; polling covers a
+   * dropped connection so the sender is never stuck waiting on a decided offer.
+   */
+  _watchOffer(offerId) {
+    if (this.offerPollers.has(offerId)) return;
+
+    const poller = setInterval(async () => {
+      try {
+        const response = await apiFetch(`/api/transfer/offer/${offerId}`, {
+          headers: this._ownershipHeaders(),
+        });
+        if (!response.ok) return;
+        const { data } = await response.json();
+        if (data.offer.state === 'pending') return;
+
+        const batch = this.offerTasks.get(offerId) || [];
+        this._applyOfferDecisions(batch, offerId, data.decisions, { announce: true });
+        this._settleOffer(offerId);
+      } catch {
+        // Keep polling; a transient failure is not a decision.
+      }
+    }, 3000);
+    // A browser has no unref; under Node this keeps a waiting poll from pinning the
+    // event loop, which would otherwise hang any process that does not exit on its own.
+    if (typeof poller.unref === 'function') poller.unref();
+    this.offerPollers.set(offerId, poller);
+  }
+
+  /** Stops all offer polling. Callers that own the engine's lifetime should invoke this. */
+  dispose() {
+    for (const poller of this.offerPollers.values()) clearInterval(poller);
+    this.offerPollers.clear();
+  }
+
+  _dropConsentTask(task) {
+    const index = this.consentPending.indexOf(task);
+    if (index !== -1) this.consentPending.splice(index, 1);
   }
 
   /**
@@ -283,9 +444,10 @@ export class TransferEngine {
       // The server derives identity itself; only the display label is reported.
       xhr.setRequestHeader('X-Device-Name', this._getDeviceName());
       xhr.setRequestHeader('X-Platform', this._getPlatform());
-      const connectionId =
-        this.connectionId || (typeof window !== 'undefined' ? window.utransConnectionId : null);
+      const connectionId = this._getConnectionId();
       if (connectionId) xhr.setRequestHeader('X-Connection-Id', connectionId);
+      // The grant is what makes the server accept these bytes (UT-012).
+      if (task.grantId) xhr.setRequestHeader('X-Transfer-Grant', task.grantId);
       xhr.send(formData);
     });
   }
@@ -316,10 +478,9 @@ export class TransferEngine {
           }
           throw err;
         }
-        const connectionId =
-          this.connectionId || (typeof window !== 'undefined' ? window.utransConnectionId : null);
-        const headers = { 'Content-Type': 'application/json' };
-        if (connectionId) headers['X-Connection-Id'] = connectionId;
+        const headers = this._ownershipHeaders(task, { 'Content-Type': 'application/json' });
+        // Consent is checked when the session starts; chunks then ride on it.
+        if (task.grantId) headers['X-Transfer-Grant'] = task.grantId;
 
         const initRes = await apiFetch('/api/upload/init', {
           method: 'POST',
@@ -341,6 +502,7 @@ export class TransferEngine {
 
         const initData = await initRes.json();
         task.uploadId = initData.data.uploadId;
+        task.uploadToken = initData.data.uploadToken;
         task.chunkSize = initData.data.chunkSize || this.chunkSize;
         task.totalChunks = initData.data.totalChunks;
       }
@@ -407,14 +569,11 @@ export class TransferEngine {
       if (task.status === 'paused' || task.status === 'cancelled') return task;
 
       // Step 3: Complete upload
-      const connectionId =
-        this.connectionId || (typeof window !== 'undefined' ? window.utransConnectionId : null);
-      const compHeaders = {
+      const compHeaders = this._ownershipHeaders(task, {
         'Content-Type': 'application/json',
         'X-Device-Name': this._getDeviceName(),
         'X-Platform': this._getPlatform(),
-      };
-      if (connectionId) compHeaders['X-Connection-Id'] = connectionId;
+      });
 
       const compRes = await apiFetch('/api/upload/complete', {
         method: 'POST',
@@ -528,6 +687,10 @@ export class TransferEngine {
       if (sessionToken) xhr.setRequestHeader('X-Session-Token', sessionToken);
       const hostToken = getHostToken();
       if (hostToken) xhr.setRequestHeader('X-Host-Token', hostToken);
+      xhr.setRequestHeader('X-Upload-Id', task.uploadId);
+      const connectionId = this._getConnectionId();
+      if (connectionId) xhr.setRequestHeader('X-Connection-Id', connectionId);
+      if (task.uploadToken) xhr.setRequestHeader('X-Upload-Token', task.uploadToken);
       xhr.send(formData);
     });
   }
@@ -601,10 +764,13 @@ export class TransferEngine {
 
     if (task.isChunked && task.uploadId) {
       try {
-        const res = await apiFetch(`/api/upload/status/${task.uploadId}`);
+        const res = await apiFetch(`/api/upload/status/${task.uploadId}`, {
+          headers: this._ownershipHeaders(task),
+        });
         if (res.status === 404 || res.status === 410) {
           // Session expired or cancelled on server; re-init from scratch
           task.uploadId = null;
+          task.uploadToken = null;
           task.currentChunk = 0;
           task.bytesUploaded = 0;
           task.progress = 0;
@@ -644,6 +810,11 @@ export class TransferEngine {
       const qIdx = this.queue.findIndex((t) => t.id === taskId);
       if (qIdx !== -1) {
         task = this.queue.splice(qIdx, 1)[0];
+      } else {
+        const cIdx = this.consentPending.findIndex((t) => t.id === taskId);
+        if (cIdx !== -1) {
+          task = this.consentPending.splice(cIdx, 1)[0];
+        }
       }
     }
 
@@ -663,7 +834,7 @@ export class TransferEngine {
       if (task.isChunked && task.uploadId) {
         apiFetch('/api/upload/cancel', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: this._ownershipHeaders(task, { 'Content-Type': 'application/json' }),
           body: JSON.stringify({ uploadId: task.uploadId }),
         }).catch(() => {});
       }
@@ -690,9 +861,12 @@ export class TransferEngine {
 
     if (task.isChunked && task.uploadId) {
       try {
-        const res = await apiFetch(`/api/upload/status/${task.uploadId}`);
+        const res = await apiFetch(`/api/upload/status/${task.uploadId}`, {
+          headers: this._ownershipHeaders(task),
+        });
         if (res.status === 404 || res.status === 410) {
           task.uploadId = null;
+          task.uploadToken = null;
           task.currentChunk = 0;
           task.bytesUploaded = 0;
           task.progress = 0;
@@ -706,10 +880,22 @@ export class TransferEngine {
         }
       } catch {
         task.uploadId = null;
+        task.uploadToken = null;
         task.currentChunk = 0;
         task.bytesUploaded = 0;
         task.progress = 0;
       }
+    }
+
+    // A declined or failed-consent file holds no grant, so retrying means asking
+    // the host again — uploading it directly would be refused at the gate.
+    if (!task.grantId) {
+      task.status = 'awaiting_consent';
+      task.offerId = null;
+      this.consentPending.push(task);
+      this._emit('queue:updated', this.getStatus());
+      await this._requestConsent([task]);
+      return;
     }
 
     this.queue.push(task);
@@ -738,6 +924,30 @@ export class TransferEngine {
    * @param {object} data
    */
   handleWebSocketEvent(event, data) {
+    // Consent decisions are matched by offerId, before any transferId exists.
+    if (event === 'transfer:offer:decision' || event === 'transfer:offer:expired') {
+      const offerId = data?.offerId;
+      if (!offerId) return;
+
+      const batch = this.offerTasks.get(offerId);
+      if (!batch) return;
+      const waiting = this.consentPending.filter((task) => task.offerId === offerId);
+
+      if (event === 'transfer:offer:expired') {
+        for (const task of waiting) {
+          this._dropConsentTask(task);
+          this._markError(task, 'Approval timed out');
+        }
+      } else {
+        // Files the host left undecided stay in consentPending and keep waiting.
+        this._applyOfferDecisions(batch, offerId, data.decisions, { announce: true });
+      }
+
+      this._settleOffer(offerId);
+      this._emit('queue:updated', this.getStatus());
+      return;
+    }
+
     const { transferId } = data || {};
     if (!transferId) return;
 
@@ -841,6 +1051,20 @@ export class TransferEngine {
     this._emit('task:completed', task);
   }
 
+  /**
+   * The host declined this file at offer time, so it never left the device.
+   * Surfaced alongside failures so the sender sees a reason and can retry.
+   */
+  _markRejected(task) {
+    task.status = 'rejected';
+    task.error = 'Declined by the PC user';
+    task.speed = 0;
+    task.speedFormatted = 'Declined';
+    task.etaFormatted = '--';
+    this.failedTransfers.unshift(task);
+    this._emit('task:error', task);
+  }
+
   _markError(task, errorMessage) {
     if (task.transferId) {
       this.pendingWsDecisions.delete(task.transferId);
@@ -855,12 +1079,16 @@ export class TransferEngine {
   }
 
   getStatus() {
+    const awaitingConsent = [...this.consentPending];
     return {
       active: [
         ...Array.from(this.activeTransfers.values()),
         ...Array.from(this.awaitingTransfers.values()),
         ...Array.from(this.pausedTransfers.values()),
+        // Shown with the active work: the sender is waiting on the host, not idle.
+        ...awaitingConsent,
       ],
+      awaitingConsent,
       queued: [...this.queue],
       completed: [...this.completedTransfers],
       failed: [...this.failedTransfers],

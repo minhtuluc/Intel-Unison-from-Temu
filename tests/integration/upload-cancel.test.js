@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createRuntime } from '../../src/runtime.js';
 import { createServer } from '../../src/server.js';
+import { approveUpload } from '../helpers/consent.js';
 
 describe('Integration: POST /api/upload/cancel (Server-side Cancel & Cleanup)', () => {
   let server;
@@ -38,19 +39,28 @@ describe('Integration: POST /api/upload/cancel (Server-side Cancel & Cleanup)', 
   });
 
   it('cancels active chunked upload and cleans up chunk files immediately', async () => {
-    // 1. Init upload
+    const checksum = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
+
+    // 1. Init upload — the host consents to this file before a session exists.
+    const grantHeader = await approveUpload(baseUrl, {
+      name: 'cancelling_movie.mp4',
+      data: Buffer.alloc(2048),
+      checksum,
+      hostToken: runtime.hostAuth.token,
+    });
+
     const initRes = await fetch(`${baseUrl}/api/upload/init`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'X-Transfer-Grant': grantHeader },
       body: JSON.stringify({
         fileName: 'cancelling_movie.mp4',
         fileSize: 2048,
         mimeType: 'video/mp4',
-        checksum: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+        checksum,
       }),
     });
     assert.equal(initRes.status, 200);
-    const { uploadId } = (await initRes.json()).data;
+    const { uploadId, uploadToken } = (await initRes.json()).data;
 
     // 2. Upload chunk 0
     const form = new FormData();
@@ -60,6 +70,7 @@ describe('Integration: POST /api/upload/cancel (Server-side Cancel & Cleanup)', 
 
     const chunkRes = await fetch(`${baseUrl}/api/upload/chunk`, {
       method: 'POST',
+      headers: { 'X-Upload-Id': uploadId, 'X-Upload-Token': uploadToken },
       body: form,
     });
     assert.equal(chunkRes.status, 200);
@@ -70,7 +81,7 @@ describe('Integration: POST /api/upload/cancel (Server-side Cancel & Cleanup)', 
     // 3. Cancel upload
     const cancelRes = await fetch(`${baseUrl}/api/upload/cancel`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'X-Upload-Token': uploadToken },
       body: JSON.stringify({ uploadId }),
     });
     assert.equal(cancelRes.status, 200);
