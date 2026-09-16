@@ -10,6 +10,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createRuntime } from '../../src/runtime.js';
 import { createServer } from '../../src/server.js';
+import { approveUpload } from '../helpers/consent.js';
 
 async function listen(app) {
   const server = app.listen(0, '127.0.0.1');
@@ -78,17 +79,19 @@ describe('UT-005: runtime isolation', () => {
     assert.equal(await download.text(), 'runtime-a-payload');
 
     // An upload received by A must land in A's upload dir only.
+    const grantHeader = await approveUpload(baseA, {
+      name: 'for-a.txt',
+      data: 'a-receives',
+      hostToken: runtimeA.hostAuth.token,
+    });
     const form = new FormData();
     form.append('files', new Blob(['a-receives']), 'for-a.txt');
-    const uploaded = await fetch(`${baseA}/api/upload`, { method: 'POST', body: form });
-    const transferId = (await uploaded.json()).data.pending[0].transferId;
-
-    const decision = await fetch(`${baseA}/api/upload/decision`, {
+    const uploaded = await fetch(`${baseA}/api/upload`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Host-Token': runtimeA.hostAuth.token },
-      body: JSON.stringify({ transferId, action: 'accept' }),
+      body: form,
+      headers: { 'X-Transfer-Grant': grantHeader },
     });
-    assert.equal(decision.status, 200);
+    assert.equal(uploaded.status, 201);
 
     const savedInA = await fs.readFile(path.join(runtimeA.config.uploadDir, 'for-a.txt'), 'utf8');
     assert.equal(savedInA, 'a-receives');

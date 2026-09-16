@@ -6,6 +6,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { createRuntime } from '../../src/runtime.js';
 import { createServer } from '../../src/server.js';
+import { approveUpload } from '../helpers/consent.js';
 
 describe('Integration: API Transfer (Download & Upload)', () => {
   let server;
@@ -152,13 +153,21 @@ describe('Integration: API Transfer (Download & Upload)', () => {
 
   describe('POST /api/upload (Simple Upload)', () => {
     it('should receive file and write directly to uploadDir', async () => {
-      const formData = new FormData();
       const uploadText = 'Quick mobile photo upload payload';
+      const grantHeader = await approveUpload(baseUrl, {
+        name: 'mobile_upload.txt',
+        data: uploadText,
+        mimeType: 'text/plain',
+        hostToken: runtime.hostAuth.token,
+      });
+
+      const formData = new FormData();
       formData.append('files', new Blob([uploadText], { type: 'text/plain' }), 'mobile_upload.txt');
 
       const res = await fetch(`${baseUrl}/api/upload`, {
         method: 'POST',
         body: formData,
+        headers: { 'X-Transfer-Grant': grantHeader },
       });
 
       assert.equal(res.status, 201);
@@ -168,10 +177,14 @@ describe('Integration: API Transfer (Download & Upload)', () => {
 
       // UT-015: responses never disclose host paths.
       assert.equal(body.data.uploaded[0].path, undefined);
-      const pendingPath = path.join(runtime.config.tempDir, 'pending', body.data.uploaded[0].name);
-      assert.ok(fs.existsSync(pendingPath));
-      const content = await fs.promises.readFile(pendingPath, 'utf8');
-      assert.equal(content, uploadText);
+
+      // Consent happened at offer time, so this file is saved rather than queued.
+      assert.equal(body.data.pending.length, 0);
+      const saved = await fs.promises.readFile(
+        path.join(runtime.config.uploadDir, body.data.uploaded[0].savedAs),
+        'utf8'
+      );
+      assert.equal(saved, uploadText);
     });
   });
 
@@ -189,10 +202,18 @@ describe('Integration: API Transfer (Download & Upload)', () => {
           .update(Buffer.concat([testChunk1, testChunk2]))
           .digest('hex');
 
-        // 1. Init
+        // 1. Init — the host consents to the declared name/size before any chunk moves.
+        const grantHeader = await approveUpload(baseUrl, {
+          name: 'video_transfer.mp4',
+          data: Buffer.concat([testChunk1, testChunk2]),
+          mimeType: 'video/mp4',
+          checksum: totalChecksum,
+          hostToken: runtime.hostAuth.token,
+        });
+
         const initRes = await fetch(`${baseUrl}/api/upload/init`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', 'X-Transfer-Grant': grantHeader },
           body: JSON.stringify({
             fileName: 'video_transfer.mp4',
             fileSize: totalSize,
@@ -249,11 +270,9 @@ describe('Integration: API Transfer (Download & Upload)', () => {
         assert.equal(completeBody.success, true);
         // UT-015: the merged file path stays server-side.
         assert.equal(completeBody.data.filePath, undefined);
-        const mergedPath = path.join(
-          runtime.config.tempDir,
-          'pending',
-          completeBody.data.pending.fileName
-        );
+
+        // Consent was given up front, so completion saves to the receive dir.
+        const mergedPath = path.join(runtime.config.uploadDir, completeBody.data.savedAs);
         assert.ok(fs.existsSync(mergedPath), `merged file exists at ${mergedPath}`);
 
         const mergedContent = await fs.promises.readFile(mergedPath);

@@ -16,6 +16,8 @@ import { ChunkedUploadManager } from './services/chunked-upload.js';
 import { PendingUploadService } from './services/pending-upload.js';
 import { DiscoveryService } from './services/discovery.js';
 import { StorageQuotaTracker } from './services/storage-quota.js';
+import { TransferOfferService } from './services/transfer-offer.js';
+import { TrustedDeviceService } from './services/trusted-devices.js';
 import { createHostAuth } from './middleware/host-auth.js';
 import { createSessionStore } from './middleware/session-auth.js';
 import { sendTransferTerminalEvent } from './websocket/handlers.js';
@@ -43,6 +45,8 @@ export function createRuntime(options = {}) {
     shareManager: new ShareManager(),
     chunkedUploadManager: new ChunkedUploadManager(config),
     pendingUploadManager: new PendingUploadService({ config, quotaTracker }),
+    trustedDevices: new TrustedDeviceService({ config }),
+    offerService: new TransferOfferService({ config }),
     discovery: new DiscoveryService({ maxConnectedDevices: config.maxConnectedDevices }),
     hostAuth: createHostAuth(),
     sessions: createSessionStore({ ttlMs: config.sessionTtlMs, maxSessions: config.maxSessions }),
@@ -87,6 +91,7 @@ export function createRuntime(options = {}) {
         runtime.pendingUploadManager.sweepOrphans(olderThanMs),
         runtime.shareManager.sweepOrphans(runtime.config.tempDir, olderThanMs),
       ]);
+      runtime.offerService.sweepGrants();
     },
 
     /**
@@ -164,6 +169,7 @@ export function createRuntime(options = {}) {
             runCleanupTask('shareManager', () => runtime.shareManager.clear()),
             runCleanupTask('chunkedUploadManager', () => runtime.chunkedUploadManager.cleanup()),
             runCleanupTask('pendingUploadManager', () => runtime.pendingUploadManager.cleanup()),
+            runCleanupTask('offerService', () => runtime.offerService.cleanup()),
             runCleanupTask('sessions', () => runtime.sessions.revokeAll()),
           ]);
         };
@@ -221,6 +227,22 @@ export function createRuntime(options = {}) {
 
   // Run startup sweep in background
   runtime.sweepAll().catch(() => {});
+
+  // An offer the host never answered must end loudly: the sender is blocked on it.
+  runtime.offerService.onExpire = ({ offerId, sender }) => {
+    const wss = runtime.wss || runtime.app?.get('wss');
+    if (wss) {
+      sendTransferTerminalEvent(
+        wss,
+        'transfer:offer:expired',
+        {
+          offerId,
+          reason: 'TIMEOUT',
+        },
+        sender
+      );
+    }
+  };
 
   runtime.pendingUploadManager.onTimeout = ({ transferId, sender }) => {
     const wss = runtime.wss || runtime.app?.get('wss');

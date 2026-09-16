@@ -106,6 +106,18 @@ export class PendingUploadService {
     return this._sanitizeRecord(record);
   }
 
+  /**
+   * Registers a file the host already consented to and moves it straight to the
+   * receive directory. The pre-transfer offer (UT-012) is the consent step, so
+   * prompting again here would ask the host twice for the same decision.
+   * @param {object} params same shape as createPending
+   * @returns {Promise<{ transferId: string, fileName: string, size: number }>}
+   */
+  async createPreApproved(params) {
+    const record = this.createPending(params);
+    return await this.accept(record.transferId);
+  }
+
   getPending(transferId) {
     const record = this.pending.get(transferId);
     return record ? this._sanitizeRecord(record) : null;

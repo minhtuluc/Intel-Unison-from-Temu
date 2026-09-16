@@ -143,6 +143,8 @@ export async function startServer(options = {}) {
   // Ensure directories exist
   await fs.promises.mkdir(cfg.uploadDir, { recursive: true });
   await fs.promises.mkdir(cfg.tempDir, { recursive: true });
+  // Durable app data (trusted devices); survives restarts, unlike tempDir.
+  await fs.promises.mkdir(cfg.dataDir, { recursive: true });
 
   // Share initial paths if provided via CLI
   if (initialPaths && initialPaths.length > 0) {

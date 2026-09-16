@@ -13,6 +13,8 @@ import { AppError } from '../middleware/error-handler.js';
 import { parseRange, reserveWritableFile } from '../utils/file-utils.js';
 import { requireHost } from '../middleware/host-auth.js';
 import { extractSessionToken } from '../middleware/session-auth.js';
+import { requireTransferGrant, assertGrantsMatchFiles } from '../middleware/transfer-grant.js';
+import { hashDeviceToken } from '../services/trusted-devices.js';
 
 export const transferRouter = Router();
 
@@ -296,6 +298,199 @@ function parseChunkUpload(req, res, next) {
   });
 }
 
+/** Device tokens are client-generated; the server only ever compares stored hashes. */
+function readDeviceToken(req) {
+  const token = req.headers['x-device-token'];
+  return typeof token === 'string' && token ? token : null;
+}
+
+/**
+ * Decision payload shared by the HTTP response and the WebSocket event, so a sender
+ * sees the same result whether it learned it by event or by polling.
+ * @param {import('../services/transfer-offer.js').TransferOfferService} offerService
+ * @param {object} offer
+ * @param {boolean} autoApproved
+ */
+function buildOfferDecisionPayload(offerService, offer, autoApproved) {
+  const grantByIndex = new Map(
+    offerService.getGrantsForOffer(offer.offerId).map((grant) => [grant.index, grant.grantId])
+  );
+  return {
+    offerId: offer.offerId,
+    autoApproved: Boolean(autoApproved),
+    decisions: offer.files.map((file) => ({
+      index: file.index,
+      name: file.name,
+      size: file.size,
+      mimeType: file.mimeType,
+      decision: file.decision,
+      grantId: grantByIndex.get(file.index) || null,
+    })),
+  };
+}
+
+/**
+ * POST /api/transfer/offer
+ * Declares a batch the sender intends to upload. No payload moves yet: the host
+ * reviews name/size/type and decides per file. A remembered device is approved
+ * immediately, but the offer is still recorded so the host can see what arrived.
+ */
+transferRouter.post('/api/transfer/offer', async (req, res, next) => {
+  try {
+    const runtime = req.app.locals.runtime;
+    const sender = resolveSender(req);
+    const deviceToken = readDeviceToken(req);
+    const trusted = Boolean(deviceToken && runtime.trustedDevices.isTrusted(deviceToken));
+    // Kept on the offer so the host can remember this device without ever learning
+    // the device's secret. `sanitize()` never emits it.
+    if (deviceToken) sender.deviceTokenHash = hashDeviceToken(deviceToken);
+
+    const { offer, autoApproved } = runtime.offerService.createOffer({
+      files: req.body?.files,
+      sender,
+      trusted,
+    });
+
+    const wss = req.app.get('wss');
+    const sanitized = runtime.offerService.sanitize(offer);
+    if (wss) {
+      broadcastEvent(wss, 'transfer:offer', {
+        offer: sanitized,
+        autoApproved: Boolean(autoApproved),
+      });
+    }
+
+    res.status(201).json({
+      success: true,
+      data: {
+        offer: sanitized,
+        autoApproved: Boolean(autoApproved),
+        decisions: buildOfferDecisionPayload(runtime.offerService, offer, autoApproved).decisions,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * GET /api/transfer/offer/:offerId
+ * Lets a sender that missed the WebSocket event read the host's decision.
+ */
+transferRouter.get('/api/transfer/offer/:offerId', (req, res, next) => {
+  try {
+    const runtime = req.app.locals.runtime;
+    const offer = runtime.offerService.getOffer(req.params.offerId);
+    if (!offer) {
+      throw new AppError('OFFER_NOT_FOUND', 404, `Offer ${req.params.offerId} not found`);
+    }
+
+    const connectionId = req.headers['x-connection-id'] || null;
+    if (offer.sender?.connectionId && offer.sender.connectionId !== connectionId) {
+      throw new AppError('OFFER_FORBIDDEN', 403, 'Offer belongs to another connection');
+    }
+
+    res.json({
+      success: true,
+      data: {
+        offer: runtime.offerService.sanitize(offer),
+        decisions: buildOfferDecisionPayload(runtime.offerService, offer, offer.trusted).decisions,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/** POST /api/transfer/offer/cancel — sender abandons the batch before the host acts. */
+transferRouter.post('/api/transfer/offer/cancel', (req, res, next) => {
+  try {
+    const { offerId } = req.body || {};
+    if (!offerId) {
+      throw new AppError('INVALID_INPUT', 400, 'offerId is required');
+    }
+    const canceled = req.app.locals.runtime.offerService.cancelOffer(offerId, {
+      connectionId: req.headers['x-connection-id'] || null,
+    });
+    res.json({ success: true, data: canceled });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/** GET /api/transfer/offers — open offers, for the host to re-sync after a reload. */
+transferRouter.get('/api/transfer/offers', requireHost, (req, res) => {
+  res.json({
+    success: true,
+    data: req.app.locals.runtime.offerService.listPending(),
+  });
+});
+
+/**
+ * POST /api/transfer/offer/decision
+ * Host approves or rejects individual files in an offer. Approving issues the
+ * single-use grants that authorize the upload.
+ */
+transferRouter.post('/api/transfer/offer/decision', requireHost, async (req, res, next) => {
+  try {
+    const { offerId, decisions, trustDevice } = req.body || {};
+    if (!offerId) {
+      throw new AppError('INVALID_INPUT', 400, 'offerId is required');
+    }
+
+    const runtime = req.app.locals.runtime;
+    const { offer } = runtime.offerService.decide(offerId, decisions);
+
+    let trustedDevice = null;
+    if (trustDevice) {
+      const tokenHash = offer.sender?.deviceTokenHash;
+      if (!tokenHash) {
+        throw new AppError(
+          'DEVICE_TOKEN_UNAVAILABLE',
+          400,
+          'This sender presented no device token, so it cannot be remembered'
+        );
+      }
+      trustedDevice = await runtime.trustedDevices.trustByHash({
+        tokenHash,
+        label: offer.sender?.label || 'Unknown device',
+        platform: offer.sender?.platform || 'unknown',
+      });
+    }
+
+    const payload = buildOfferDecisionPayload(runtime.offerService, offer, false);
+    const wss = req.app.get('wss');
+    if (wss) {
+      sendTransferTerminalEvent(wss, 'transfer:offer:decision', payload, offer.sender);
+    }
+
+    res.json({
+      success: true,
+      data: { ...payload, trustedDevice },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/** GET /api/devices/trusted — host-facing list; never exposes stored token hashes. */
+transferRouter.get('/api/devices/trusted', requireHost, (req, res) => {
+  res.json({
+    success: true,
+    data: req.app.locals.runtime.trustedDevices.list(),
+  });
+});
+
+/** DELETE /api/devices/trusted/:id — revoke a remembered device. */
+transferRouter.delete('/api/devices/trusted/:id', requireHost, async (req, res, next) => {
+  try {
+    const result = await req.app.locals.runtime.trustedDevices.revoke(req.params.id);
+    res.json({ success: true, data: result });
+  } catch (error) {
+    next(error);
+  }
+});
+
 /**
  * GET /api/download/:fileId
  * Streams a staged file to client with Range header (resume & seeking) support.
@@ -388,67 +583,94 @@ transferRouter.get('/api/thumbnail/:fileId', (req, res) => {
  * POST /api/upload
  * Simple upload endpoint for single/multiple files (<100MB).
  */
-transferRouter.post('/api/upload', parseSimpleUpload, async (req, res, next) => {
-  const runtime = req.app.locals.runtime;
-  try {
-    const files = req.files || [];
-    if (files.length === 0) {
-      throw new AppError('NO_FILES_UPLOADED', 400, 'No files provided in upload');
-    }
-
-    // Sender attribution is strictly verified against active connection and remote IP
-    const sender = resolveSender(req);
-
-    const uploaded = [];
-    const pending = [];
-    const wss = req.app.get('wss');
-
-    for (const f of files) {
-      const record = runtime.pendingUploadManager.createPending({
-        fileName: f.originalname || f.filename,
-        fileSize: f.size,
-        mimeType: f.mimetype,
-        tempPath: f.path,
-        sender,
-        quotaAlreadyReserved: true,
-      });
-
-      uploaded.push({
-        name: f.filename,
-        size: f.size,
-        transferId: record.transferId,
-      });
-      pending.push(record);
-
-      if (wss) {
-        broadcastEvent(wss, 'upload:request', { pending: record });
+transferRouter.post(
+  '/api/upload',
+  requireTransferGrant(),
+  parseSimpleUpload,
+  async (req, res, next) => {
+    const runtime = req.app.locals.runtime;
+    try {
+      const files = req.files || [];
+      if (files.length === 0) {
+        throw new AppError('NO_FILES_UPLOADED', 400, 'No files provided in upload');
       }
-    }
 
-    res.status(201).json({
-      success: true,
-      data: { uploaded, pending },
-    });
-  } catch (error) {
-    if (req.files && Array.isArray(req.files)) {
-      for (const f of req.files) {
-        try {
-          if (fs.existsSync(f.path)) await fs.promises.unlink(f.path);
-        } catch {
-          // ignore unlink failure
+      // The gate ran before Multer, so this is what binds the parsed bytes to what
+      // the host actually approved: wrong name, wrong size or extra files all fail.
+      assertGrantsMatchFiles(req, files);
+
+      // Sender attribution is strictly verified against active connection and remote IP
+      const sender = resolveSender(req);
+      const consented = Boolean(req.transferGrants?.length);
+
+      const uploaded = [];
+      const pending = [];
+      const wss = req.app.get('wss');
+
+      for (const f of files) {
+        const recordParams = {
+          fileName: f.originalname || f.filename,
+          fileSize: f.size,
+          mimeType: f.mimetype,
+          tempPath: f.path,
+          sender,
+          quotaAlreadyReserved: true,
+        };
+
+        if (consented) {
+          // Host consent already happened at offer time, so the file goes straight to
+          // the receive dir. Asking again here would be the duplicate consent UT-012
+          // sets out to remove, and the size already matched the approved manifest.
+          const saved = await runtime.pendingUploadManager.createPreApproved(recordParams);
+          uploaded.push({
+            name: f.filename,
+            size: f.size,
+            transferId: saved.transferId,
+            savedAs: saved.fileName,
+            status: 'saved',
+          });
+          continue;
         }
-        if (runtime.quotaTracker) runtime.quotaTracker.release(f.size);
+
+        const record = runtime.pendingUploadManager.createPending(recordParams);
+
+        uploaded.push({
+          name: f.filename,
+          size: f.size,
+          transferId: record.transferId,
+        });
+        pending.push(record);
+
+        if (wss) {
+          broadcastEvent(wss, 'upload:request', { pending: record });
+        }
       }
+
+      res.status(201).json({
+        success: true,
+        data: { uploaded, pending },
+      });
+    } catch (error) {
+      if (req.files && Array.isArray(req.files)) {
+        for (const f of req.files) {
+          try {
+            if (fs.existsSync(f.path)) await fs.promises.unlink(f.path);
+          } catch {
+            // ignore unlink failure
+          }
+          if (runtime.quotaTracker) runtime.quotaTracker.release(f.size);
+        }
+      }
+      next(error);
     }
-    next(error);
   }
-});
+);
 
 /**
  * POST /api/upload/init
  * Initializes a chunked upload session for large files.
  */
-transferRouter.post('/api/upload/init', async (req, res, next) => {
+transferRouter.post('/api/upload/init', requireTransferGrant(), async (req, res, next) => {
   try {
     const runtime = req.app.locals.runtime;
     if (runtime.getActiveTransferCount() >= runtime.config.maxConcurrentTransfers) {
@@ -462,11 +684,29 @@ transferRouter.post('/api/upload/init', async (req, res, next) => {
     const sender = resolveSender(req);
 
     const { fileName, fileSize, mimeType, checksum } = req.body || {};
+    const grants = req.transferGrants || [];
+    if (grants.length > 1) {
+      throw new AppError(
+        'GRANT_FILE_COUNT_MISMATCH',
+        403,
+        'A chunked session is initialized for exactly one approved file'
+      );
+    }
+    const grant = grants[0] || null;
+    if (grant && Number(fileSize) !== grant.size) {
+      throw new AppError(
+        'GRANT_SIZE_MISMATCH',
+        403,
+        `Declared size ${fileSize} does not match the approved size ${grant.size}`
+      );
+    }
+
     const result = await runtime.chunkedUploadManager.initUpload({
       fileName,
       fileSize,
       mimeType,
       checksum,
+      preApproved: Boolean(grant),
     });
 
     const session = runtime.chunkedUploadManager.sessions.get(result.uploadId);
@@ -591,9 +831,15 @@ transferRouter.post('/api/upload/complete', async (req, res, next) => {
           averageSpeed: existingOutcome.averageSpeed,
           pending: existingOutcome.pending,
           transferId: existingOutcome.transferId,
+          savedAs: existingOutcome.savedAs || null,
         },
       });
     }
+
+    // Read before completion clears the session: this is the consent the host gave
+    // at offer time, and it decides whether a second prompt happens.
+    const session = runtime.chunkedUploadManager.sessions.get(uploadId);
+    const preApproved = Boolean(session?.preApproved);
 
     const pendingDir = path.join(runtime.config.tempDir, 'pending');
     const result = await runtime.chunkedUploadManager.complete(uploadId, pendingDir);
@@ -607,6 +853,7 @@ transferRouter.post('/api/upload/complete', async (req, res, next) => {
           averageSpeed: result.averageSpeed,
           pending: result.pending,
           transferId: result.transferId,
+          savedAs: result.savedAs || null,
         },
       });
     }
@@ -618,14 +865,20 @@ transferRouter.post('/api/upload/complete', async (req, res, next) => {
       sender = result.sender || resolveSender(req);
     }
 
-    const record = runtime.pendingUploadManager.createPending({
+    const recordParams = {
       fileName: result.fileName,
       fileSize: result.size,
       mimeType: result.mimeType || 'application/octet-stream',
       tempPath: result.filePath,
       sender,
       quotaAlreadyReserved: true,
-    });
+    };
+
+    // A consented session already carries the whole-file checksum the client
+    // declared and `complete` verified it, so the file can be saved directly.
+    const record = preApproved
+      ? await runtime.pendingUploadManager.createPreApproved(recordParams)
+      : runtime.pendingUploadManager.createPending(recordParams);
 
     const outcomeData = {
       fileName: result.fileName,
@@ -634,13 +887,14 @@ transferRouter.post('/api/upload/complete', async (req, res, next) => {
       averageSpeed: result.averageSpeed,
       pending: record,
       transferId: record.transferId,
+      savedAs: preApproved ? record.fileName : null,
       filePath: result.filePath,
     };
 
     runtime.chunkedUploadManager.recordCompletedOutcome(uploadId, outcomeData);
 
     const wss = req.app.get('wss');
-    if (wss) {
+    if (wss && !preApproved) {
       broadcastEvent(wss, 'upload:request', { pending: record });
     }
 
@@ -653,6 +907,7 @@ transferRouter.post('/api/upload/complete', async (req, res, next) => {
         averageSpeed: outcomeData.averageSpeed,
         pending: outcomeData.pending,
         transferId: outcomeData.transferId,
+        savedAs: outcomeData.savedAs,
       },
     });
   } catch (error) {

@@ -53,112 +53,123 @@ describe('Upload Approval & Decision Integration Tests', () => {
     }
   });
 
-  it('should stage mobile upload in pending area until PC user accepts', async () => {
-    const formData = new FormData();
+  it('should keep a mobile upload off disk until the host approves the offer', async () => {
     const payload = 'SECRET_PHOTO_PAYLOAD_12345';
-    formData.append('files', new Blob([payload], { type: 'text/plain' }), 'photo_from_phone.jpg');
+    const expectedFinalPath = path.join(uploadDir, 'photo_from_phone.jpg');
 
-    // 1. Mobile uploads file
-    const uploadRes = await fetch(`${baseUrl}/api/upload`, {
+    // 1. The phone announces what it wants to send. No payload moves yet.
+    const offerRes = await fetch(`${baseUrl}/api/transfer/offer`, {
       method: 'POST',
       headers: {
+        'Content-Type': 'application/json',
         'x-device-id': 'dev_phone_1',
         'x-device-name': 'Pixel Phone',
         'x-platform': 'android',
       },
-      body: formData,
+      body: JSON.stringify({
+        files: [{ name: 'photo_from_phone.jpg', size: payload.length, mimeType: 'text/plain' }],
+      }),
     });
+    assert.equal(offerRes.status, 201);
+    const offer = (await offerRes.json()).data.offer;
+    assert.equal(offer.state, 'pending');
+    // The device label is display-only and must never be treated as identity.
+    assert.equal(offer.sender.label, 'Pixel Phone');
+    assert.equal(offer.sender.labelUntrusted, true);
 
-    assert.equal(uploadRes.status, 201);
-    const uploadBody = await uploadRes.json();
-    assert.equal(uploadBody.success, true);
-    assert.ok(uploadBody.data.pending);
-    const pendingItem = uploadBody.data.pending[0];
-    const transferId = pendingItem.transferId;
-    assert.ok(transferId);
-
-    // File should NOT yet be in uploadDir
-    const expectedFinalPath = path.join(uploadDir, 'photo_from_phone.jpg');
+    // 2. The host can see the offer, and nothing has reached the receive dir.
+    const offersRes = await fetch(`${baseUrl}/api/transfer/offers`, { headers: hostHeaders });
+    assert.equal(offersRes.status, 200);
+    assert.ok((await offersRes.json()).data.some((o) => o.offerId === offer.offerId));
     assert.equal(
       fs.existsSync(expectedFinalPath),
       false,
-      'File must not be in uploadDir before acceptance'
+      'File must not be in uploadDir before the host approves'
     );
 
-    // 2. PC fetches pending list
-    const pendingRes = await fetch(`${baseUrl}/api/upload/pending`, { headers: hostHeaders });
-    assert.equal(pendingRes.status, 200);
-    const pendingList = await pendingRes.json();
-    assert.ok(pendingList.data.some((p) => p.transferId === transferId));
-
-    // 3. PC clicks Accept
-    const decisionRes = await fetch(`${baseUrl}/api/upload/decision`, {
+    // 3. The host approves this file, which issues the grant that unlocks the write path.
+    const decisionRes = await fetch(`${baseUrl}/api/transfer/offer/decision`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...hostHeaders },
       body: JSON.stringify({
-        transferId,
-        action: 'accept',
+        offerId: offer.offerId,
+        decisions: [{ index: 0, action: 'approve' }],
       }),
     });
-
     assert.equal(decisionRes.status, 200);
-    const decisionBody = await decisionRes.json();
-    assert.equal(decisionBody.success, true);
-    assert.equal(decisionBody.data.fileName, 'photo_from_phone.jpg');
+    const grantId = (await decisionRes.json()).data.decisions[0].grantId;
+    assert.ok(grantId);
 
-    // File now exists in uploadDir
-    assert.ok(fs.existsSync(expectedFinalPath), 'File must exist in uploadDir after acceptance');
-    const savedContent = await fs.promises.readFile(expectedFinalPath, 'utf8');
-    assert.equal(savedContent, payload);
-
-    // Pending list is now cleared of this item
-    const pendingResAfter = await fetch(`${baseUrl}/api/upload/pending`, { headers: hostHeaders });
-    const pendingListAfter = await pendingResAfter.json();
-    assert.ok(!pendingListAfter.data.some((p) => p.transferId === transferId));
-  });
-
-  it('should immediately delete file and reject when PC user declines', async () => {
+    // 4. Only now can the payload move.
     const formData = new FormData();
-    const payload = 'UNWANTED_SPAM_FILE_DATA';
-    formData.append('files', new Blob([payload], { type: 'text/plain' }), 'unwanted_file.exe');
-
+    formData.append('files', new Blob([payload], { type: 'text/plain' }), 'photo_from_phone.jpg');
     const uploadRes = await fetch(`${baseUrl}/api/upload`, {
       method: 'POST',
+      headers: { 'X-Transfer-Grant': grantId },
       body: formData,
     });
+    assert.equal(uploadRes.status, 201);
 
-    const uploadBody = await uploadRes.json();
-    const transferId = uploadBody.data.pending[0].transferId;
+    // Consent already happened, so the file is saved rather than queued for a second prompt.
+    assert.ok(fs.existsSync(expectedFinalPath), 'File must exist in uploadDir once approved');
+    assert.equal(await fs.promises.readFile(expectedFinalPath, 'utf8'), payload);
+    assert.equal((await uploadRes.json()).data.pending.length, 0);
+  });
 
-    // PC declines
-    const decisionRes = await fetch(`${baseUrl}/api/upload/decision`, {
+  it('should reject a file at offer time so no payload is ever written', async () => {
+    const payload = 'UNWANTED_SPAM_FILE_DATA';
+    const expectedFinalPath = path.join(uploadDir, 'unwanted_file.exe');
+
+    const offerRes = await fetch(`${baseUrl}/api/transfer/offer`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ files: [{ name: 'unwanted_file.exe', size: payload.length }] }),
+    });
+    const offer = (await offerRes.json()).data.offer;
+
+    // The host rejects this file; no grant is issued for it.
+    const decisionRes = await fetch(`${baseUrl}/api/transfer/offer/decision`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...hostHeaders },
       body: JSON.stringify({
-        transferId,
-        action: 'decline',
+        offerId: offer.offerId,
+        decisions: [{ index: 0, action: 'reject' }],
       }),
     });
-
     assert.equal(decisionRes.status, 200);
-    const decisionBody = await decisionRes.json();
-    assert.equal(decisionBody.data.declined, true);
+    const decision = (await decisionRes.json()).data.decisions[0];
+    assert.equal(decision.decision, 'rejected');
+    assert.equal(decision.grantId, null);
 
-    // Verify file does not exist in uploadDir
-    const expectedFinalPath = path.join(uploadDir, 'unwanted_file.exe');
+    // Without a grant the upload is refused at the gate, before Multer parses anything.
+    const formData = new FormData();
+    formData.append('files', new Blob([payload]), 'unwanted_file.exe');
+    const uploadRes = await fetch(`${baseUrl}/api/upload`, { method: 'POST', body: formData });
+    assert.equal(uploadRes.status, 428);
+    assert.equal((await uploadRes.json()).error.code, 'TRANSFER_GRANT_REQUIRED');
+
     assert.equal(fs.existsSync(expectedFinalPath), false);
+    const pendingDir = path.join(tempDir, 'pending');
+    const staged = fs.existsSync(pendingDir) ? await fs.promises.readdir(pendingDir) : [];
+    assert.equal(
+      staged.some((name) => name.includes('unwanted_file')),
+      false,
+      'a rejected file must not reach temp staging'
+    );
   });
 
-  it('should handle chunked upload complete staging and approval flow', async () => {
+  it('should stage a host chunked upload in pending until the host accepts', async () => {
     const origChunkSize = runtime.config.chunkSize;
     runtime.config.chunkSize = 25; // 25 bytes per chunk
 
     try {
       const chunkData = Buffer.from('Chunked_Payload_Data_123456'); // 27 bytes -> 2 chunks
       const checksum = crypto.createHash('sha256').update(chunkData).digest('hex');
+      // Host authority bypasses consent: the host is not asked to approve itself,
+      // so this flow keeps exercising the pending + accept path.
       const initRes = await fetch(`${baseUrl}/api/upload/init`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...hostHeaders },
         body: JSON.stringify({
           fileName: 'large_recording.mp4',
           fileSize: chunkData.length,

@@ -3,7 +3,7 @@
  * Network-first for API transfers & WebSocket, cache-first for app shell.
  */
 
-const CACHE_NAME = 'utrans-shell-v6';
+const CACHE_NAME = 'utrans-shell-v7';
 
 const STATIC_ASSETS = [
   '/',

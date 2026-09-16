@@ -88,8 +88,8 @@ describe('PWA & Static Assets (Unit)', () => {
     it('caches the session-aware api client in the shell', () => {
       const swCode = fs.readFileSync(swPath, 'utf8');
       assert.ok(swCode.includes("'/js/api.js'"), 'api.js is part of the cached shell');
-      assert.ok(swCode.includes('utrans-shell-v6'), 'shell cache version is bumped to v6');
-      assert.equal(swCode.includes('utrans-shell-v5'), false, 'old v5 shell cache version is gone');
+      assert.ok(swCode.includes('utrans-shell-v7'), 'shell cache version is bumped to v7');
+      assert.equal(swCode.includes('utrans-shell-v6'), false, 'old v6 shell cache version is gone');
       assert.equal(swCode.includes('utrans-shell-v3'), false, 'old shell cache version is gone');
     });
   });

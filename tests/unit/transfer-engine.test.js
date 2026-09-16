@@ -3,6 +3,42 @@ import assert from 'node:assert/strict';
 import { TransferEngine } from '../../public/js/transfer.js';
 import { formatEta } from '../../public/js/utils.js';
 
+/**
+ * Uploading now waits on host consent (UT-012). Cases in this file are about queue
+ * mechanics rather than consent, so they run the handshake against a stub that
+ * approves everything — the real gate is covered in transfer-consent-engine.test.js.
+ * @param {TransferEngine} target
+ * @param {Array<object>} files
+ */
+async function addApprovedFiles(target, files) {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 201,
+    json: async () => ({
+      success: true,
+      data: {
+        offer: { offerId: `of_${Math.random().toString(36).slice(2)}`, state: 'decided' },
+        autoApproved: false,
+        decisions: files.map((entry, index) => ({
+          index,
+          name: entry.name,
+          size: entry.size,
+          decision: 'approved',
+          grantId: `gr_${index}_${Math.random().toString(36).slice(2)}`,
+        })),
+      },
+    }),
+  });
+  try {
+    const tasks = target.addFiles(files);
+    await new Promise((resolve) => setImmediate(resolve));
+    return tasks;
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
 describe('TransferEngine (Unit)', () => {
   let engine;
 
@@ -74,11 +110,11 @@ describe('TransferEngine (Unit)', () => {
     assert.equal(task.etaFormatted, '4s');
   });
 
-  it('should handle cancel and pause states', () => {
+  it('should handle cancel and pause states', async () => {
     const mockFile = { name: 'doc.pdf', size: 1000, type: 'application/pdf' };
     engine._startUpload = () => new Promise(() => {}); // never resolves
 
-    const [task] = engine.addFiles([mockFile]);
+    const [task] = await addApprovedFiles(engine, [mockFile]);
     assert.equal(task.status, 'uploading');
 
     engine.pause(task.id);
@@ -141,7 +177,7 @@ describe('TransferEngine (Unit)', () => {
       { name: 'f5.txt', size: 100 },
     ];
 
-    engine2.addFiles(files);
+    await addApprovedFiles(engine2, files);
     assert.equal(engine2.activeTransfers.size, 2);
     assert.equal(engine2.queue.length, 3);
 

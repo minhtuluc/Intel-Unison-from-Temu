@@ -9,6 +9,16 @@ import { startServer } from '../../src/server.js';
 import { TransferEngine, computeFileSha256 } from '../../public/js/transfer.js';
 import { IncrementalSha256 } from '../../public/js/utils.js';
 
+/**
+ * M2 QC Review Regression Suite (R1 to R13).
+ *
+ * UT-012 (M3) put a host-consent gate in front of every upload write path. These
+ * cases exist to lock down M2's concurrency, quota, atomicity and integrity
+ * behaviour, which is orthogonal to consent, so they reach that pipeline through
+ * host authority — a real, supported path in which the host does not approve
+ * itself. The gate itself is covered by its own negative tests in
+ * `upload-approval.test.js` and by the UT-012 cases in this suite's R14 block.
+ */
 describe('M2 QC Review Regression Suite (R1 to R13)', () => {
   let tempDir;
   let uploadDir;
@@ -79,7 +89,7 @@ describe('M2 QC Review Regression Suite (R1 to R13)', () => {
         // 1. Init
         const initRes = await fetch(`${baseUrl}/api/upload/init`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', ...hostHeaders },
           body: JSON.stringify({
             fileName: 'concurrent_complete.bin',
             fileSize: totalSize,
@@ -160,7 +170,7 @@ describe('M2 QC Review Regression Suite (R1 to R13)', () => {
         const hash = crypto.createHash('sha256').update(chunk1).digest('hex');
         const initRes = await fetch(`${baseUrl}/api/upload/init`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', ...hostHeaders },
           body: JSON.stringify({
             fileName: 'complete_vs_cancel.bin',
             fileSize: 10,
@@ -222,7 +232,7 @@ describe('M2 QC Review Regression Suite (R1 to R13)', () => {
       // Float
       const resFloat = await fetch(`${baseUrl}/api/upload/init`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...hostHeaders },
         body: JSON.stringify({ fileName: 'test.bin', fileSize: 12.34, checksum: validChecksum }),
       });
       assert.equal(resFloat.status, 400);
@@ -232,7 +242,7 @@ describe('M2 QC Review Regression Suite (R1 to R13)', () => {
       // Negative
       const resNeg = await fetch(`${baseUrl}/api/upload/init`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...hostHeaders },
         body: JSON.stringify({ fileName: 'test.bin', fileSize: -500, checksum: validChecksum }),
       });
       assert.equal(resNeg.status, 400);
@@ -240,7 +250,7 @@ describe('M2 QC Review Regression Suite (R1 to R13)', () => {
       // String non-number
       const resStr = await fetch(`${baseUrl}/api/upload/init`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...hostHeaders },
         body: JSON.stringify({
           fileName: 'test.bin',
           fileSize: 'not-a-number',
@@ -261,7 +271,7 @@ describe('M2 QC Review Regression Suite (R1 to R13)', () => {
         // Init with valid expected checksum
         const initRes = await fetch(`${baseUrl}/api/upload/init`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', ...hostHeaders },
           body: JSON.stringify({
             fileName: 'tampered.bin',
             fileSize: 10,
@@ -310,11 +320,12 @@ describe('M2 QC Review Regression Suite (R1 to R13)', () => {
 
       try {
         const tightUrl = `http://127.0.0.1:${tightServer.server.address().port}`;
+        const tightHost = { 'X-Host-Token': tightServer.app.locals.hostAuth.token };
 
         // Attempt to initialize upload of 600 bytes
         const resInit = await fetch(`${tightUrl}/api/upload/init`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', ...tightHost },
           body: JSON.stringify({
             fileName: 'too_big_for_quota.bin',
             fileSize: 600,
@@ -330,6 +341,7 @@ describe('M2 QC Review Regression Suite (R1 to R13)', () => {
         formData.append('files', new Blob([Buffer.alloc(600, 'X')]), 'too_big_simple.bin');
         const resSimple = await fetch(`${tightUrl}/api/upload`, {
           method: 'POST',
+          headers: { ...tightHost },
           body: formData,
         });
         assert.equal(resSimple.status, 507);
@@ -418,11 +430,12 @@ describe('M2 QC Review Regression Suite (R1 to R13)', () => {
 
       try {
         const tightUrl = `http://127.0.0.1:${tightServer.server.address().port}`;
+        const tightHost = { 'X-Host-Token': tightServer.app.locals.hostAuth.token };
 
         // Init transfer 1
         const res1 = await fetch(`${tightUrl}/api/upload/init`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', ...tightHost },
           body: JSON.stringify({ fileName: 'file1.bin', fileSize: 100, checksum: 'a'.repeat(64) }),
         });
         assert.equal(res1.status, 200);
@@ -430,7 +443,7 @@ describe('M2 QC Review Regression Suite (R1 to R13)', () => {
         // Attempt init transfer 2 while transfer 1 is uploading
         const res2 = await fetch(`${tightUrl}/api/upload/init`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', ...tightHost },
           body: JSON.stringify({ fileName: 'file2.bin', fileSize: 100, checksum: 'b'.repeat(64) }),
         });
         assert.equal(res2.status, 429);
@@ -451,7 +464,7 @@ describe('M2 QC Review Regression Suite (R1 to R13)', () => {
       // 1. Session cancel releases quota
       const resInit = await fetch(`${baseUrl}/api/upload/init`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...hostHeaders },
         body: JSON.stringify({
           fileName: 'quota_cancel.bin',
           fileSize: 1000,
@@ -670,36 +683,45 @@ describe('M2 QC Review Regression Suite (R1 to R13)', () => {
       const connIdB = regEventB.data.connectionId;
       assert.notEqual(connIdA, connIdB);
 
-      // Client A performs upload, passing its connectionId in header
-      const formData = new FormData();
-      formData.append('files', new Blob(['Exclusive data for Client A']), 'client_a_exclusive.txt');
-      const uploadRes = await fetch(`${baseUrl}/api/upload`, {
+      // Client A announces a file, passing its connectionId in header
+      const exclusiveBody = 'Exclusive data for Client A';
+      const offerRes = await fetch(`${baseUrl}/api/transfer/offer`, {
         method: 'POST',
-        headers: { 'X-Connection-Id': connIdA },
-        body: formData,
+        headers: { 'Content-Type': 'application/json', 'X-Connection-Id': connIdA },
+        body: JSON.stringify({
+          files: [{ name: 'client_a_exclusive.txt', size: exclusiveBody.length }],
+        }),
       });
-      assert.equal(uploadRes.status, 201);
-      const { pending } = (await uploadRes.json()).data;
-      const transferId = pending[0].transferId;
+      assert.equal(offerRes.status, 201);
+      const offerId = (await offerRes.json()).data.offer.offerId;
 
-      // Host approves Client A's upload
-      await fetch(`${baseUrl}/api/upload/decision`, {
+      // The offer itself is host-only: the sender already knows what it offered,
+      // and other clients must never learn that it happened.
+      assert.equal(
+        eventsA.some((e) => e.event === 'transfer:offer'),
+        false,
+        'Client A must not receive its own offer broadcast'
+      );
+
+      // Host decides on Client A's offer
+      const decisionRes = await fetch(`${baseUrl}/api/transfer/offer/decision`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...hostHeaders },
-        body: JSON.stringify({ transferId, action: 'accept' }),
+        body: JSON.stringify({ offerId, decisions: [{ index: 0, action: 'approve' }] }),
       });
+      assert.equal(decisionRes.status, 200);
 
       await new Promise((r) => setTimeout(r, 100));
 
-      // Client A must receive transfer:complete
-      const completeForA = eventsA.find(
-        (e) => e.event === 'transfer:complete' && e.data?.transferId === transferId
+      // Client A must receive the decision for its own offer
+      const decisionForA = eventsA.find(
+        (e) => e.event === 'transfer:offer:decision' && e.data?.offerId === offerId
       );
-      assert.ok(completeForA, 'Client A must receive transfer:complete event');
+      assert.ok(decisionForA, 'Client A must receive transfer:offer:decision');
 
-      // Client B must NOT receive any event for Client A's transfer
-      const eventForB = eventsB.find((e) => e.data?.transferId === transferId);
-      assert.equal(eventForB, undefined, 'Client B must NOT receive terminal events for Client A');
+      // Client B must NOT receive any event about Client A's offer
+      const eventForB = eventsB.find((e) => e.data?.offerId === offerId);
+      assert.equal(eventForB, undefined, 'Client B must NOT receive events for Client A');
 
       wsClientA.close();
       wsClientB.close();
@@ -886,11 +908,12 @@ describe('M2 QC Review Regression Suite (R1 to R13)', () => {
 
       try {
         const tightUrl = `http://127.0.0.1:${tightServer.server.address().port}`;
+        const tightHost = { 'X-Host-Token': tightServer.app.locals.hostAuth.token };
 
         // Init chunked transfer 1 (occupies the single slot)
         const initRes = await fetch(`${tightUrl}/api/upload/init`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', ...tightHost },
           body: JSON.stringify({
             fileName: 'slot_holder.bin',
             fileSize: 100,
@@ -905,6 +928,7 @@ describe('M2 QC Review Regression Suite (R1 to R13)', () => {
         const blockedRes = await fetch(`${tightUrl}/api/upload`, {
           method: 'POST',
           body: form,
+          headers: { ...tightHost },
         });
         assert.equal(blockedRes.status, 429);
         const errJson = await blockedRes.json();
@@ -948,7 +972,10 @@ describe('M2 QC Review Regression Suite (R1 to R13)', () => {
         // Requesting 300 bytes must be rejected with 507 STORAGE_QUOTA_EXCEEDED (800 + 300 > 1000)
         const initRes = await fetch(`${reconUrl}/api/upload/init`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Host-Token': reconServer.app.locals.hostAuth.token,
+          },
           body: JSON.stringify({
             fileName: 'excess.bin',
             fileSize: 300,
@@ -989,6 +1016,7 @@ describe('M2 QC Review Regression Suite (R1 to R13)', () => {
         const uploadRes = await fetch(`${tightUrl}/api/upload`, {
           method: 'POST',
           body: form,
+          headers: { 'X-Host-Token': tightServer.app.locals.hostAuth.token },
         });
 
         // Must reject with 507 STORAGE_QUOTA_EXCEEDED
@@ -1027,7 +1055,7 @@ describe('M2 QC Review Regression Suite (R1 to R13)', () => {
         // 1. Init
         const initRes = await fetch(`${baseUrl}/api/upload/init`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', ...hostHeaders },
           body: JSON.stringify({
             fileName: 'retry_complete.bin',
             fileSize: 10,
@@ -1127,13 +1155,13 @@ describe('M2 QC Review Regression Suite (R1 to R13)', () => {
   // R8 — P1 / frontend delivery: Service Worker Cache Lifecycle
   // ==========================================
   describe('R8: Service Worker cache version and update lifecycle', () => {
-    it('public/sw.js defines CACHE_NAME as utrans-shell-v6 and purges v5 on activation', async () => {
+    it('public/sw.js defines CACHE_NAME as utrans-shell-v7 and purges v6 on activation', async () => {
       const swPath = path.resolve('public/sw.js');
       const swContent = await fs.promises.readFile(swPath, 'utf8');
 
-      // Verify CACHE_NAME is updated to v6
-      assert.match(swContent, /CACHE_NAME\s*=\s*['"]utrans-shell-v6['"]/);
-      assert.doesNotMatch(swContent, /CACHE_NAME\s*=\s*['"]utrans-shell-v5['"]/);
+      // Verify CACHE_NAME is bumped whenever the shell changes (M3 raised it to v7).
+      assert.match(swContent, /CACHE_NAME\s*=\s*['"]utrans-shell-v7['"]/);
+      assert.doesNotMatch(swContent, /CACHE_NAME\s*=\s*['"]utrans-shell-v6['"]/);
 
       // Verify activation logic purges non-current caches
       assert.match(swContent, /caches\.delete\(key\)/);
@@ -1164,7 +1192,7 @@ describe('M2 QC Review Regression Suite (R1 to R13)', () => {
 
         const res = await fetch(`${baseUrl}/api/upload/init`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', ...hostHeaders },
           body: JSON.stringify(body),
         });
 
@@ -1182,7 +1210,7 @@ describe('M2 QC Review Regression Suite (R1 to R13)', () => {
       const upperHex = 'A'.repeat(64);
       const res = await fetch(`${baseUrl}/api/upload/init`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...hostHeaders },
         body: JSON.stringify({
           fileName: 'upper_hex.bin',
           fileSize: 10,
@@ -1212,10 +1240,13 @@ describe('M2 QC Review Regression Suite (R1 to R13)', () => {
       const form = new FormData();
       form.append('files', new Blob(['test payload']), 'spoof_test.txt');
 
+      // Host authority clears the consent gate so this reaches resolveSender, which
+      // is what rejects the spoofed id — the assertion below is about that check.
       const res = await fetch(`${baseUrl}/api/upload`, {
         method: 'POST',
         headers: {
           'X-Connection-Id': 'fake-non-existent-conn-id-999',
+          ...hostHeaders,
         },
         body: form,
       });
@@ -1285,6 +1316,7 @@ describe('M2 QC Review Regression Suite (R1 to R13)', () => {
 
       try {
         const testUrl = `http://127.0.0.1:${sameNameServer.server.address().port}`;
+        const sameNameHost = { 'X-Host-Token': sameNameServer.app.locals.hostAuth.token };
         const count = 10;
         const payloads = [];
         const expectedHashes = new Set();
@@ -1302,6 +1334,7 @@ describe('M2 QC Review Regression Suite (R1 to R13)', () => {
           const res = await fetch(`${testUrl}/api/upload`, {
             method: 'POST',
             body: form,
+            headers: { ...sameNameHost },
           });
           assert.equal(res.status, 201, `Upload #${idx} must return 201`);
           const json = await res.json();
@@ -1444,25 +1477,54 @@ describe('M2 QC Review Regression Suite (R1 to R13)', () => {
         const connIdB = regB.data.connectionId;
         assert.notEqual(connIdA, connIdB);
 
-        // 5. Spoof probe: Client B attempts upload using its sessionTokenB, but spoofing Client A's connectionId
+        // 5. The host consents to a file B will legitimately send. Two independent
+        //    mechanisms then bind that consent to B: the grant carries B's
+        //    connectionId, and resolveSender validates any claimed connectionId.
+        const legitBody = 'legitimate B payload';
+        const offerRes = await fetch(`${pinUrl}/api/transfer/offer`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Session-Token': tokenB,
+            'X-Connection-Id': connIdB,
+          },
+          body: JSON.stringify({ files: [{ name: 'legit_b.txt', size: legitBody.length }] }),
+        });
+        assert.equal(offerRes.status, 201);
+        const offerId = (await offerRes.json()).data.offer.offerId;
+
+        const approveRes = await fetch(`${pinUrl}/api/transfer/offer/decision`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Host-Token': pinServer.app.locals.hostAuth.token,
+          },
+          body: JSON.stringify({ offerId, decisions: [{ index: 0, action: 'approve' }] }),
+        });
+        assert.equal(approveRes.status, 200);
+        const grantB = (await approveRes.json()).data.decisions[0].grantId;
+        assert.ok(grantB);
+
+        // 6. Spoof probe: B spends its own grant while claiming A's connectionId.
         const formSpoof = new FormData();
-        formSpoof.append('files', new Blob(['spoofed payload']), 'spoof.txt');
+        formSpoof.append('files', new Blob([legitBody]), 'legit_b.txt');
 
         const spoofRes = await fetch(`${pinUrl}/api/upload`, {
           method: 'POST',
           headers: {
             'X-Session-Token': tokenB, // Authenticated as B
             'X-Connection-Id': connIdA, // Claiming to be A
+            'X-Transfer-Grant': grantB,
           },
           body: formSpoof,
         });
 
-        // Server MUST reject with 403 INVALID_CONNECTION_ID
+        // The grant is bound to B, so presenting it as A is refused.
         assert.equal(spoofRes.status, 403, 'Cross-session spoofed connectionId must return 403');
         const spoofJson = await spoofRes.json();
-        assert.equal(spoofJson.error.code, 'INVALID_CONNECTION_ID');
+        assert.equal(spoofJson.error.code, 'TRANSFER_GRANT_INVALID');
 
-        // A forged host capability must not bypass the connection/session binding.
+        // A forged host capability must not unlock the write path either.
         const formForgedHost = new FormData();
         formForgedHost.append('files', new Blob(['forged host payload']), 'forged_host.txt');
         const forgedHostRes = await fetch(`${pinUrl}/api/upload`, {
@@ -1476,11 +1538,12 @@ describe('M2 QC Review Regression Suite (R1 to R13)', () => {
         });
         assert.equal(
           forgedHostRes.status,
-          403,
-          'Forged host token must not bypass session binding'
+          428,
+          'Forged host token must not bypass the consent gate'
         );
+        assert.equal((await forgedHostRes.json()).error.code, 'TRANSFER_GRANT_REQUIRED');
 
-        // 6. Fail-closed probe: Upload without session token claiming connectionIdA
+        // 7. Fail-closed probe: Upload without session token claiming connectionIdA
         const formNoToken = new FormData();
         formNoToken.append('files', new Blob(['no token payload']), 'notoken.txt');
 
@@ -1493,22 +1556,23 @@ describe('M2 QC Review Regression Suite (R1 to R13)', () => {
         });
         assert.ok([401, 403].includes(noTokenRes.status), 'Missing session token must be rejected');
 
-        // 7. Verify Client A never received any upload event or notification
+        // 8. Verify Client A never received any event from the spoofed requests
         assert.equal(
           eventsA.filter((e) => e.event.startsWith('transfer:')).length,
           0,
           'Client A must receive zero transfer events from spoofed requests'
         );
 
-        // 8. Legitimate upload: Client B uploads with its own tokenB and connectionIdB
+        // 9. Legitimate upload: Client B uploads with its own tokenB and connectionIdB
         const formLegit = new FormData();
-        formLegit.append('files', new Blob(['legitimate B payload']), 'legit_b.txt');
+        formLegit.append('files', new Blob([legitBody]), 'legit_b.txt');
 
         const legitRes = await fetch(`${pinUrl}/api/upload`, {
           method: 'POST',
           headers: {
             'X-Session-Token': tokenB,
             'X-Connection-Id': connIdB,
+            'X-Transfer-Grant': grantB,
           },
           body: formLegit,
         });

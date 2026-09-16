@@ -123,6 +123,12 @@ export function handleWsMessage(wss, ws, rawMessage) {
   }
 }
 
+/**
+ * Events that describe a host-only decision. Clients must never receive these:
+ * seeing another device's pending approval is itself an information leak.
+ */
+const HOST_ONLY_EVENTS = new Set(['upload:request', 'transfer:offer']);
+
 export function broadcastEvent(wss, event, data, filterOrExclude = null) {
   if (!wss || !wss.clients) return;
 
@@ -139,7 +145,7 @@ export function broadcastEvent(wss, event, data, filterOrExclude = null) {
     } else if (client.authorized === false) {
       continue;
     }
-    if (event === 'upload:request' && !client.isHost) continue;
+    if (HOST_ONLY_EVENTS.has(event) && !client.isHost) continue;
 
     // Filter check
     if (typeof filterOrExclude === 'function') {

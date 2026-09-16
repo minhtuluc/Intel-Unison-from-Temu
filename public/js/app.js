@@ -31,6 +31,8 @@ class App {
     this.deferredPrompt = null;
     this.isHost = false;
     this.pendingApprovals = [];
+    // Batches announced by senders (UT-012). Consent happens here, before any bytes.
+    this.pendingOffers = [];
   }
 
   async init() {
@@ -724,6 +726,144 @@ class App {
     }
   }
 
+  /**
+   * Consent dialog for one batch. The host sees name/size/type for each file and
+   * decides per file, because agreeing to a batch is not agreeing to every item in it.
+   */
+  _showOfferModal(offer) {
+    if (!offer || !this.isHost) return;
+
+    if (navigator.vibrate) {
+      navigator.vibrate([100, 50, 100]);
+    }
+
+    const senderTitle = offer.sender?.label || 'A device';
+    const selected = new Set(offer.files.map((file) => file.index));
+    const trustCheckbox = createElement('input', { type: 'checkbox', id: 'offer-trust-device' });
+
+    const fileRows = offer.files.map((file) =>
+      createElement('label', { class: 'offer-file-row' }, [
+        createElement('input', {
+          type: 'checkbox',
+          checked: true,
+          onchange: (event) => {
+            if (event.target.checked) selected.add(file.index);
+            else selected.delete(file.index);
+          },
+        }),
+        createElement('div', { class: 'offer-file-text' }, [
+          createElement('div', { class: 'approval-file-name' }, file.name),
+          createElement(
+            'div',
+            { class: 'approval-file-meta' },
+            `${formatFileSize(file.size)} • ${file.mimeType || 'file'}`
+          ),
+        ]),
+      ])
+    );
+
+    const content = createElement('div', { class: 'approval-modal-body' }, [
+      createElement(
+        'h4',
+        { style: 'margin-bottom: var(--space-1);' },
+        `${senderTitle} wants to send ${offer.files.length} file${offer.files.length === 1 ? '' : 's'}:`
+      ),
+      createElement('div', { class: 'offer-file-list' }, fileRows),
+      createElement(
+        'p',
+        { style: 'font-size: var(--font-size-xs); color: var(--color-text-secondary);' },
+        'Approved files transfer straight to your Downloads folder. Nothing is sent until you decide.'
+      ),
+      createElement('label', { class: 'offer-trust-row' }, [
+        trustCheckbox,
+        createElement(
+          'span',
+          {},
+          'Remember this device and skip this prompt next time (revocable in Settings)'
+        ),
+      ]),
+      createElement('div', { class: 'approval-actions' }, [
+        createElement(
+          'button',
+          {
+            class: 'btn btn--danger',
+            onclick: async () => {
+              closeModal();
+              await this._submitOfferDecision(
+                offer.offerId,
+                offer.files.map((file) => ({ index: file.index, action: 'reject' })),
+                trustCheckbox.checked
+              );
+            },
+          },
+          'Decline All'
+        ),
+        createElement(
+          'button',
+          {
+            class: 'btn btn--primary',
+            onclick: async () => {
+              closeModal();
+              await this._submitOfferDecision(
+                offer.offerId,
+                offer.files.map((file) => ({
+                  index: file.index,
+                  action: selected.has(file.index) ? 'approve' : 'reject',
+                })),
+                trustCheckbox.checked
+              );
+            },
+          },
+          'Approve Selected'
+        ),
+      ]),
+    ]);
+
+    showModal({
+      title: 'Incoming File Transfer',
+      contentNode: content,
+      actions: [],
+    });
+  }
+
+  async _submitOfferDecision(offerId, decisions, trustDevice = false) {
+    try {
+      const res = await apiFetch('/api/transfer/offer/decision', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...hostHeaders() },
+        body: JSON.stringify({ offerId, decisions, trustDevice }),
+      });
+      if (!res.ok) throw new Error(`Decision error: ${res.status}`);
+
+      const approved = decisions.filter((d) => d.action === 'approve').length;
+      if (approved === 0) {
+        showToast({ message: 'Transfer declined', type: 'warning' });
+      } else {
+        showToast({
+          message: `Approved ${approved} of ${decisions.length} file(s)`,
+          type: 'success',
+        });
+      }
+    } catch (err) {
+      showToast({ message: `Error processing transfer: ${err.message}`, type: 'danger' });
+    } finally {
+      await this._loadPendingOffers();
+    }
+  }
+
+  async _loadPendingOffers() {
+    if (!this.isHost) return;
+    try {
+      const res = await apiFetch('/api/transfer/offers', { headers: hostHeaders() });
+      if (!res.ok) return;
+      const body = await res.json();
+      this.pendingOffers = body.data || [];
+      if (this.pendingOffers.length) this._showOfferModal(this.pendingOffers[0]);
+    } catch {
+      // Reconnect registration will retry the authoritative offer list.
+    }
+  }
+
   async _loadPendingApprovals() {
     if (!this.isHost) return;
     try {
@@ -947,6 +1087,26 @@ class App {
       }
     });
 
+    // A sender announced a batch; nothing has been written yet (UT-012).
+    connection.on('transfer:offer', (data) => {
+      if (this.isHost && data?.offer) {
+        if (!this.pendingOffers.some((o) => o.offerId === data.offer.offerId)) {
+          this.pendingOffers.push(data.offer);
+        }
+        this._showOfferModal(this.pendingOffers[0]);
+      }
+    });
+
+    connection.on('transfer:offer:decision', (data) => {
+      transferEngine.handleWebSocketEvent('transfer:offer:decision', data);
+      if (this.isHost) this._loadPendingOffers();
+    });
+
+    connection.on('transfer:offer:expired', (data) => {
+      transferEngine.handleWebSocketEvent('transfer:offer:expired', data);
+      if (this.isHost) this._loadPendingOffers();
+    });
+
     connection.on('client:registered', (data) => {
       this.isHost = data?.device?.isHost === true;
       // Server-issued identity for this connection; used only to flag "This Device".
@@ -956,6 +1116,7 @@ class App {
         transferEngine.connectionId = data.connectionId;
       }
       this._loadPendingApprovals();
+      this._loadPendingOffers();
     });
 
     // Server refused the socket because this client holds no valid capability.
