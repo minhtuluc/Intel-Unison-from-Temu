@@ -208,3 +208,67 @@
    - Integration regression suite: `tests/integration/m3-qc-review-regression.test.js` đạt 9/9 test pass.
 
 **QC status:** Sẵn sàng để QC re-check vòng 3 trên nhánh `m3-core-ux-consent`.
+
+---
+
+## QC vòng 3 — kiểm tra commit `0ef8405`
+
+**Kết luận:** **BLOCK MERGE**. Hai bản vá R2 hoạt động trong các integration test mới có PIN, nhưng request contract của frontend thật không khớp với các giả định trong test. Kết quả là grant vẫn có thể không bind connection và chunked upload mặc định không PIN bị gãy.
+
+### Bằng chứng gate
+
+- `npm run quality`: **435/435 test pass**, 119 suites, 0 fail/skip; coverage local Windows: 90.71% line / 82.06% branch / 88.25% function.
+- `git diff --check origin/main...HEAD`: pass.
+- Hai probe HTTP + WebSocket chạy với request giống frontend shipped, dùng thư mục tạm và đã dọn sau khi chạy.
+
+### M3-QC-R3-01 — Frontend tạo offer không có connection ID, grant vẫn không được bind (P1)
+
+**Bằng chứng:** `TransferEngine._requestConsent()` tại `public/js/transfer.js:167-181` chỉ gửi `Content-Type`; `apiFetch` thêm session/device token nhưng không thêm `X-Connection-Id`. Probe với hai PIN session thực hiện đúng request này:
+
+1. A đăng ký WebSocket nhưng tạo offer không có connection header như frontend.
+2. Host approve; grant trong server có `connectionId: null`.
+3. B gửi đúng tên/cỡ bằng grant đó và connection ID của B.
+4. Kết quả thực tế `POST /api/upload` = **201**, file được ghi vào receive directory; expected 403.
+
+`beginGrant()` chỉ enforce strict binding khi `grant.connectionId` tồn tại, nên fix R2-01 không bảo vệ luồng sản phẩm hiện tại.
+
+**Yêu cầu vá / acceptance criteria:**
+
+1. Frontend phải gửi connection ID đã được server cấp khi tạo offer; server phải từ chối client offer thiếu identity thay vì phát grant unbound (host capability vẫn theo policy riêng).
+2. Không phát grant client có `connectionId: null`; B không tiêu được grant của A kể cả biết grant ID và metadata.
+3. Thêm integration test dùng đúng headers/body của `TransferEngine._requestConsent`, không tự thêm connection header mà production không gửi.
+4. Thêm unit/contract test khẳng định `_requestConsent` thực sự gửi connection ID hiện tại.
+
+### M3-QC-R3-02 — Chunked upload mặc định không PIN bị khóa bởi bản vá owner check (P1)
+
+**Bằng chứng:** cấu hình mặc định `pinRequired: false`, client có WebSocket connection hợp lệ, offer/init thành công. Sau đó gửi đúng request hiện tại của frontend:
+
+- `GET /api/upload/status/:uploadId` không có connection header → **403 `UPLOAD_FORBIDDEN`**.
+- `POST /api/upload/chunk` không có connection header → **403 `UPLOAD_FORBIDDEN`**.
+- `POST /api/upload/cancel` không có connection header → **403 `UPLOAD_FORBIDDEN`**.
+
+Frontend chỉ gắn `X-Connection-Id` cho init và complete (`public/js/transfer.js:466-469`, `:559-566`), không gắn cho chunk/status/cancel (`:675`, `:753`, `:818`, `:847`). Integration test mới chỉ chạy PIN mode, nơi session token che mất sai lệch này.
+
+**Yêu cầu vá / acceptance criteria:**
+
+1. Đồng bộ request contract giữa frontend và server cho cả status/chunk/cancel/complete ở hai chế độ PIN bật và PIN tắt.
+2. Test một chu trình chunked hoàn chỉnh bằng request giống frontend, có WebSocket connection thật, ở **cả no-PIN mặc định và PIN mode**.
+3. Test pause/resume/cancel và reconnect. Với no-PIN, phải quyết định capability nào chứng minh owner sau khi connection ID thay đổi; không dựa vào tên thiết bị hay header không được server bind.
+4. Foreign B vẫn 403 và không thay đổi session; owner A phải upload/đọc status/cancel/complete được trong cấu hình mặc định.
+
+### M3-QC-R3-03 — Foreign chunk bị authorize sau khi body đã vào memory (P2)
+
+`POST /api/upload/chunk` khai báo `parseChunkUpload` trước handler (`src/routes/transfer.js:757`), trong khi `assertChunkSessionOwner` chỉ chạy tại dòng 768. Multer `memoryStorage` vì vậy nhận toàn bộ chunk trước khi biết caller có sở hữu session hay không. Response cuối là 403 và session không bị mutate, nhưng foreign client biết `uploadId` vẫn có thể đẩy chunk qua mạng và chiếm buffer RAM tới giới hạn request.
+
+**Yêu cầu vá / acceptance criteria:**
+
+1. Đưa `uploadId` vào header hoặc URL để authorization chạy trước Multer; nếu giữ bản sao trong multipart body thì hai giá trị phải khớp.
+2. Test chứng minh foreign request bị chặn trước parser/storage callback, không chỉ kiểm `receivedChunks.length === 0` sau khi toàn body đã được nhận.
+3. Giữ tương thích frontend bằng cách cập nhật client và server trong cùng commit, không tăng giới hạn chunk/headroom.
+
+### Trạng thái sau vòng 3
+
+- M3-QC-R2-01: logic service đã fail-closed khi grant có owner, nhưng **luồng frontend chưa bảo đảm grant có owner**; theo dõi bằng M3-QC-R3-01.
+- M3-QC-R2-02: PIN-mode API test đạt, nhưng default no-PIN/frontend contract chưa đạt; theo dõi bằng M3-QC-R3-02 và R3-03.
+
+**QC status:** Changes requested — chưa đủ điều kiện merge vào `main`.
