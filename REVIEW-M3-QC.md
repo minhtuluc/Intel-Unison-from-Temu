@@ -2,6 +2,8 @@
 
 **Branch/commit reviewed:** `m3-core-ux-consent` @ `b0ce319`
 
+**QC recheck:** commit khắc phục `4c3deef` được kiểm tra lại ngày 2026-09-16; xem mục "QC vòng 2" ở cuối tài liệu.
+
 **Kết luận:** **BLOCK MERGE**. M3 có nền tảng tốt và quality runner xanh, nhưng còn các lỗi P1 liên quan đến quyền sở hữu transfer và tính toàn vẹn consent. Theo release gate trong `docs/agents/quality.md`, P1 liên quan mất dữ liệu phải bằng 0 trước khi merge/release.
 
 ## Bằng chứng kiểm thử
@@ -121,3 +123,56 @@
    - Suite hồi quy tích hợp mới: `tests/integration/m3-qc-review-regression.test.js` (8/8 tests pass).
    - `npm run quality`: **434/434 test pass** (118 suites), 0 fail, 0 skipped. Coverage: **90.63% line / 82.11% branch / 88.22% function**.
    - `git diff --check origin/main`: Exit code 0, không có lỗi định dạng hay whitespace.
+
+---
+
+## QC vòng 2 — kiểm tra commit `4c3deef`
+
+**Kết luận:** **BLOCK MERGE**. M3-QC-02, M3-QC-03 và M3-QC-04 đã có regression phù hợp; tuy nhiên M3-QC-01 chưa đạt acceptance, đồng thời chunk session sau bước init chưa được bind với owner.
+
+### Bằng chứng gate
+
+- `npm run quality`: **434/434 test pass**, 118 suites, 0 fail/skip; coverage local Windows: 90.65% line / 82.21% branch / 88.22% function.
+- `git diff --check origin/main...HEAD`: pass.
+- Probe HTTP + WebSocket dùng hai PIN session, dữ liệu hoàn toàn trong thư mục tạm và đã dọn sau khi chạy.
+
+### M3-QC-R2-01 — Session owner vẫn dùng được grant khi thiếu connection ID (P1)
+
+**Bằng chứng:** A đăng ký WebSocket, tạo offer bằng connection ID của A và được host approve. Sau đó chính session A gọi `POST /api/upload` với grant nhưng bỏ `X-Connection-Id`. Kết quả thực tế **201** và file được ghi vào receive directory; acceptance của M3-QC-01 yêu cầu **403 trước khi chạm đĩa**.
+
+**Nguyên nhân:** `src/middleware/transfer-grant.js:95-112` gọi `resolveSender(req)` ở chế độ không bắt buộc, rồi truyền callback `isSessionOwner`. `src/services/transfer-offer.js:309-315` chấp nhận `matchSessionConn` thay cho connection ID hiện tại, nên header thiếu vẫn qua gate.
+
+**Yêu cầu vá / acceptance criteria:**
+
+1. Grant có `connectionId` thì `/api/upload` và `/api/upload/init` bắt buộc nhận connection ID hiện tại đã được server xác minh; thiếu, foreign hoặc forged đều 403.
+2. Session mapping chỉ dùng để xác minh connection ID thuộc session/reconnect, không thay thế hoàn toàn connection ID trên request ghi payload.
+3. Thêm regression cho **owner session + missing header** ở cả simple upload và chunked init; xác nhận không tạo file/session và owner vẫn retry được với connection ID đúng.
+4. Sửa lại Resolution Summary: không tuyên bố "bắt buộc connection ID" cho tới khi hai ca trên pass.
+
+### M3-QC-R2-02 — Chunk session không có authorization sau init (P1)
+
+**Bằng chứng:** A tạo và init chunk session hợp lệ. Session B chỉ cần biết `uploadId` của A:
+
+- `GET /api/upload/status/:uploadId` trả **200**, làm lộ trạng thái/metadata transfer.
+- `POST /api/upload/cancel` trả **200**, `cancelled: true`; B hủy được transfer của A.
+
+Đọc code cho thấy `POST /api/upload/chunk` và `POST /api/upload/complete` cũng không đối chiếu caller với `session.sender`; chỉ có global PIN session gate.
+
+**Nguyên nhân:** grant được kiểm tra ở `/api/upload/init`, nhưng các route `src/routes/transfer.js:712`, `:758`, `:776`, `:797` nhận `uploadId` như capability dùng chung và không xác minh connection/session owner trước khi đọc hoặc mutate chunk session.
+
+**Yêu cầu vá / acceptance criteria:**
+
+1. Bind chunk session với sender đã xác minh tại init; mọi thao tác chunk/status/cancel/complete phải kiểm tra caller là owner hoặc host capability hợp lệ.
+2. Client B biết `uploadId` vẫn phải nhận 403 trên cả bốn route, không đọc metadata, không thêm chunk, không cancel và không complete được session của A.
+3. Owner A vẫn tiếp tục/resume sau reconnect theo policy session ↔ connection đã thống nhất; host bypass chỉ dựa trên host capability thật.
+4. Thêm integration regression dùng hai PIN session cho status, chunk, cancel và complete; kiểm tra B bị từ chối không thay đổi state/đĩa, sau đó A vẫn hoàn tất được transfer.
+
+### Trạng thái sau vòng 2
+
+- M3-QC-02: đạt qua code review + regression hiện có.
+- M3-QC-03: đạt với hai session và reconnect trong phạm vi đã test.
+- M3-QC-04: đạt; batch validation atomic và không phát grant lặp.
+- M3-QC-01: **chưa đạt**, được thay bằng M3-QC-R2-01.
+- Finding mới M3-QC-R2-02: **chưa đạt**.
+
+**QC status:** Changes requested — chưa đủ điều kiện merge vào `main`.
