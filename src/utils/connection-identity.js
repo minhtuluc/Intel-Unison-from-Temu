@@ -104,6 +104,7 @@ export function resolveSender(req, { required = false } = {}) {
           labelUntrusted: true,
           platform: req.headers['x-platform'] || req.body?.platform || 'unknown',
           isHost: isHostReq,
+          sessionToken: reqToken || null,
         };
       }
       throw new AppError('INVALID_CONNECTION_ID', 403, 'Connection ID not found or expired');
@@ -137,5 +138,6 @@ export function resolveSender(req, { required = false } = {}) {
     labelUntrusted: true,
     platform: req.headers['x-platform'] || req.body?.platform || 'unknown',
     isHost: isHostReq,
+    sessionToken: reqToken || null,
   };
 }

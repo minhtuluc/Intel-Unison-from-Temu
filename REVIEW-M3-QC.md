@@ -176,3 +176,35 @@
 - Finding mới M3-QC-R2-02: **chưa đạt**.
 
 **QC status:** Changes requested — chưa đủ điều kiện merge vào `main`.
+
+---
+
+## Kết quả khắc phục QC vòng 2 (Round 2 Resolution Summary)
+
+Đã hoàn thành khắc phục triệt để hai finding P1 của QC vòng 2:
+
+1. **M3-QC-R2-01 (Strict connection ID enforcement for grant owner session):**
+   - File sửa: `src/services/transfer-offer.js`.
+   - Kết quả: Khi `grant.connectionId` tồn tại, `beginGrant(grantId, context)` bắt buộc `context.connectionId` phải có giá trị (`!context.connectionId` ném 403 `TRANSFER_GRANT_INVALID`). Kể cả khi caller sở hữu session token hợp lệ của chính owner, việc thiếu header `X-Connection-Id` sẽ bị từ chối 403 trước khi Multer ghi đĩa hoặc session chunked được khởi tạo.
+   - Khi bị từ chối do thiếu header, grant không bị chuyển sang `in_use` và rightful owner có thể retry kèm `X-Connection-Id` hợp lệ để upload thành công.
+   - Bổ sung integration regression tests cho owner session thiếu header trên cả `/api/upload` (simple upload) và `/api/upload/init` (chunked init).
+
+2. **M3-QC-R2-02 (Chunk session sender binding & authorization post-init):**
+   - File sửa: `src/routes/transfer.js`, `src/services/chunked-upload.js`, `src/utils/connection-identity.js`.
+   - Kết quả:
+     - Tại `POST /api/upload/init`, `session.sender` được ghi nhận với đầy đủ `sessionToken` và `connectionId` đã xác minh.
+     - Hàm kiểm tra quyền sở hữu `assertChunkSessionOwner(req, session)` được áp dụng cho toàn bộ 4 route:
+       - `GET /api/upload/status/:uploadId`
+       - `POST /api/upload/chunk`
+       - `POST /api/upload/cancel`
+       - `POST /api/upload/complete` (cả trong quá trình upload và sau khi đã hoàn tất lưu trong `completedOutcomes`).
+     - Client B dù biết `uploadId` đều nhận 403 `UPLOAD_FORBIDDEN` trên cả 4 route, không đọc được metadata, không upload được chunk, không cancel và không complete được transfer của Client A.
+     - Hỗ trợ reconnect: Client A sau khi ngắt kết nối WebSocket và kết nối lại với cùng session token vẫn được công nhận là owner và tiếp tục upload chunk cũng như hoàn tất transfer thành công.
+     - Host capability (`X-Host-Token`) được bypass hợp lệ để host có thể giám sát trạng thái session.
+
+3. **Bằng chứng kiểm thử & chất lượng:**
+   - `npm run quality`: **435/435 test pass** (119 suites), 0 fail, 0 skipped. Coverage: **90.76% line / 82.01% branch / 88.25% function**.
+   - `git diff --check origin/main`: Exit code 0, không có lỗi định dạng hay whitespace.
+   - Integration regression suite: `tests/integration/m3-qc-review-regression.test.js` đạt 9/9 test pass.
+
+**QC status:** Sẵn sàng để QC re-check vòng 3 trên nhánh `m3-core-ux-consent`.

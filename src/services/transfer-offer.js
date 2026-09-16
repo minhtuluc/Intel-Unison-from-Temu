@@ -305,11 +305,16 @@ export class TransferOfferService {
     if (grant.status === 'in_use') {
       throw new AppError('TRANSFER_GRANT_BUSY', 409, 'Transfer grant is already in use');
     }
-    // A grant authorizes one connection only; a stolen id or missing connection is useless elsewhere (M3-QC-01)
+    // A grant authorizes one connection only; a stolen id or missing connection is useless elsewhere (M3-QC-01 / M3-QC-R2-01)
     if (grant.connectionId) {
-      const matchConn = Boolean(
-        context.connectionId && grant.connectionId === context.connectionId
-      );
+      if (!context.connectionId) {
+        throw new AppError(
+          'TRANSFER_GRANT_INVALID',
+          403,
+          'Transfer grant requires verified connection ID'
+        );
+      }
+      const matchConn = grant.connectionId === context.connectionId;
       const matchSessionConn =
         typeof context.isSessionOwner === 'function' && context.isSessionOwner(grant.connectionId);
       if (!matchConn && !matchSessionConn) {

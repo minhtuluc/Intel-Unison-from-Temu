@@ -272,6 +272,51 @@ function buildOfferDecisionPayload(offerService, offer, autoApproved) {
 }
 
 /**
+ * Verifies that the caller is authorized to view or mutate an active/completed chunk session.
+ * Only host authority or the verified session/connection owner may access it (M3-QC-R2-02).
+ *
+ * @param {import('express').Request} req
+ * @param {object} session
+ * @throws {AppError} 403 UPLOAD_FORBIDDEN if caller is neither host nor the session owner
+ */
+export function assertChunkSessionOwner(req, session) {
+  if (!session || !session.sender) return;
+
+  const hostAuth = req.app.locals.hostAuth || req.app.locals.runtime?.hostAuth;
+  const isHost = Boolean(hostAuth?.verify(req, req.headers['x-host-token']));
+  if (isHost) return;
+
+  const caller = resolveSender(req);
+  const reqToken = extractSessionToken(req);
+  const sessions = req.app.locals.sessions || req.app.locals.runtime?.sessions;
+
+  const ownerSender = session.sender;
+  const isPinRequired = req.app.locals.pinRequired ?? req.app.locals.runtime?.pinRequired ?? false;
+
+  if (isPinRequired || ownerSender.sessionToken || reqToken) {
+    const sessionMatch = Boolean(
+      reqToken && ownerSender.sessionToken && reqToken === ownerSender.sessionToken
+    );
+    const sessionConnMatch = Boolean(
+      reqToken &&
+      ownerSender.connectionId &&
+      sessions?.hasConnection?.(reqToken, ownerSender.connectionId)
+    );
+    if (!sessionMatch && !sessionConnMatch) {
+      throw new AppError('UPLOAD_FORBIDDEN', 403, 'Upload session belongs to another client');
+    }
+    return;
+  }
+
+  // Without PIN, check connection ID
+  if (ownerSender.connectionId) {
+    if (!caller.connectionId || caller.connectionId !== ownerSender.connectionId) {
+      throw new AppError('UPLOAD_FORBIDDEN', 403, 'Upload session belongs to another connection');
+    }
+  }
+}
+
+/**
  * POST /api/transfer/offer
  * Declares a batch the sender intends to upload. No payload moves yet: the host
  * reviews name/size/type and decides per file. A remembered device is approved
@@ -717,6 +762,12 @@ transferRouter.post('/api/upload/chunk', parseChunkUpload, async (req, res, next
       throw new AppError('INVALID_INPUT', 400, 'uploadId and chunkIndex are required');
     }
 
+    const runtime = req.app.locals.runtime;
+    const session = runtime.chunkedUploadManager.sessions.get(uploadId);
+    if (session) {
+      assertChunkSessionOwner(req, session);
+    }
+
     const idx = Number(chunkIndex);
     if (!Number.isInteger(idx) || idx < 0) {
       throw new AppError('INVALID_INPUT', 400, 'chunkIndex must be a non-negative integer');
@@ -726,7 +777,6 @@ transferRouter.post('/api/upload/chunk', parseChunkUpload, async (req, res, next
       throw new AppError('CHUNK_INVALID', 400, 'No chunk data provided');
     }
 
-    const runtime = req.app.locals.runtime;
     if (req.file.size > runtime.config.chunkSize + CHUNK_HEADROOM) {
       throw new AppError(
         'CHUNK_TOO_LARGE',
@@ -758,7 +808,12 @@ transferRouter.post('/api/upload/chunk', parseChunkUpload, async (req, res, next
 transferRouter.get('/api/upload/status/:uploadId', (req, res, next) => {
   try {
     const { uploadId } = req.params;
-    const status = req.app.locals.runtime.chunkedUploadManager.getStatus(uploadId);
+    const runtime = req.app.locals.runtime;
+    const session = runtime.chunkedUploadManager.sessions.get(uploadId);
+    if (session) {
+      assertChunkSessionOwner(req, session);
+    }
+    const status = runtime.chunkedUploadManager.getStatus(uploadId);
 
     res.json({
       success: true,
@@ -780,7 +835,13 @@ transferRouter.post('/api/upload/cancel', async (req, res, next) => {
       throw new AppError('INVALID_INPUT', 400, 'uploadId is required');
     }
 
-    const cancelled = await req.app.locals.runtime.chunkedUploadManager.cancelUpload(uploadId);
+    const runtime = req.app.locals.runtime;
+    const session = runtime.chunkedUploadManager.sessions.get(uploadId);
+    if (session) {
+      assertChunkSessionOwner(req, session);
+    }
+
+    const cancelled = await runtime.chunkedUploadManager.cancelUpload(uploadId);
     res.json({
       success: true,
       data: { uploadId, cancelled },
@@ -803,24 +864,30 @@ transferRouter.post('/api/upload/complete', async (req, res, next) => {
 
     const runtime = req.app.locals.runtime;
     const existingOutcome = runtime.chunkedUploadManager.getCompletedOutcome(uploadId);
-    if (existingOutcome && existingOutcome.pending) {
-      return res.json({
-        success: true,
-        data: {
-          fileName: existingOutcome.fileName,
-          size: existingOutcome.size,
-          duration: existingOutcome.duration,
-          averageSpeed: existingOutcome.averageSpeed,
-          pending: existingOutcome.pending,
-          transferId: existingOutcome.transferId,
-          savedAs: existingOutcome.savedAs || null,
-        },
-      });
+    if (existingOutcome) {
+      assertChunkSessionOwner(req, existingOutcome);
+      if (existingOutcome.pending) {
+        return res.json({
+          success: true,
+          data: {
+            fileName: existingOutcome.fileName,
+            size: existingOutcome.size,
+            duration: existingOutcome.duration,
+            averageSpeed: existingOutcome.averageSpeed,
+            pending: existingOutcome.pending,
+            transferId: existingOutcome.transferId,
+            savedAs: existingOutcome.savedAs || null,
+          },
+        });
+      }
     }
 
     // Read before completion clears the session: this is the consent the host gave
     // at offer time, and it decides whether a second prompt happens.
     const session = runtime.chunkedUploadManager.sessions.get(uploadId);
+    if (session) {
+      assertChunkSessionOwner(req, session);
+    }
     const preApproved = Boolean(session?.preApproved);
 
     const pendingDir = path.join(runtime.config.tempDir, 'pending');
@@ -871,6 +938,7 @@ transferRouter.post('/api/upload/complete', async (req, res, next) => {
       transferId: record.transferId,
       savedAs: preApproved ? record.fileName : null,
       filePath: result.filePath,
+      sender: session?.sender || result.sender || sender || null,
     };
 
     runtime.chunkedUploadManager.recordCompletedOutcome(uploadId, outcomeData);

@@ -177,6 +177,26 @@ describe('M3 QC Review Regression Suite (M3-QC-01 to M3-QC-04)', () => {
       assert.equal(jsonMissing.error.code, 'TRANSFER_GRANT_INVALID');
       assert.equal(fs.existsSync(path.join(uploadDir, 'file_a.txt')), false);
 
+      // Case 1b: Owner Session A itself tries to spend grantA WITHOUT X-Connection-Id header (M3-QC-R2-01)
+      const formOwnerMissing = new FormData();
+      formOwnerMissing.append('files', new Blob([bodyBytes]), 'file_a.txt');
+      const resOwnerMissing = await fetch(`${baseUrl}/api/upload`, {
+        method: 'POST',
+        headers: {
+          'X-Session-Token': tokenA,
+          'X-Transfer-Grant': grantA,
+        },
+        body: formOwnerMissing,
+      });
+      assert.equal(
+        resOwnerMissing.status,
+        403,
+        'Owner session missing connectionId header must return 403'
+      );
+      const jsonOwnerMissing = await resOwnerMissing.json();
+      assert.equal(jsonOwnerMissing.error.code, 'TRANSFER_GRANT_INVALID');
+      assert.equal(fs.existsSync(path.join(uploadDir, 'file_a.txt')), false);
+
       // Case 2: Session B tries to spend grantA with its own connectionId (connIdB)
       const formForeign = new FormData();
       formForeign.append('files', new Blob([bodyBytes]), 'file_a.txt');
@@ -267,7 +287,7 @@ describe('M3 QC Review Regression Suite (M3-QC-01 to M3-QC-04)', () => {
       assert.equal(decisionRes.status, 200);
       const grantId = (await decisionRes.json()).data.decisions[0].grantId;
 
-      // Case 1: Missing X-Connection-Id
+      // Case 1: Missing X-Connection-Id (Session B)
       const resMissing = await fetch(`${baseUrl}/api/upload/init`, {
         method: 'POST',
         headers: {
@@ -279,6 +299,23 @@ describe('M3 QC Review Regression Suite (M3-QC-01 to M3-QC-04)', () => {
       });
       assert.equal(resMissing.status, 403);
       assert.equal((await resMissing.json()).error.code, 'TRANSFER_GRANT_INVALID');
+
+      // Case 1b: Owner Session A itself tries to init WITHOUT X-Connection-Id header (M3-QC-R2-01)
+      const resOwnerMissing = await fetch(`${baseUrl}/api/upload/init`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Session-Token': tokenA,
+          'X-Transfer-Grant': grantId,
+        },
+        body: JSON.stringify({ fileName, fileSize, checksum: fileChecksum }),
+      });
+      assert.equal(
+        resOwnerMissing.status,
+        403,
+        'Owner session missing connectionId header on init must return 403'
+      );
+      assert.equal((await resOwnerMissing.json()).error.code, 'TRANSFER_GRANT_INVALID');
 
       // Case 2: Foreign connectionId (connIdB)
       const resForeign = await fetch(`${baseUrl}/api/upload/init`, {
@@ -732,6 +769,222 @@ describe('M3 QC Review Regression Suite (M3-QC-01 to M3-QC-04)', () => {
       assert.equal(finishedOffer.state, 'decided');
       assert.equal(finishedOffer.files[1].decision, 'approved');
       assert.equal(finishedOffer.files[2].decision, 'rejected');
+    });
+  });
+
+  describe('M3-QC-R2-02: Chunk session authorization post-init', () => {
+    it('rejects foreign client on all four chunk routes (status, chunk, cancel, complete) and allows owner to complete transfer including after reconnect', async () => {
+      const origChunkSize = serverInstance.runtime.config.chunkSize;
+      // Use 1024 bytes chunk size for test isolation
+      serverInstance.runtime.config.chunkSize = 1024;
+
+      let wsA2 = null;
+      try {
+        const fileName = 'chunk_auth_test.bin';
+        const chunk0 = Buffer.alloc(1024, 0x33);
+        const chunk1 = Buffer.alloc(1024, 0x44);
+        const fullBuffer = Buffer.concat([chunk0, chunk1]);
+        const fileSize = fullBuffer.length;
+        const fileChecksum = crypto.createHash('sha256').update(fullBuffer).digest('hex');
+
+        // 1. Client A creates offer
+        const offerRes = await fetch(`${baseUrl}/api/transfer/offer`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Session-Token': tokenA,
+            'X-Connection-Id': connIdA,
+          },
+          body: JSON.stringify({
+            files: [{ name: fileName, size: fileSize, checksum: fileChecksum }],
+          }),
+        });
+        assert.equal(offerRes.status, 201);
+        const offer = (await offerRes.json()).data.offer;
+
+        // 2. Host approves file
+        const decisionRes = await fetch(`${baseUrl}/api/transfer/offer/decision`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Host-Token': hostToken,
+          },
+          body: JSON.stringify({
+            offerId: offer.offerId,
+            decisions: [{ index: 0, action: 'approve' }],
+          }),
+        });
+        assert.equal(decisionRes.status, 200);
+        const grantId = (await decisionRes.json()).data.decisions[0].grantId;
+        assert.ok(grantId);
+
+        // 3. Client A inits chunked session
+        const initRes = await fetch(`${baseUrl}/api/upload/init`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Session-Token': tokenA,
+            'X-Connection-Id': connIdA,
+            'X-Transfer-Grant': grantId,
+          },
+          body: JSON.stringify({ fileName, fileSize, checksum: fileChecksum }),
+        });
+        assert.equal(initRes.status, 200);
+        const uploadId = (await initRes.json()).data.uploadId;
+        assert.ok(uploadId);
+
+        // 4a. Client B tries GET /api/upload/status/:uploadId -> 403 UPLOAD_FORBIDDEN
+        const statusResB = await fetch(`${baseUrl}/api/upload/status/${uploadId}`, {
+          headers: {
+            'X-Session-Token': tokenB,
+            'X-Connection-Id': connIdB,
+          },
+        });
+        assert.equal(statusResB.status, 403, 'Client B status must be forbidden');
+        assert.equal((await statusResB.json()).error.code, 'UPLOAD_FORBIDDEN');
+
+        // 4b. Client B tries POST /api/upload/chunk -> 403 UPLOAD_FORBIDDEN
+        const formChunkB = new FormData();
+        formChunkB.append('uploadId', uploadId);
+        formChunkB.append('chunkIndex', '0');
+        formChunkB.append('chunk', new Blob([chunk0]), 'chunk_0');
+        const chunkResB = await fetch(`${baseUrl}/api/upload/chunk`, {
+          method: 'POST',
+          headers: {
+            'X-Session-Token': tokenB,
+            'X-Connection-Id': connIdB,
+          },
+          body: formChunkB,
+        });
+        assert.equal(chunkResB.status, 403, 'Client B chunk upload must be forbidden');
+        assert.equal((await chunkResB.json()).error.code, 'UPLOAD_FORBIDDEN');
+
+        // 4c. Client B tries POST /api/upload/cancel -> 403 UPLOAD_FORBIDDEN
+        const cancelResB = await fetch(`${baseUrl}/api/upload/cancel`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Session-Token': tokenB,
+            'X-Connection-Id': connIdB,
+          },
+          body: JSON.stringify({ uploadId }),
+        });
+        assert.equal(cancelResB.status, 403, 'Client B cancel must be forbidden');
+        assert.equal((await cancelResB.json()).error.code, 'UPLOAD_FORBIDDEN');
+
+        // 4d. Client B tries POST /api/upload/complete -> 403 UPLOAD_FORBIDDEN
+        const completeResB = await fetch(`${baseUrl}/api/upload/complete`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Session-Token': tokenB,
+            'X-Connection-Id': connIdB,
+          },
+          body: JSON.stringify({ uploadId }),
+        });
+        assert.equal(completeResB.status, 403, 'Client B complete must be forbidden');
+        assert.equal((await completeResB.json()).error.code, 'UPLOAD_FORBIDDEN');
+
+        // 5. Host capability verification: Host CAN inspect session status
+        const hostStatusRes = await fetch(`${baseUrl}/api/upload/status/${uploadId}`, {
+          headers: {
+            'X-Host-Token': hostToken,
+          },
+        });
+        assert.equal(hostStatusRes.status, 200, 'Host can inspect chunk session status');
+
+        // 6. Owner Client A checks status -> 200, verified 0 chunks received
+        const statusResA = await fetch(`${baseUrl}/api/upload/status/${uploadId}`, {
+          headers: {
+            'X-Session-Token': tokenA,
+            'X-Connection-Id': connIdA,
+          },
+        });
+        assert.equal(statusResA.status, 200);
+        const statusDataA = (await statusResA.json()).data;
+        assert.equal(
+          statusDataA.receivedChunks.length,
+          0,
+          'No chunks received because foreign upload was rejected'
+        );
+
+        // 7. Owner Client A uploads chunk 0
+        const formChunkA0 = new FormData();
+        formChunkA0.append('uploadId', uploadId);
+        formChunkA0.append('chunkIndex', '0');
+        formChunkA0.append('chunk', new Blob([chunk0]), 'chunk_0');
+        const chunkResA0 = await fetch(`${baseUrl}/api/upload/chunk`, {
+          method: 'POST',
+          headers: {
+            'X-Session-Token': tokenA,
+            'X-Connection-Id': connIdA,
+          },
+          body: formChunkA0,
+        });
+        assert.equal(chunkResA0.status, 200);
+
+        // 8. Reconnect support: Client A connects a new WebSocket socket with same tokenA
+        const port = serverInstance.server.address().port;
+        const reconnected = await connectWs(port, tokenA, 'Client A Reconnected Phone', 'ios');
+        wsA2 = reconnected.ws;
+        const connIdA2 = reconnected.connId;
+        assert.ok(connIdA2);
+
+        // 9. Client A uploads chunk 1 using reconnected connection
+        const formChunkA1 = new FormData();
+        formChunkA1.append('uploadId', uploadId);
+        formChunkA1.append('chunkIndex', '1');
+        formChunkA1.append('chunk', new Blob([chunk1]), 'chunk_1');
+        const chunkResA1 = await fetch(`${baseUrl}/api/upload/chunk`, {
+          method: 'POST',
+          headers: {
+            'X-Session-Token': tokenA,
+            'X-Connection-Id': connIdA2,
+          },
+          body: formChunkA1,
+        });
+        assert.equal(chunkResA1.status, 200);
+
+        // 10. Client A completes the upload using reconnected connection
+        const completeResA = await fetch(`${baseUrl}/api/upload/complete`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Session-Token': tokenA,
+            'X-Connection-Id': connIdA2,
+          },
+          body: JSON.stringify({ uploadId }),
+        });
+        assert.equal(completeResA.status, 200, 'Owner completes upload');
+        const completeData = (await completeResA.json()).data;
+        assert.equal(completeData.fileName, fileName);
+
+        // Verify assembled file exists in uploadDir with identical bytes
+        const finalFilePath = path.join(uploadDir, fileName);
+        assert.equal(fs.existsSync(finalFilePath), true);
+        const savedBytes = await fs.promises.readFile(finalFilePath);
+        assert.deepEqual(savedBytes, fullBuffer);
+
+        // 11. Foreign Client B attempts POST /api/upload/complete on completed outcome -> 403 UPLOAD_FORBIDDEN
+        const reCompleteResB = await fetch(`${baseUrl}/api/upload/complete`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Session-Token': tokenB,
+            'X-Connection-Id': connIdB,
+          },
+          body: JSON.stringify({ uploadId }),
+        });
+        assert.equal(
+          reCompleteResB.status,
+          403,
+          'Foreign client cannot complete completed session'
+        );
+        assert.equal((await reCompleteResB.json()).error.code, 'UPLOAD_FORBIDDEN');
+      } finally {
+        if (wsA2 && wsA2.readyState === WebSocket.OPEN) wsA2.terminate();
+        serverInstance.runtime.config.chunkSize = origChunkSize;
+      }
     });
   });
 

@@ -403,6 +403,7 @@ export class ChunkedUploadManager {
       mimeType: session.mimeType,
       duration: parseFloat(duration.toFixed(1)),
       averageSpeed: `${speedMBs} MB/s`,
+      sender: session.sender || null,
     };
 
     this.recordCompletedOutcome(uploadId, completionResult);
