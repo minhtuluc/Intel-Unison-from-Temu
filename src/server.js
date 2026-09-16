@@ -17,6 +17,7 @@ import { errorHandler } from './middleware/error-handler.js';
 import { infoRouter } from './routes/info.js';
 import { filesRouter } from './routes/files.js';
 import { transferRouter } from './routes/transfer.js';
+import { createServiceWorkerHandler } from './routes/service-worker.js';
 import { setupWebSocket } from './websocket/index.js';
 import { requireSession } from './middleware/session-auth.js';
 
@@ -86,6 +87,9 @@ export function createServer(runtimeOrOptions = {}) {
   // Serve static assets from public/ (resolved against the package, not the cwd)
   const publicDir = runtime.publicDir;
   if (fs.existsSync(publicDir)) {
+    // Registered before static so the worker is delivered with its version-derived
+    // cache name rather than as a plain file (UT-016).
+    app.get('/sw.js', createServiceWorkerHandler({ publicDir }));
     app.use(
       express.static(publicDir, {
         setHeaders: (res, filePath) => {

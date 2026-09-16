@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import request from 'supertest';
 import { createServer } from '../../src/server.js';
+import { APP_VERSION } from '../../src/version.js';
 
 describe('PWA & Static Assets (Unit)', () => {
   const publicDir = path.resolve('public');
@@ -88,9 +89,40 @@ describe('PWA & Static Assets (Unit)', () => {
     it('caches the session-aware api client in the shell', () => {
       const swCode = fs.readFileSync(swPath, 'utf8');
       assert.ok(swCode.includes("'/js/api.js'"), 'api.js is part of the cached shell');
-      assert.ok(swCode.includes('utrans-shell-v7'), 'shell cache version is bumped to v7');
-      assert.equal(swCode.includes('utrans-shell-v6'), false, 'old v6 shell cache version is gone');
-      assert.equal(swCode.includes('utrans-shell-v3'), false, 'old shell cache version is gone');
+      assert.ok(swCode.includes("'/js/capabilities.js'"), 'capabilities.js is part of the shell');
+    });
+
+    it('takes its cache name from the server rather than a hand-edited literal', () => {
+      const swCode = fs.readFileSync(swPath, 'utf8');
+      // The source carries a placeholder; the route substitutes a version-derived
+      // name so a release cannot ship a frontend fix behind a stale shell.
+      assert.ok(
+        swCode.includes("const CACHE_NAME = '__SHELL_CACHE_NAME__'"),
+        'sw.js declares the cache name placeholder'
+      );
+      assert.equal(
+        /utrans-shell-v\d+/.test(swCode),
+        false,
+        'no hand-maintained version literal remains in sw.js'
+      );
+    });
+
+    it('waits for the page to ask before activating an update', () => {
+      const swCode = fs.readFileSync(swPath, 'utf8');
+      assert.ok(
+        swCode.includes('SKIP_WAITING'),
+        'the worker honours an explicit skip-waiting message'
+      );
+      assert.equal(
+        (swCode.match(/self\.skipWaiting\(\)/g) || []).length,
+        1,
+        'skipWaiting is called exactly once, from the message handler'
+      );
+      assert.match(
+        swCode,
+        /addEventListener\('message'[\s\S]*?self\.skipWaiting\(\)/,
+        'activation waits for the page to ask, so an update cannot swap assets mid-transfer'
+      );
     });
   });
 
@@ -111,6 +143,24 @@ describe('PWA & Static Assets (Unit)', () => {
         res.headers['cache-control']?.includes('no-cache'),
         `Expected no-cache, got: ${res.headers['cache-control']}`
       );
+    });
+
+    it('serves sw.js with the cache name derived from the app version (UT-016)', async () => {
+      const res = await request(app).get('/sw.js');
+      assert.equal(res.status, 200);
+
+      const served = res.text;
+      const expected = `utrans-shell-${APP_VERSION}`;
+      assert.ok(served.includes(`const CACHE_NAME = '${expected}'`), `expected ${expected}`);
+      assert.equal(
+        served.includes('__SHELL_CACHE_NAME__'),
+        false,
+        'the placeholder must not reach the browser'
+      );
+      // The served shell must match what /api/info reports, or a client cannot tell
+      // which version it is running.
+      const info = await request(app).get('/api/info');
+      assert.equal(info.body.data.version, APP_VERSION);
     });
 
     it('should set 1-hour cache-control for static assets like css and icons', async () => {

@@ -1155,16 +1155,22 @@ describe('M2 QC Review Regression Suite (R1 to R13)', () => {
   // R8 — P1 / frontend delivery: Service Worker Cache Lifecycle
   // ==========================================
   describe('R8: Service Worker cache version and update lifecycle', () => {
-    it('public/sw.js defines CACHE_NAME as utrans-shell-v7 and purges v6 on activation', async () => {
+    it('the served shell cache name follows the app version and purges old caches', async () => {
       const swPath = path.resolve('public/sw.js');
       const swContent = await fs.promises.readFile(swPath, 'utf8');
 
-      // Verify CACHE_NAME is bumped whenever the shell changes (M3 raised it to v7).
-      assert.match(swContent, /CACHE_NAME\s*=\s*['"]utrans-shell-v7['"]/);
-      assert.doesNotMatch(swContent, /CACHE_NAME\s*=\s*['"]utrans-shell-v6['"]/);
-
-      // Verify activation logic purges non-current caches
+      // UT-016: the source carries a placeholder so nobody has to remember to bump a
+      // literal, and the server substitutes a version-derived name per release.
+      assert.match(swContent, /CACHE_NAME\s*=\s*['"]__SHELL_CACHE_NAME__['"]/);
       assert.match(swContent, /caches\.delete\(key\)/);
+
+      const served = await fetch(`${baseUrl}/sw.js`);
+      assert.equal(served.status, 200);
+      const body = await served.text();
+      assert.match(body, /CACHE_NAME\s*=\s*['"]utrans-shell-[^'"]+['"]/);
+      assert.equal(body.includes('__SHELL_CACHE_NAME__'), false);
+      // A renamed cache is what makes an installed client drop the previous shell.
+      assert.notEqual(body.match(/CACHE_NAME\s*=\s*['"]([^'"]+)['"]/)[1], 'utrans-shell-v6');
     });
   });
 

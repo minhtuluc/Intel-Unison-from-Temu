@@ -157,14 +157,14 @@ utrans -p 9090
 
 ## 🛡️ Cơ chế kiến trúc & An toàn dữ liệu
 
-| Cơ chế                          | Chi tiết kỹ thuật                                                                                                        |
-| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| **Staging Area**                | Lưu danh sách tệp đang chia sẻ trên RAM (`share-manager.js`), không quét tự động ổ cứng người dùng.                      |
-| **Streaming Range 206**         | Hỗ trợ HTTP Range Header cho phép tua video trực tuyến và tải file mượt mà trên iOS Safari không sợ tràn RAM.            |
-| **PC Confirmation & 5-min TTL** | File tải lên được đưa vào vùng tạm `temp/pending`. Tự động xóa sau 5 phút nếu PC không duyệt.                            |
-| **Anti-Traversal Protection**   | Chặn toàn bộ ký tự traversal `..`, `\0` null-bytes, kiểm tra quyền truy cập đĩa cứng an toàn.                            |
-| **Security Headers**            | Trang bị `X-Content-Type-Options: nosniff`, `X-Frame-Options: SAMEORIGIN`, tắt `x-powered-by`.                           |
-| **Offline Shell Cache**         | Service Worker `utrans-shell-v5` cache sẵn giao diện; đường truyền dữ liệu `/api/*` và `/ws` luôn đi thẳng qua mạng LAN. |
+| Cơ chế                          | Chi tiết kỹ thuật                                                                                                                                                                               |
+| ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Staging Area**                | Lưu danh sách tệp đang chia sẻ trên RAM (`share-manager.js`), không quét tự động ổ cứng người dùng.                                                                                             |
+| **Streaming Range 206**         | Hỗ trợ HTTP Range Header cho phép tua video trực tuyến và tải file mượt mà trên iOS Safari không sợ tràn RAM.                                                                                   |
+| **PC Confirmation & 5-min TTL** | File tải lên được đưa vào vùng tạm `temp/pending`. Tự động xóa sau 5 phút nếu PC không duyệt.                                                                                                   |
+| **Anti-Traversal Protection**   | Chặn toàn bộ ký tự traversal `..`, `\0` null-bytes, kiểm tra quyền truy cập đĩa cứng an toàn.                                                                                                   |
+| **Security Headers**            | Trang bị `X-Content-Type-Options: nosniff`, `X-Frame-Options: SAMEORIGIN`, tắt `x-powered-by`.                                                                                                  |
+| **Offline Shell Cache**         | Service Worker cache sẵn giao diện; đường truyền dữ liệu `/api/*` và `/ws` luôn đi thẳng qua mạng LAN. Tên cache (`utrans-shell-<version>`) lấy từ `package.json` nên tự đổi mỗi bản phát hành. |
 
 ---
 

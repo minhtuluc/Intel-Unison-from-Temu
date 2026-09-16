@@ -9,6 +9,7 @@ import qrcode from 'qrcode';
 import { getLanIp } from '../utils/network.js';
 import { AppError } from '../middleware/error-handler.js';
 import { requireHost } from '../middleware/host-auth.js';
+import { APP_VERSION } from '../version.js';
 import {
   buildClearedSessionCookie,
   buildSessionCookie,
@@ -59,7 +60,7 @@ infoRouter.get('/api/info', async (req, res, next) => {
       data: {
         serverName: os.hostname(),
         platform: process.platform,
-        version: '1.0.0',
+        version: APP_VERSION,
         ip,
         port,
         connectUrl,

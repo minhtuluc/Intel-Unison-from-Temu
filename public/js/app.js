@@ -9,6 +9,11 @@ import { DropZone } from './drop-zone.js';
 import { transferEngine } from './transfer.js';
 import { createElement, getFileSvg, showModal, closeModal, showQrModal, showToast } from './ui.js';
 import { describeReason, formatFileSize, formatRelativeTime } from './utils.js';
+import {
+  describeMissingCapabilities,
+  isSecureContextOk,
+  supportsWakeLock,
+} from './capabilities.js';
 import { initializeHostSession, hostHeaders } from './host-session.js';
 import {
   UNAUTHORIZED_EVENT,
@@ -33,6 +38,10 @@ class App {
     this.pendingApprovals = [];
     // Batches announced by senders (UT-012). Consent happens here, before any bytes.
     this.pendingOffers = [];
+    // One-shot notices: each of these would otherwise repeat on every retry.
+    this.capabilityNoticeShown = false;
+    this.wakeLockNoticeShown = false;
+    this.updateOffered = false;
   }
 
   async init() {
@@ -1266,16 +1275,36 @@ class App {
   }
 
   async _acquireWakeLock() {
-    if ('wakeLock' in navigator && !this.wakeLockSentinel) {
-      try {
-        this.wakeLockSentinel = await navigator.wakeLock.request('screen');
-        this.wakeLockSentinel.addEventListener('release', () => {
-          this.wakeLockSentinel = null;
-        });
-      } catch {
-        // Silently handle if rejected or unsupported
-      }
+    if (!supportsWakeLock()) {
+      this._reportWakeLockUnavailable();
+      return;
     }
+    if (this.wakeLockSentinel) return;
+
+    try {
+      this.wakeLockSentinel = await navigator.wakeLock.request('screen');
+      this.wakeLockSentinel.addEventListener('release', () => {
+        this.wakeLockSentinel = null;
+      });
+    } catch (err) {
+      // An empty catch used to swallow this, so the screen slept mid-transfer and
+      // nothing explained why. Say it once, and only while it actually matters.
+      this._reportWakeLockUnavailable(err);
+    }
+  }
+
+  _reportWakeLockUnavailable(err) {
+    if (this.wakeLockNoticeShown) return;
+    if (!transferEngine.getStatus().active?.length) return;
+    this.wakeLockNoticeShown = true;
+
+    const detail = isSecureContextOk()
+      ? `Screen wake lock was refused${err ? `: ${describeReason(err)}` : ''}.`
+      : 'This page is open over plain HTTP on the LAN, where the browser blocks screen wake lock.';
+    showToast({
+      type: 'warning',
+      message: `The screen may sleep during this transfer. ${detail}`,
+    });
   }
 
   async _releaseWakeLock() {
@@ -1299,31 +1328,105 @@ class App {
   }
 
   _registerServiceWorker() {
-    if ('serviceWorker' in navigator) {
-      document.addEventListener('visibilitychange', () => {
-        if (document.visibilityState === 'visible') {
-          this._updateWakeLock();
-        }
-      });
+    // Re-arming the wake lock on focus has nothing to do with the service worker.
+    // It used to sit inside the serviceWorker guard, so a browser without one never
+    // re-acquired the lock after a tab switch.
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') {
+        this._updateWakeLock();
+      }
+    });
 
-      window.addEventListener('load', async () => {
-        try {
-          const registration = await navigator.serviceWorker.register('/sw.js', { scope: '/' });
-          registration.addEventListener('updatefound', () => {
-            const newWorker = registration.installing;
-            if (newWorker) {
-              newWorker.addEventListener('statechange', () => {
-                if (newWorker.state === 'installed' && navigator.serviceWorker.controller) {
-                  showToast({ message: 'New version available. Refresh to update.', type: 'info' });
-                }
-              });
-            }
-          });
-        } catch (err) {
-          console.warn('ServiceWorker registration skipped:', err.message);
+    const gap = describeMissingCapabilities().find(
+      (entry) => entry.key === 'secureContext' || entry.key === 'serviceWorker'
+    );
+    if (gap) {
+      this._announceCapabilityGap(gap);
+      return;
+    }
+
+    window.addEventListener('load', async () => {
+      try {
+        const registration = await navigator.serviceWorker.register('/sw.js', { scope: '/' });
+        this._watchForShellUpdate(registration);
+      } catch (err) {
+        console.warn('ServiceWorker registration skipped:', err.message);
+        this._announceCapabilityGap({
+          key: 'serviceWorker',
+          message: `The offline shell is unavailable: ${describeReason(err)}`,
+        });
+      }
+    });
+  }
+
+  /** The app still works without these; saying so beats leaving features unexplained. */
+  _announceCapabilityGap(gap) {
+    if (this.capabilityNoticeShown) return;
+    this.capabilityNoticeShown = true;
+    showToast({ type: 'info', message: gap.message });
+  }
+
+  _watchForShellUpdate(registration) {
+    registration.addEventListener('updatefound', () => {
+      const newWorker = registration.installing;
+      if (!newWorker) return;
+      newWorker.addEventListener('statechange', () => {
+        // `controller` is only set when an older shell is already running, which is
+        // exactly the update case; a first install must not reload the page.
+        if (newWorker.state === 'installed' && navigator.serviceWorker.controller) {
+          this._offerShellUpdate(newWorker);
         }
       });
-    }
+    });
+  }
+
+  /** Offers the update as a real choice, and applies it only when clicked. */
+  _offerShellUpdate(worker) {
+    if (this.updateOffered) return;
+    this.updateOffered = true;
+
+    let reloading = false;
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      if (reloading) return;
+      reloading = true;
+      window.location.reload();
+    });
+
+    showModal({
+      title: 'Update available',
+      contentNode: createElement('div', { class: 'update-prompt' }, [
+        createElement('p', {}, 'A new version of UniversalTrans is ready to install.'),
+        createElement(
+          'p',
+          { class: 'approval-file-meta' },
+          'Reloading applies it now; a transfer in progress would be interrupted.'
+        ),
+      ]),
+      actions: [
+        createElement(
+          'button',
+          {
+            class: 'btn btn--ghost',
+            onclick: () => {
+              this.updateOffered = false;
+              closeModal();
+            },
+          },
+          'Later'
+        ),
+        createElement(
+          'button',
+          {
+            class: 'btn btn--primary',
+            onclick: () => {
+              closeModal();
+              worker.postMessage({ type: 'SKIP_WAITING' });
+            },
+          },
+          'Reload now'
+        ),
+      ],
+    });
   }
 
   _setupErrorBoundary() {
