@@ -8,7 +8,7 @@ import { FileBrowser } from './file-browser.js';
 import { DropZone } from './drop-zone.js';
 import { transferEngine } from './transfer.js';
 import { createElement, getFileSvg, showModal, closeModal, showQrModal, showToast } from './ui.js';
-import { describeReason, formatFileSize, formatRelativeTime } from './utils.js';
+import { describeReason, formatFileSize, formatRelativeTime, readApiError } from './utils.js';
 import {
   describeMissingCapabilities,
   isSecureContextOk,
@@ -165,6 +165,10 @@ class App {
 
       case 'devices':
         this._renderDevicesView();
+        break;
+
+      case 'settings':
+        this._renderSettingsView();
         break;
 
       default:
@@ -1159,6 +1163,306 @@ class App {
         this._loadPendingApprovals();
       }
     });
+  }
+
+  /* ==========================================================================
+     Settings View
+     ========================================================================== */
+  _renderSettingsView() {
+    this.mainContainer.innerHTML = '';
+
+    const header = createElement('div', { class: 'view-header' }, [
+      createElement('h1', { class: 'view-title' }, 'Settings'),
+      createElement(
+        'p',
+        { class: 'view-subtitle' },
+        this.isHost
+          ? 'Receive folder, storage and remembered devices'
+          : 'Your recent transfers and host storage'
+      ),
+    ]);
+
+    const container = createElement('div', { class: 'settings-container' });
+    container.append(
+      header,
+      this._buildReceiveFolderCard(),
+      this._buildStorageCard(),
+      this._buildTrustedDevicesCard(),
+      this._buildHistoryCard()
+    );
+
+    this.mainContainer.appendChild(container);
+
+    this._loadSettingsData();
+  }
+
+  _settingsCard(title, subtitle = '') {
+    return createElement('section', { class: 'settings-card' }, [
+      createElement('h3', { class: 'settings-card__title' }, title),
+      subtitle ? createElement('p', { class: 'settings-card__subtitle' }, subtitle) : null,
+      createElement('div', { class: 'settings-card__body' }),
+    ]);
+  }
+
+  _buildReceiveFolderCard() {
+    const card = this._settingsCard(
+      'Receive folder',
+      this.isHost
+        ? 'Approved files are saved here. Changing it applies to the next file the host approves.'
+        : 'Only the host can change this.'
+    );
+
+    const body = card.querySelector('.settings-card__body');
+    const input = createElement('input', {
+      type: 'text',
+      class: 'settings-input',
+      id: 'settings-upload-dir',
+      placeholder: 'Loading…',
+      disabled: !this.isHost,
+    });
+    const save = createElement(
+      'button',
+      {
+        class: 'btn btn--primary btn--sm',
+        onclick: () => this._saveReceiveDir(input.value),
+      },
+      'Save'
+    );
+    if (!this.isHost) save.setAttribute('disabled', '');
+
+    body.append(input, save);
+    return card;
+  }
+
+  _buildStorageCard() {
+    const card = this._settingsCard('Storage', 'Space committed to files still being staged.');
+    const body = card.querySelector('.settings-card__body');
+    body.append(
+      createElement('div', { class: 'quota-row' }, [
+        createElement('span', { id: 'quota-used', class: 'quota-used' }, '—'),
+        createElement('span', { id: 'quota-limit', class: 'quota-limit' }, ''),
+      ]),
+      createElement('div', { class: 'quota-bar' }, [
+        createElement('div', { class: 'quota-bar__fill', id: 'quota-bar-fill' }),
+      ])
+    );
+    return card;
+  }
+
+  _buildTrustedDevicesCard() {
+    const card = this._settingsCard(
+      'Remembered devices',
+      'Devices that can send without a fresh approval. Revoke any you no longer trust.'
+    );
+    card
+      .querySelector('.settings-card__body')
+      .append(
+        createElement('ul', { class: 'settings-list', id: 'trusted-device-list' }, [
+          createElement('li', { class: 'settings-list__empty' }, 'Loading…'),
+        ])
+      );
+    return card;
+  }
+
+  _buildHistoryCard() {
+    const card = this._settingsCard(
+      'Recent transfers',
+      this.isHost ? 'Every transfer this host handled.' : 'Only the transfers this device sent.'
+    );
+    card
+      .querySelector('.settings-card__body')
+      .append(
+        createElement('ul', { class: 'settings-list', id: 'history-list' }, [
+          createElement('li', { class: 'settings-list__empty' }, 'Loading…'),
+        ])
+      );
+    return card;
+  }
+
+  async _loadSettingsData() {
+    await Promise.all([
+      this._loadReceiveDir(),
+      this._loadQuota(),
+      this._loadTrustedDevices(),
+      this._loadHistory(),
+    ]);
+  }
+
+  async _loadReceiveDir() {
+    if (!this.isHost) return;
+    const input = document.getElementById('settings-upload-dir');
+    if (!input) return;
+    try {
+      const res = await apiFetch('/api/settings', { headers: hostHeaders() });
+      if (!res.ok) return;
+      const { data } = await res.json();
+      input.value = data.uploadDir;
+    } catch {
+      input.placeholder = 'Could not load the receive folder';
+    }
+  }
+
+  async _saveReceiveDir(value) {
+    if (!this.isHost) return;
+    try {
+      const res = await apiFetch('/api/settings', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', ...hostHeaders() },
+        body: JSON.stringify({ uploadDir: value }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const { message } = readApiError(body, res.status);
+        showToast({ type: 'danger', message });
+        return;
+      }
+      document.getElementById('settings-upload-dir').value = body.data.uploadDir;
+      showToast({ type: 'success', message: 'Receive folder updated' });
+    } catch (err) {
+      showToast({ type: 'danger', message: `Could not save: ${describeReason(err)}` });
+    }
+  }
+
+  async _loadQuota() {
+    try {
+      const res = await apiFetch('/api/quota');
+      if (!res.ok) return;
+      const { data } = await res.json();
+      const used = document.getElementById('quota-used');
+      const limit = document.getElementById('quota-limit');
+      const fill = document.getElementById('quota-bar-fill');
+      if (!used || !limit || !fill) return;
+
+      const percent = data.limitBytes > 0 ? (data.usedBytes / data.limitBytes) * 100 : 0;
+      used.textContent = formatFileSize(data.usedBytes);
+      limit.textContent = `of ${formatFileSize(data.limitBytes)}`;
+      fill.style.width = `${Math.min(100, percent).toFixed(1)}%`;
+      fill.classList.toggle('quota-bar__fill--high', percent >= 90);
+    } catch {
+      // The card simply keeps its placeholder.
+    }
+  }
+
+  async _loadTrustedDevices() {
+    const list = document.getElementById('trusted-device-list');
+    if (!list) return;
+    if (!this.isHost) {
+      list.replaceChildren(
+        createElement('li', { class: 'settings-list__empty' }, 'Only the host can see this.')
+      );
+      return;
+    }
+
+    try {
+      const res = await apiFetch('/api/devices/trusted', { headers: hostHeaders() });
+      const { data } = await res.json();
+      if (data.length === 0) {
+        list.replaceChildren(
+          createElement('li', { class: 'settings-list__empty' }, 'No devices are remembered yet.')
+        );
+        return;
+      }
+      list.replaceChildren(
+        ...data.map((device) =>
+          createElement('li', { class: 'settings-list__row' }, [
+            createElement('div', { class: 'settings-list__text' }, [
+              createElement('div', { class: 'settings-list__name' }, device.label),
+              createElement(
+                'div',
+                { class: 'settings-list__meta' },
+                `${device.platform} • trusted ${formatRelativeTime(device.trustedAt)}`
+              ),
+            ]),
+            createElement(
+              'button',
+              {
+                class: 'btn btn--danger btn--sm',
+                onclick: () => this._revokeTrustedDevice(device.id),
+              },
+              'Revoke'
+            ),
+          ])
+        )
+      );
+    } catch {
+      list.replaceChildren(
+        createElement('li', { class: 'settings-list__empty' }, 'Could not load devices.')
+      );
+    }
+  }
+
+  async _revokeTrustedDevice(id) {
+    try {
+      const res = await apiFetch(`/api/devices/trusted/${id}`, {
+        method: 'DELETE',
+        headers: hostHeaders(),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      showToast({ type: 'success', message: 'Device revoked; it will be asked again' });
+    } catch (err) {
+      showToast({ type: 'danger', message: `Could not revoke: ${describeReason(err)}` });
+    } finally {
+      await this._loadTrustedDevices();
+    }
+  }
+
+  async _loadHistory() {
+    const list = document.getElementById('history-list');
+    if (!list) return;
+
+    try {
+      const res = await apiFetch('/api/transfers/history');
+      if (!res.ok) return;
+      const { data } = await res.json();
+      if (data.entries.length === 0) {
+        list.replaceChildren(
+          createElement(
+            'li',
+            { class: 'settings-list__empty' },
+            'Nothing has been transferred yet.'
+          )
+        );
+        return;
+      }
+
+      const tone = { completed: 'success', rejected: 'danger', expired: 'warning' };
+      list.replaceChildren(
+        ...data.entries.slice(0, 50).map((entry) =>
+          createElement('li', { class: 'settings-list__row' }, [
+            createElement('div', { class: 'settings-list__text' }, [
+              createElement(
+                'div',
+                { class: 'settings-list__name' },
+                entry.fileName || 'Unnamed file'
+              ),
+              createElement(
+                'div',
+                { class: 'settings-list__meta' },
+                [
+                  entry.status,
+                  entry.size !== null ? formatFileSize(entry.size) : null,
+                  entry.label,
+                  formatRelativeTime(entry.timestamp),
+                ]
+                  .filter(Boolean)
+                  .join(' • ')
+              ),
+            ]),
+            createElement(
+              'span',
+              {
+                class: `settings-list__badge settings-list__badge--${tone[entry.status] || 'info'}`,
+              },
+              entry.status
+            ),
+          ])
+        )
+      );
+    } catch {
+      list.replaceChildren(
+        createElement('li', { class: 'settings-list__empty' }, 'Could not load history.')
+      );
+    }
   }
 
   _setupQrModal() {

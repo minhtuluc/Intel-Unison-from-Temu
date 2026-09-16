@@ -19,6 +19,61 @@ export function debounce(fn, delay = 300) {
 }
 
 /**
+ * Human wording for the machine-readable codes the server returns.
+ *
+ * Before this, a refused upload surfaced as "Upload failed with status 507", which
+ * told the sender nothing about what to do next.
+ */
+const ERROR_MESSAGES = Object.freeze({
+  STORAGE_QUOTA_EXCEEDED: 'The host is out of staging space. Ask them to free some up.',
+  TOO_MANY_TRANSFERS:
+    'The host is already handling as many transfers as it allows. Try again shortly.',
+  TOO_MANY_SESSIONS:
+    'The host is already handling as many uploads as it allows. Try again shortly.',
+  FILE_TOO_LARGE: 'This file is bigger than the host accepts.',
+  CHUNK_TOO_LARGE: 'A chunk was larger than the host accepts.',
+  CHECKSUM_MISMATCH: 'The file changed on the way and was discarded. Try sending it again.',
+  FILE_CORRUPTED: 'The received file did not match its expected size and was discarded.',
+  TRANSFER_GRANT_REQUIRED: 'The host has not approved this file, so it was not sent.',
+  TRANSFER_GRANT_INVALID: 'The host approval for this file is no longer valid. Ask again.',
+  TRANSFER_GRANT_USED: 'The host approval for this file was already spent.',
+  TRANSFER_GRANT_BUSY: 'This file is already being sent.',
+  TRANSFER_GRANT_EXPIRED: 'The host approval for this file expired. Ask again.',
+  GRANT_MISMATCH: 'The file does not match what the host approved, so it was refused.',
+  OFFER_NOT_FOUND: 'The host can no longer see this request. Send it again.',
+  OFFER_CLOSED: 'The host already answered this request.',
+  UPLOAD_EXPIRED: 'This upload session expired before it finished.',
+  TOO_MANY_TRUSTED_DEVICES: 'The host has reached its limit of remembered devices.',
+  INVALID_UPLOAD_DIR: 'That receive folder cannot be used.',
+  HOST_REQUIRED: 'Only the host can do that.',
+  ACCESS_DENIED: 'This device is not allowed to do that.',
+});
+
+/**
+ * @param {string} [code] server error code
+ * @param {string} [fallback] message to use when the code is unknown
+ * @returns {string}
+ */
+export function describeError(code, fallback = '') {
+  if (code && ERROR_MESSAGES[code]) return ERROR_MESSAGES[code];
+  return fallback || 'Something went wrong.';
+}
+
+/**
+ * Pulls the error code and message out of a failed response body.
+ * @param {object} body parsed JSON body
+ * @param {number} [status]
+ * @returns {{ code: string, message: string }}
+ */
+export function readApiError(body, status) {
+  const error = body?.error || {};
+  return {
+    code: error.code || '',
+    message: describeError(error.code, error.message || `Request failed with status ${status}`),
+  };
+}
+
+/**
  * Turns an arbitrary thrown or rejected value into something a person can read.
  * A bare object would otherwise render as "[object Object]", which says nothing.
  * @param {unknown} reason

@@ -1032,6 +1032,161 @@
   flex: 1;
 }
 
+/* M3: settings view — receive folder, storage, remembered devices and history. */
+.settings-container {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  max-width: 720px;
+}
+
+.settings-card {
+  background: var(--color-bg-secondary);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-4);
+}
+
+.settings-card__title {
+  font-size: var(--font-size-base);
+  font-weight: 600;
+  margin-bottom: var(--space-1);
+}
+
+.settings-card__subtitle {
+  font-size: var(--font-size-xs);
+  color: var(--color-text-secondary);
+  margin-bottom: var(--space-3);
+}
+
+.settings-card__body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.settings-input {
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  background: var(--color-bg-primary);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  color: var(--color-text-primary);
+  font-family: inherit;
+  font-size: var(--font-size-sm);
+}
+
+.settings-input:disabled {
+  opacity: 0.6;
+}
+
+.settings-card__body .btn {
+  align-self: flex-start;
+}
+
+.quota-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  font-size: var(--font-size-sm);
+}
+
+.quota-used {
+  font-weight: 600;
+}
+
+.quota-limit {
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-xs);
+}
+
+.quota-bar {
+  height: 8px;
+  border-radius: var(--radius-full);
+  background: var(--color-bg-primary);
+  border: 1px solid var(--color-border);
+  overflow: hidden;
+}
+
+.quota-bar__fill {
+  height: 100%;
+  width: 0;
+  background: var(--color-accent);
+  transition: width 200ms ease;
+}
+
+.quota-bar__fill--high {
+  background: var(--color-danger);
+}
+
+.settings-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+}
+
+.settings-list__empty {
+  font-size: var(--font-size-xs);
+  color: var(--color-text-secondary);
+}
+
+.settings-list__row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  background: var(--color-bg-primary);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  padding: var(--space-2) var(--space-3);
+}
+
+.settings-list__text {
+  min-width: 0;
+}
+
+.settings-list__name {
+  font-size: var(--font-size-sm);
+  word-break: break-all;
+}
+
+.settings-list__meta {
+  font-size: var(--font-size-xs);
+  color: var(--color-text-secondary);
+}
+
+.settings-list__badge {
+  flex: 0 0 auto;
+  font-size: var(--font-size-xs);
+  padding: 2px var(--space-2);
+  border-radius: var(--radius-full);
+  border: 1px solid var(--color-border);
+}
+
+.settings-list__badge--success {
+  color: var(--color-success);
+  border-color: var(--color-success);
+}
+
+.settings-list__badge--danger {
+  color: var(--color-danger);
+  border-color: var(--color-danger);
+}
+
+.settings-list__badge--warning {
+  color: var(--color-warning);
+  border-color: var(--color-warning);
+}
+
+.update-prompt {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
 /* ==========================================================================
    Phase 4 PWA, Latency & iOS Install Guide
    ========================================================================== */

@@ -4,8 +4,9 @@
  * as well as pasting clipboard images (Ctrl+V) directly into the shared staging area.
  */
 
-import { showToast } from './ui.js';
+import { closeModal, createElement, showModal, showToast } from './ui.js';
 import { apiFetch } from './api.js';
+import { readApiError } from './utils.js';
 
 export class DropZone {
   constructor(targetElement = document.body, onFilesShared = null) {
@@ -201,8 +202,10 @@ export class DropZone {
       });
 
       if (!res.ok) {
-        const errJson = await res.json().catch(() => ({}));
-        throw new Error(errJson.error?.message || `Server returned ${res.status}`);
+        const body = await res.json().catch(() => ({}));
+        const error = new Error(readApiError(body, res.status).message);
+        error.code = body?.error?.code || '';
+        throw error;
       }
 
       const data = await res.json();
@@ -213,7 +216,53 @@ export class DropZone {
         this.onFilesShared(data.data?.shared);
       }
     } catch (err) {
-      showToast({ message: `Failed to share files: ${err.message}`, type: 'danger' });
+      this._offerShareRetry(files, err);
     }
+  }
+
+  /**
+   * Staging failed. The selection is kept so retrying does not mean picking the
+   * same files again, which on a phone is the expensive part.
+   */
+  _offerShareRetry(files, err) {
+    this.retryFiles = files;
+
+    showModal({
+      title: 'Sharing failed',
+      contentNode: createElement('div', { class: 'update-prompt' }, [
+        createElement('p', {}, err?.message || 'The host refused these files.'),
+        createElement(
+          'p',
+          { class: 'approval-file-meta' },
+          `${files.length} file(s) are still selected — retrying sends the same list again.`
+        ),
+      ]),
+      actions: [
+        createElement(
+          'button',
+          {
+            class: 'btn btn--ghost',
+            onclick: () => {
+              this.retryFiles = null;
+              closeModal();
+            },
+          },
+          'Dismiss'
+        ),
+        createElement(
+          'button',
+          {
+            class: 'btn btn--primary',
+            onclick: () => {
+              closeModal();
+              const again = this.retryFiles;
+              this.retryFiles = null;
+              if (again && again.length > 0) this._shareFiles(again);
+            },
+          },
+          'Retry'
+        ),
+      ],
+    });
   }
 }

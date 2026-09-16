@@ -66,6 +66,7 @@ export class PendingUploadService {
         status: 'expired',
         reason: 'TIMEOUT',
         fileName: cleanName,
+        sender: record.sender,
         timestamp: Date.now(),
       });
       if (typeof this.onTimeout === 'function') {
@@ -180,6 +181,7 @@ export class PendingUploadService {
         status: 'completed',
         fileName: moved.fileName,
         size: record.fileSize,
+        sender: record.sender,
         timestamp: Date.now(),
       });
 
@@ -218,6 +220,7 @@ export class PendingUploadService {
           status: 'expired',
           reason: 'TIMEOUT',
           fileName: record.fileName,
+          sender: record.sender,
           timestamp: Date.now(),
         });
         if (typeof this.onTimeout === 'function') {
@@ -274,6 +277,8 @@ export class PendingUploadService {
       this._recordOutcome(transferId, {
         status: 'rejected',
         reason: 'REJECTED_BY_PC',
+        fileName: record.fileName,
+        sender: record.sender,
         timestamp: Date.now(),
       });
     }
@@ -307,6 +312,16 @@ export class PendingUploadService {
       this.recentOutcomes.delete(oldestKey);
     }
     this.recentOutcomes.set(transferId, outcome);
+
+    // Observed by the history service, which is durable where this ring buffer is
+    // not. An observer failure must never fail the transfer it was watching.
+    if (typeof this.onOutcome === 'function') {
+      try {
+        this.onOutcome(outcome);
+      } catch (err) {
+        logger.warn('Transfer outcome observer failed', { error: err.message });
+      }
+    }
   }
 
   getTransferStatus(transferId) {

@@ -459,6 +459,21 @@ transferRouter.post('/api/transfer/offer/decision', requireHost, async (req, res
     }
 
     const payload = buildOfferDecisionPayload(runtime.offerService, offer, false);
+
+    // A rejected file never reaches the upload pipeline, so nothing else would
+    // record it; without this the host's "Decline" leaves no trace at all.
+    for (const decision of payload.decisions) {
+      if (decision.decision !== 'rejected') continue;
+      runtime.history.record({
+        status: 'rejected',
+        reason: 'REJECTED_BY_PC',
+        source: 'offer',
+        fileName: decision.name,
+        size: decision.size,
+        sender: offer.sender,
+      });
+    }
+
     const wss = req.app.get('wss');
     if (wss) {
       sendTransferTerminalEvent(wss, 'transfer:offer:decision', payload, offer.sender);

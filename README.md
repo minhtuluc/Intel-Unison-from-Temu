@@ -12,7 +12,7 @@ Mô hình hiện tại truyền qua host, chưa có P2P trực tiếp giữa cli
 
 M1 (commit `64cff86`) và M2 (PR #2, commit `047706f`) đã merge vào `main`. M3 (UT-011, UT-012, UT-016, UT-018) đang nằm trên nhánh `m3-core-ux-consent`, **chưa merge** — đang chờ QC quyết định.
 
-Số liệu đo trên trạng thái cuối của nhánh M3, ngày 2026-09-16, Node 24.15.0 / Windows: **392 automated tests pass**, coverage **89,84% line / 82,66% branch / 87,44% function**, lint và format sạch (`npm run quality`). **Chưa** kiểm chứng: điện thoại thật (Android Chrome / iOS Safari), TLS LAN, vòng đời cache service worker trên browser thật (repo không có E2E browser), và CI chưa chạy cho nhánh này. Các tuyên bố bên dưới cần đối chiếu giới hạn còn mở trong báo cáo.
+Số liệu đo trên trạng thái cuối của nhánh M3, ngày 2026-09-16, Node 24.15.0 / Windows: **424 automated tests pass**, coverage **90,18% line / 82,97% branch / 87,66% function**, lint và format sạch (`npm run quality`). **Chưa** kiểm chứng: điện thoại thật (Android Chrome / iOS Safari), TLS LAN, vòng đời cache service worker trên browser thật (repo không có E2E browser), và CI chưa chạy cho nhánh này. Các tuyên bố bên dưới cần đối chiếu giới hạn còn mở trong báo cáo.
 
 <p align="center">
   <img src="public/favicon.svg" alt="UniversalTrans Logo" width="96" height="96" />
@@ -25,8 +25,8 @@ Số liệu đo trên trạng thái cuối của nhánh M3, ngày 2026-09-16, No
 
 <p align="center">
   <img src="https://img.shields.io/badge/node-%3E%3D20.0.0-brightgreen" alt="Node Version" />
-  <img src="https://img.shields.io/badge/tests-392%20passed-success" alt="Tests" />
-  <img src="https://img.shields.io/badge/coverage-89.84%25-blue" alt="Coverage" />
+  <img src="https://img.shields.io/badge/tests-424%20passed-success" alt="Tests" />
+  <img src="https://img.shields.io/badge/coverage-90.18%25-blue" alt="Coverage" />
   <img src="https://img.shields.io/badge/port-8080%20default-orange" alt="Port 8080" />
   <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License" />
   <img src="https://img.shields.io/badge/pwa-standalone%20ready-purple" alt="PWA Ready" />
