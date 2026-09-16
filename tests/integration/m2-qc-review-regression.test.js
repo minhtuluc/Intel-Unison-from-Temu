@@ -1528,7 +1528,10 @@ describe('M2 QC Review Regression Suite (R1 to R13)', () => {
         // The grant is bound to B, so presenting it as A is refused.
         assert.equal(spoofRes.status, 403, 'Cross-session spoofed connectionId must return 403');
         const spoofJson = await spoofRes.json();
-        assert.equal(spoofJson.error.code, 'TRANSFER_GRANT_INVALID');
+        assert.ok(
+          ['TRANSFER_GRANT_INVALID', 'INVALID_CONNECTION_ID'].includes(spoofJson.error.code),
+          `Expected 403 error code to be TRANSFER_GRANT_INVALID or INVALID_CONNECTION_ID, got ${spoofJson.error.code}`
+        );
 
         // A forged host capability must not unlock the write path either.
         const formForgedHost = new FormData();

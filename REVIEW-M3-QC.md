@@ -87,3 +87,37 @@
 5. Sau khi P1 = 0 mới review lại branch; browser/device E2E và packaging Windows/Linux vẫn là gate riêng trước release.
 
 **QC status:** Changes requested — chưa đủ điều kiện merge vào `main`.
+
+---
+
+## Kết quả khắc phục (Resolution Summary)
+
+Đã hoàn thành toàn bộ 4 finding P1 và các vấn đề nhỏ theo đúng acceptance criteria:
+
+1. **M3-QC-01 (Grant connection binding bypass):**
+   - File sửa: `src/services/transfer-offer.js`, `src/middleware/transfer-grant.js`.
+   - Kết quả: Khi grant có `connectionId`, mọi request `/api/upload` và `/api/upload/init` bắt buộc phải có connection ID và phải khớp với grant. Thiếu hoặc sai đều bị chặn tại middleware với mã 403 (`TRANSFER_GRANT_INVALID`) trước khi Multer chạm đĩa hoặc session chunked được khởi tạo.
+   - Khi request bị từ chối, grant được release an toàn về trạng thái `issued` để rightful owner có thể retry và hoàn tất upload thành công.
+
+2. **M3-QC-02 (Chunked init metadata binding):**
+   - File sửa: `src/routes/transfer.js`, `src/middleware/transfer-grant.js`.
+   - Kết quả: `/api/upload/init` sử dụng chung hàm đối chiếu `assertGrantsMatchFiles` với simple upload, kiểm tra chặt chẽ `fileName`, `fileSize`, và `checksum` (khi grant có checksum) đối chiếu với grant được host phê duyệt.
+   - Mismatch trả về 403 `GRANT_MISMATCH`, không tạo session trên đĩa và giải phóng grant ngay lập tức (không bị fulfill).
+
+3. **M3-QC-03 (Server-side capability binding & reconnect support):**
+   - File sửa: `src/utils/connection-identity.js`, `src/middleware/session-auth.js`, `src/websocket/index.js`, `src/websocket/handlers.js`, `src/routes/settings.js`, `src/routes/transfer.js`.
+   - Kết quả: Máy chủ map session token hợp lệ ↔ tập hợp connection ID đã đăng ký WebSocket. Mọi endpoint self-scoped (`GET /api/transfers/history`, `GET /api/transfer/offer/:offerId`, `POST /api/transfer/offer/cancel`) đối chiếu server-side; client B không thể đọc/hủy offer hay xem lịch sử của client A (trả về 403 `INVALID_CONNECTION_ID` hoặc `OFFER_FORBIDDEN`).
+   - Hỗ trợ reconnect: Client A sau khi ngắt kết nối WebSocket và kết nối lại với cùng session token vẫn truy cập được đầy đủ lịch sử truyền file trước đó và quản lý được offer của mình.
+
+4. **M3-QC-04 (Host decision idempotency & atomic batch):**
+   - File sửa: `src/services/transfer-offer.js`.
+   - Kết quả: Xác thực atomic toàn bộ mảng `decisions` trước khi thay đổi trạng thái. Trùng index trong cùng request trả về 400 `INVALID_INPUT`; quyết định lại file đã duyệt trả về 409 `OFFER_CONFLICT`. Mỗi `(offerId, fileIndex)` chỉ có tối đa 1 grant. Nếu bất kỳ entry nào trong batch bị lỗi, không file nào bị thay đổi trạng thái và không grant nào được phát.
+
+5. **Chất lượng nhỏ:**
+   - Đã xóa trailing whitespace ở `README.md:150`.
+   - `PATCH /api/settings` bổ sung write probe an toàn với file tạm `.probe-*.tmp` để xác minh quyền ghi thực tế trước khi thay đổi receive directory.
+
+6. **Bằng chứng kiểm thử:**
+   - Suite hồi quy tích hợp mới: `tests/integration/m3-qc-review-regression.test.js` (8/8 tests pass).
+   - `npm run quality`: **434/434 test pass** (118 suites), 0 fail, 0 skipped. Coverage: **90.63% line / 82.11% branch / 88.22% function**.
+   - `git diff --check origin/main`: Exit code 0, không có lỗi định dạng hay whitespace.

@@ -14,7 +14,9 @@
 
 import path from 'node:path';
 import { AppError } from './error-handler.js';
+import { extractSessionToken } from './session-auth.js';
 import { sanitizeFileName } from '../utils/file-utils.js';
+import { resolveSender } from '../utils/connection-identity.js';
 
 export const GRANT_HEADER = 'x-transfer-grant';
 
@@ -87,11 +89,28 @@ export function requireTransferGrant({ required = true } = {}) {
       return next(new AppError('TRANSFER_GRANT_UNAVAILABLE', 500, 'Transfer consent unavailable'));
     }
 
-    const connectionId = req.headers['x-connection-id'] || null;
+    // Verify sender attribution and session binding (M3-QC-01)
+    let connectionId = null;
+    try {
+      const sender = resolveSender(req);
+      connectionId = sender.connectionId;
+    } catch (err) {
+      return next(err);
+    }
+
+    const sessions = req.app.locals.sessions || req.app.locals.runtime?.sessions;
+    const reqToken = extractSessionToken(req);
+
     const grants = [];
     try {
       for (const grantId of grantIds) {
-        grants.push(offerService.beginGrant(grantId, { connectionId }));
+        grants.push(
+          offerService.beginGrant(grantId, {
+            connectionId,
+            isSessionOwner: (grantConnId) =>
+              Boolean(reqToken && sessions?.hasConnection?.(reqToken, grantConnId)),
+          })
+        );
       }
     } catch (err) {
       // Do not leave the already-claimed grants stuck in `in_use`.
@@ -124,12 +143,11 @@ export function requireTransferGrant({ required = true } = {}) {
 }
 
 /**
- * Binds the files Multer actually parsed to the grants the host approved. The gate
- * runs before parsing, so this second check is what ties consent to real bytes: a
- * grant for `report.pdf` cannot be spent on something else, and a batch cannot
- * carry more files than were approved.
+ * Binds the files Multer actually parsed or chunked init declared to the grants the host
+ * approved. The gate runs before parsing/session creation, so this check is what ties
+ * consent to real bytes: name, size and checksum must match what was approved (M3-QC-02).
  * @param {import('express').Request} req
- * @param {Array<{originalname?: string, size: number}>} files
+ * @param {Array<{originalname?: string, fileName?: string, name?: string, size?: number, fileSize?: number, checksum?: string}>} files
  * @throws {AppError}
  */
 export function assertGrantsMatchFiles(req, files) {
@@ -151,16 +169,25 @@ export function assertGrantsMatchFiles(req, files) {
   // cannot be used to smuggle a different file past the host's decision.
   const unmatched = [...grants];
   for (const file of files) {
-    const index = unmatched.findIndex(
-      (grant) =>
-        grant.size === file.size &&
-        (!file.originalname || normalizeName(grant.name) === normalizeName(file.originalname))
-    );
+    const fileName = file.originalname || file.fileName || file.name;
+    const fileSize = Number(file.size ?? file.fileSize);
+    const checksum = file.checksum;
+
+    const index = unmatched.findIndex((grant) => {
+      if (grant.size !== fileSize) return false;
+      if (!fileName || normalizeName(grant.name) !== normalizeName(fileName)) return false;
+      if (grant.checksum) {
+        if (!checksum || String(checksum).toLowerCase() !== String(grant.checksum).toLowerCase()) {
+          return false;
+        }
+      }
+      return true;
+    });
     if (index === -1) {
       throw new AppError(
         'GRANT_MISMATCH',
         403,
-        `File "${file.originalname || 'unnamed'}" (${file.size} bytes) does not match any approved file`
+        `File "${fileName || 'unnamed'}" (${fileSize} bytes) does not match approved metadata`
       );
     }
     unmatched.splice(index, 1);

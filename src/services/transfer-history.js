@@ -106,13 +106,27 @@ export class TransferHistoryService {
   /**
    * The host sees the whole history; a client sees only what it sent. Filtering by
    * connection is what stops one phone from reading another phone's activity.
-   * @param {{ connectionId?: string|null, isHost?: boolean, limit?: number }} [options]
+   * @param {{ connectionId?: string|null, connectionIds?: string[]|Set<string>|null, isHost?: boolean, limit?: number }} [options]
    */
-  list({ connectionId = null, isHost = false, limit = MAX_LIST } = {}) {
+  list({ connectionId = null, connectionIds = null, isHost = false, limit = MAX_LIST } = {}) {
     const capped = Math.min(Math.max(Number(limit) || MAX_LIST, 1), MAX_LIST);
-    const visible = isHost
-      ? this.entries
-      : this.entries.filter((entry) => entry.connectionId && entry.connectionId === connectionId);
+    if (isHost) {
+      return this.entries.slice(0, capped);
+    }
+
+    const ids = connectionIds
+      ? new Set(connectionIds)
+      : connectionId
+        ? new Set([connectionId])
+        : null;
+
+    if (!ids || ids.size === 0) {
+      return [];
+    }
+
+    const visible = this.entries.filter(
+      (entry) => entry.connectionId && ids.has(entry.connectionId)
+    );
     return visible.slice(0, capped);
   }
 

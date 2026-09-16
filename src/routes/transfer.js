@@ -15,67 +15,9 @@ import { requireHost } from '../middleware/host-auth.js';
 import { extractSessionToken } from '../middleware/session-auth.js';
 import { requireTransferGrant, assertGrantsMatchFiles } from '../middleware/transfer-grant.js';
 import { hashDeviceToken } from '../services/trusted-devices.js';
+import { resolveSender } from '../utils/connection-identity.js';
 
 export const transferRouter = Router();
-
-/**
- * Resolves and strictly validates sender attribution from request headers/body against
- * observed connection state. Throws 403 INVALID_CONNECTION_ID if connectionId is spoofed
- * or belongs to a different socket IP / session.
- * @param {import('express').Request} req
- */
-function resolveSender(req) {
-  const connectionId = req.headers['x-connection-id'] || req.body?.connectionId || null;
-  const rawReqIp = req.ip || req.socket?.remoteAddress || 'unknown';
-  const cleanReqIp = rawReqIp.replace(/^::ffff:/, '');
-
-  if (connectionId) {
-    const wss = req.app.get('wss') || req.app.locals.runtime?.wss;
-    if (wss && wss.clients) {
-      let matchedClient = null;
-      for (const client of wss.clients) {
-        if (client.connectionId === connectionId) {
-          matchedClient = client;
-          break;
-        }
-      }
-      if (!matchedClient) {
-        throw new AppError('INVALID_CONNECTION_ID', 403, 'Connection ID not found or expired');
-      }
-
-      const clientIp = (matchedClient._remoteIp || '').replace(/^::ffff:/, '');
-      if (clientIp && cleanReqIp && cleanReqIp !== 'unknown' && clientIp !== cleanReqIp) {
-        throw new AppError('INVALID_CONNECTION_ID', 403, 'Connection ID does not match sender IP');
-      }
-
-      // If PIN is required (or socket is bound to a session), verify that session matches
-      const isPinRequired =
-        req.app.locals.pinRequired ?? req.app.locals.runtime?.pinRequired ?? false;
-      const hostAuth = req.app.locals.hostAuth || req.app.locals.runtime?.hostAuth;
-      const hostToken = req.headers['x-host-token'];
-      const isHostReq = Boolean(hostToken && hostAuth?.verify(req, hostToken));
-
-      if (!isHostReq && (isPinRequired || matchedClient.sessionToken)) {
-        const reqToken = extractSessionToken(req);
-        if (!reqToken || !matchedClient.sessionToken || matchedClient.sessionToken !== reqToken) {
-          throw new AppError(
-            'INVALID_CONNECTION_ID',
-            403,
-            'Connection ID belongs to a different session'
-          );
-        }
-      }
-    }
-  }
-
-  return {
-    connectionId,
-    ip: rawReqIp,
-    label: req.headers['x-device-name'] || req.body?.deviceName || 'Unknown device',
-    labelUntrusted: true,
-    platform: req.headers['x-platform'] || req.body?.platform || 'unknown',
-  };
-}
 
 /**
  * Custom Multer storage engine that streams files to pending staging area while atomically
@@ -341,8 +283,8 @@ transferRouter.post('/api/transfer/offer', async (req, res, next) => {
     const sender = resolveSender(req);
     const deviceToken = readDeviceToken(req);
     const trusted = Boolean(deviceToken && runtime.trustedDevices.isTrusted(deviceToken));
-    // Kept on the offer so the host can remember this device without ever learning
-    // the device's secret. `sanitize()` never emits it.
+    const reqToken = extractSessionToken(req);
+    if (reqToken) sender.sessionToken = reqToken;
     if (deviceToken) sender.deviceTokenHash = hashDeviceToken(deviceToken);
 
     const { offer, autoApproved } = runtime.offerService.createOffer({
@@ -385,9 +327,22 @@ transferRouter.get('/api/transfer/offer/:offerId', (req, res, next) => {
       throw new AppError('OFFER_NOT_FOUND', 404, `Offer ${req.params.offerId} not found`);
     }
 
-    const connectionId = req.headers['x-connection-id'] || null;
-    if (offer.sender?.connectionId && offer.sender.connectionId !== connectionId) {
-      throw new AppError('OFFER_FORBIDDEN', 403, 'Offer belongs to another connection');
+    const hostAuth = req.app.locals.hostAuth || runtime.hostAuth;
+    const isHost = Boolean(hostAuth?.verify(req, req.headers['x-host-token']));
+
+    if (!isHost && offer.sender?.connectionId) {
+      const sender = resolveSender(req, { required: true });
+      const reqToken = extractSessionToken(req);
+      const sessions = req.app.locals.sessions || runtime.sessions;
+      const isOwnerConn = offer.sender.connectionId === sender.connectionId;
+      const isOwnerSession = Boolean(
+        reqToken &&
+        ((offer.sender.sessionToken && offer.sender.sessionToken === reqToken) ||
+          sessions?.hasConnection?.(reqToken, offer.sender.connectionId))
+      );
+      if (!isOwnerConn && !isOwnerSession) {
+        throw new AppError('OFFER_FORBIDDEN', 403, 'Offer belongs to another connection');
+      }
     }
 
     res.json({
@@ -409,8 +364,17 @@ transferRouter.post('/api/transfer/offer/cancel', (req, res, next) => {
     if (!offerId) {
       throw new AppError('INVALID_INPUT', 400, 'offerId is required');
     }
+    const hostAuth = req.app.locals.hostAuth || req.app.locals.runtime?.hostAuth;
+    const isHost = Boolean(hostAuth?.verify(req, req.headers['x-host-token']));
+    const sender = isHost ? { connectionId: null } : resolveSender(req, { required: true });
+    const reqToken = extractSessionToken(req);
+    const sessions = req.app.locals.sessions || req.app.locals.runtime?.sessions;
     const canceled = req.app.locals.runtime.offerService.cancelOffer(offerId, {
-      connectionId: req.headers['x-connection-id'] || null,
+      connectionId: sender.connectionId,
+      sessionToken: reqToken,
+      isSessionOwner: (offerConnId) =>
+        Boolean(reqToken && sessions?.hasConnection?.(reqToken, offerConnId)),
+      isHost,
     });
     res.json({ success: true, data: canceled });
   } catch (error) {
@@ -708,12 +672,15 @@ transferRouter.post('/api/upload/init', requireTransferGrant(), async (req, res,
       );
     }
     const grant = grants[0] || null;
-    if (grant && Number(fileSize) !== grant.size) {
-      throw new AppError(
-        'GRANT_SIZE_MISMATCH',
-        403,
-        `Declared size ${fileSize} does not match the approved size ${grant.size}`
-      );
+    if (grant) {
+      assertGrantsMatchFiles(req, [
+        {
+          fileName,
+          fileSize: Number(fileSize),
+          mimeType,
+          checksum,
+        },
+      ]);
     }
 
     const result = await runtime.chunkedUploadManager.initUpload({

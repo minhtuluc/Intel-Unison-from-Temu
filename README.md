@@ -147,7 +147,7 @@ utrans -p 9090
    - Thanh tiến độ hiển thị % hoàn thành, tốc độ MB/s và thời gian còn lại (ETA).
 5. **Host duyệt trước khi truyền (UT-012)**:
    - Ngay khi chọn file, điện thoại gửi **danh sách** (tên, cỡ, loại) — chưa có dữ liệu nào được gửi.
-   - Trên PC bật lên hộp thoại liệt kê từng file kèm checkbox:  
+   - Trên PC bật lên hộp thoại liệt kê từng file kèm checkbox:
      _“Thiết bị [Tên máy] muốn gửi N file(s)”_
    - Bấm **Approve Selected**: chỉ những file được tick mới được phép truyền, và chúng được lưu thẳng vào thư mục `Downloads\UniversalTrans` — không hỏi lại lần hai.
    - Bấm **Decline All**: không file nào được gửi, không byte nào được ghi.

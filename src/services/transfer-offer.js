@@ -177,11 +177,20 @@ export class TransferOfferService {
     if (!Array.isArray(decisions) || decisions.length === 0) {
       throw new AppError('INVALID_INPUT', 400, 'decisions must be a non-empty array');
     }
+    // Atomic validation across all entries before mutating any state (M3-QC-04)
+    const seenIndices = new Set();
+    const planned = [];
 
-    const approvals = [];
     for (const decision of decisions) {
       const index = Number(decision?.index);
-      const action = decision?.action;
+      if (!Number.isInteger(index) || index < 0) {
+        throw new AppError('INVALID_INPUT', 400, `Invalid file index: ${decision?.index}`);
+      }
+      if (seenIndices.has(index)) {
+        throw new AppError('INVALID_INPUT', 400, `Duplicate index ${index} in decisions batch`);
+      }
+      seenIndices.add(index);
+
       const target = offer.files.find((f) => f.index === index);
       if (!target) {
         throw new AppError(
@@ -190,9 +199,23 @@ export class TransferOfferService {
           `decisions index ${decision?.index} is not in offer`
         );
       }
+      const action = decision?.action;
       if (action !== 'approve' && action !== 'reject') {
         throw new AppError('INVALID_INPUT', 400, 'action must be "approve" or "reject"');
       }
+      if (target.decision !== 'pending') {
+        throw new AppError(
+          'OFFER_CONFLICT',
+          409,
+          `File index ${index} has already been decided (${target.decision})`
+        );
+      }
+      planned.push({ target, action, index });
+    }
+
+    // Apply mutations only after all checks have succeeded
+    const approvals = [];
+    for (const { target, action, index } of planned) {
       target.decision = action === 'approve' ? 'approved' : 'rejected';
       if (action === 'approve') approvals.push(index);
     }
@@ -223,6 +246,12 @@ export class TransferOfferService {
 
   /** @private */
   _issueGrant(offer, index) {
+    // Ensure at most one grant per (offerId, fileIndex) (M3-QC-04)
+    for (const existing of this.grants.values()) {
+      if (existing.offerId === offer.offerId && existing.fileIndex === index) {
+        return existing;
+      }
+    }
     const file = offer.files.find((f) => f.index === index);
     const grantId = generateId('gr_', 24);
     const grant = {
@@ -254,7 +283,7 @@ export class TransferOfferService {
       throw new AppError(
         'TRANSFER_GRANT_REQUIRED',
         428,
-        'A host-approved transfer grant is required'
+        'Host approval is required before uploading. Request a transfer offer first.'
       );
     }
 
@@ -276,13 +305,20 @@ export class TransferOfferService {
     if (grant.status === 'in_use') {
       throw new AppError('TRANSFER_GRANT_BUSY', 409, 'Transfer grant is already in use');
     }
-    // A grant authorizes one connection only; a stolen id is useless elsewhere.
-    if (grant.connectionId && context.connectionId && grant.connectionId !== context.connectionId) {
-      throw new AppError(
-        'TRANSFER_GRANT_INVALID',
-        403,
-        'Transfer grant belongs to another connection'
+    // A grant authorizes one connection only; a stolen id or missing connection is useless elsewhere (M3-QC-01)
+    if (grant.connectionId) {
+      const matchConn = Boolean(
+        context.connectionId && grant.connectionId === context.connectionId
       );
+      const matchSessionConn =
+        typeof context.isSessionOwner === 'function' && context.isSessionOwner(grant.connectionId);
+      if (!matchConn && !matchSessionConn) {
+        throw new AppError(
+          'TRANSFER_GRANT_INVALID',
+          403,
+          'Transfer grant belongs to another connection'
+        );
+      }
     }
 
     grant.status = 'in_use';
@@ -347,8 +383,20 @@ export class TransferOfferService {
     if (!offer) {
       throw new AppError('OFFER_NOT_FOUND', 404, `Offer ${offerId} not found`);
     }
-    if (offer.sender?.connectionId && context.connectionId) {
-      if (offer.sender.connectionId !== context.connectionId) {
+    if (!context.isHost && offer.sender?.connectionId) {
+      const matchConn = Boolean(
+        context.connectionId && offer.sender.connectionId === context.connectionId
+      );
+      const matchSession = Boolean(
+        context.sessionToken &&
+        offer.sender.sessionToken &&
+        context.sessionToken === offer.sender.sessionToken
+      );
+      const matchSessionConn =
+        typeof context.isSessionOwner === 'function' &&
+        context.isSessionOwner(offer.sender.connectionId);
+
+      if (!matchConn && !matchSession && !matchSessionConn) {
         throw new AppError('OFFER_FORBIDDEN', 403, 'Offer belongs to another connection');
       }
     }

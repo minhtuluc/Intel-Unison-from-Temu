@@ -13,6 +13,8 @@ import { requireHost } from '../middleware/host-auth.js';
 import { AppError } from '../middleware/error-handler.js';
 import { resolvePath } from '../config.js';
 import { logger } from '../utils/logger.js';
+import { extractSessionToken } from '../middleware/session-auth.js';
+import { resolveSender, getSessionConnectionIds } from '../utils/connection-identity.js';
 
 export const settingsRouter = Router();
 
@@ -118,6 +120,18 @@ settingsRouter.patch('/api/settings', requireHost, async (req, res, next) => {
       if (!stat.isDirectory()) {
         throw new AppError('INVALID_UPLOAD_DIR', 400, 'uploadDir is not a directory');
       }
+      // Probe write capability (M3 QC review)
+      const probeFile = path.join(resolved, `.probe-${process.pid}-${Date.now()}.tmp`);
+      try {
+        await fs.promises.writeFile(probeFile, '');
+        await fs.promises.rm(probeFile, { force: true });
+      } catch (writeErr) {
+        throw new AppError(
+          'INVALID_UPLOAD_DIR',
+          400,
+          `uploadDir is not writable: ${writeErr.message}`
+        );
+      }
     } catch (err) {
       if (err instanceof AppError) throw err;
       throw new AppError('INVALID_UPLOAD_DIR', 400, `uploadDir cannot be used: ${err.message}`);
@@ -147,20 +161,57 @@ settingsRouter.get('/api/quota', (req, res) => {
 });
 
 /** GET /api/transfers/history — host sees everything, a client sees only its own. */
-settingsRouter.get('/api/transfers/history', (req, res) => {
-  const runtime = req.app.locals.runtime;
-  const hostAuth = req.app.locals.hostAuth || runtime.hostAuth;
-  const isHost = Boolean(hostAuth?.verify(req, req.headers['x-host-token']));
+settingsRouter.get('/api/transfers/history', (req, res, next) => {
+  try {
+    const runtime = req.app.locals.runtime;
+    const hostAuth = req.app.locals.hostAuth || runtime.hostAuth;
+    const isHost = Boolean(hostAuth?.verify(req, req.headers['x-host-token']));
 
-  res.json({
-    success: true,
-    data: {
-      scope: isHost ? 'host' : 'self',
-      entries: runtime.history.list({
-        isHost,
-        connectionId: req.headers['x-connection-id'] || null,
-        limit: Number(req.query.limit) || undefined,
-      }),
-    },
-  });
+    if (isHost) {
+      return res.json({
+        success: true,
+        data: {
+          scope: 'host',
+          entries: runtime.history.list({
+            isHost: true,
+            limit: Number(req.query.limit) || undefined,
+          }),
+        },
+      });
+    }
+
+    // Non-host client: verify connection identity server-side (M3-QC-03)
+    const connectionHeader = req.headers['x-connection-id'];
+    const reqToken = extractSessionToken(req);
+    let allowedConnectionIds = [];
+    if (connectionHeader) {
+      // Claimed connectionId MUST belong to the caller's session/IP
+      const sender = resolveSender(req, { required: true });
+      if (reqToken) {
+        allowedConnectionIds = getSessionConnectionIds(req);
+        if (sender.connectionId && !allowedConnectionIds.includes(sender.connectionId)) {
+          allowedConnectionIds.push(sender.connectionId);
+        }
+      } else {
+        allowedConnectionIds = [sender.connectionId];
+      }
+    } else {
+      // No header: query all connections registered under caller's session
+      allowedConnectionIds = getSessionConnectionIds(req);
+    }
+
+    res.json({
+      success: true,
+      data: {
+        scope: 'self',
+        entries: runtime.history.list({
+          isHost: false,
+          connectionIds: allowedConnectionIds,
+          limit: Number(req.query.limit) || undefined,
+        }),
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
 });

@@ -152,6 +152,53 @@ describe('UT-012 offer lifecycle', () => {
     });
   });
 
+  it('rejects duplicate indices in the same decision batch (M3-QC-04)', () => {
+    const offers = service();
+    const { offer } = offers.createOffer({ files: [file('a.txt', 5), file('b.txt', 6)], sender });
+    assert.throws(
+      () =>
+        offers.decide(offer.offerId, [
+          { index: 0, action: 'approve' },
+          { index: 0, action: 'reject' },
+        ]),
+      { code: 'INVALID_INPUT' }
+    );
+    // State remains untouched
+    assert.equal(offer.files[0].decision, 'pending');
+    assert.equal(offers.getGrantsForOffer(offer.offerId).length, 0);
+  });
+
+  it('rejects decisions on files already decided and keeps batch atomic (M3-QC-04)', () => {
+    const offers = service();
+    const { offer } = offers.createOffer({
+      files: [file('a.txt', 5), file('b.txt', 6), file('c.txt', 7)],
+      sender,
+    });
+    // First decision: approve index 0
+    offers.decide(offer.offerId, [{ index: 0, action: 'approve' }]);
+    assert.equal(offer.files[0].decision, 'approved');
+    assert.equal(offer.state, 'pending'); // still pending because index 1 and 2 are pending
+
+    // Attempting to approve index 0 again while offer is pending throws 409
+    assert.throws(() => offers.decide(offer.offerId, [{ index: 0, action: 'approve' }]), {
+      code: 'OFFER_CONFLICT',
+    });
+
+    // Atomic batch test: attempting to approve index 1 along with invalid index 0
+    assert.throws(
+      () =>
+        offers.decide(offer.offerId, [
+          { index: 1, action: 'approve' },
+          { index: 0, action: 'approve' },
+        ]),
+      { code: 'OFFER_CONFLICT' }
+    );
+    // Index 1 must still be pending because the batch failed atomically
+    assert.equal(offer.files[1].decision, 'pending');
+    // Only 1 grant issued from the first request
+    assert.equal(offers.getGrantsForOffer(offer.offerId).length, 1);
+  });
+
   it('auto-approves every file for a trusted device', () => {
     const offers = service();
     const { autoApproved, grants } = offers.createOffer({
@@ -197,20 +244,22 @@ describe('UT-012 grant redemption', () => {
     const grant = approvedGrant(offers);
 
     assert.equal(grant.status, 'issued');
-    assert.equal(offers.beginGrant(grant.grantId).status, 'in_use');
+    assert.equal(offers.beginGrant(grant.grantId, { connectionId: 'conn-1' }).status, 'in_use');
     offers.fulfillGrant(grant.grantId);
     assert.equal(offers.getGrant(grant.grantId).status, 'fulfilled');
-    assert.throws(() => offers.beginGrant(grant.grantId), { code: 'TRANSFER_GRANT_USED' });
+    assert.throws(() => offers.beginGrant(grant.grantId, { connectionId: 'conn-1' }), {
+      code: 'TRANSFER_GRANT_USED',
+    });
   });
 
   it('returns a grant to issued after a failed attempt so a retry can work', () => {
     const offers = service();
     const grant = approvedGrant(offers);
 
-    offers.beginGrant(grant.grantId);
+    offers.beginGrant(grant.grantId, { connectionId: 'conn-1' });
     offers.releaseGrant(grant.grantId);
     assert.equal(offers.getGrant(grant.grantId).status, 'issued');
-    assert.equal(offers.beginGrant(grant.grantId).status, 'in_use');
+    assert.equal(offers.beginGrant(grant.grantId, { connectionId: 'conn-1' }).status, 'in_use');
   });
 
   it('refuses a missing, unknown or concurrently spent grant', () => {
@@ -219,14 +268,19 @@ describe('UT-012 grant redemption', () => {
     assert.throws(() => offers.beginGrant('gr_unknown'), { code: 'TRANSFER_GRANT_INVALID' });
 
     const grant = approvedGrant(offers);
-    offers.beginGrant(grant.grantId);
-    assert.throws(() => offers.beginGrant(grant.grantId), { code: 'TRANSFER_GRANT_BUSY' });
+    offers.beginGrant(grant.grantId, { connectionId: 'conn-1' });
+    assert.throws(() => offers.beginGrant(grant.grantId, { connectionId: 'conn-1' }), {
+      code: 'TRANSFER_GRANT_BUSY',
+    });
   });
 
-  it('refuses a grant presented by a different connection', () => {
+  it('refuses a grant presented by a different or missing connection', () => {
     const offers = service();
     const grant = approvedGrant(offers);
     assert.throws(() => offers.beginGrant(grant.grantId, { connectionId: 'other' }), {
+      code: 'TRANSFER_GRANT_INVALID',
+    });
+    assert.throws(() => offers.beginGrant(grant.grantId), {
       code: 'TRANSFER_GRANT_INVALID',
     });
   });
@@ -236,7 +290,9 @@ describe('UT-012 grant redemption', () => {
     const grant = approvedGrant(offers);
     grant.expiresAt = Date.now() - 1;
 
-    assert.throws(() => offers.beginGrant(grant.grantId), { code: 'TRANSFER_GRANT_EXPIRED' });
+    assert.throws(() => offers.beginGrant(grant.grantId, { connectionId: 'conn-1' }), {
+      code: 'TRANSFER_GRANT_EXPIRED',
+    });
     assert.equal(offers.getGrant(grant.grantId), null);
     assert.equal(offers.sweepGrants(), 0, 'the expired grant was already dropped');
   });

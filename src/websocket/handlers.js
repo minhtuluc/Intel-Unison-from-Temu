@@ -25,6 +25,10 @@ export function handleWsMessage(wss, ws, rawMessage) {
       ws.sessionToken = session ? (typeof session === 'object' ? session.token : session) : null;
       ws.authorized = Boolean(ws.isHost || session || !ws.pinRequired);
 
+      if (ws.sessionToken) {
+        ws.sessions?.addConnection?.(ws.sessionToken, ws.connectionId);
+      }
+
       if (!ws.authorized) {
         if (ws.readyState === 1) {
           ws.send(
