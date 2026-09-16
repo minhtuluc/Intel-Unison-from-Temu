@@ -206,8 +206,12 @@ describe('UT-012: transfer consent before bytes move', () => {
     for (const label of ['Owner', 'Thief']) {
       const ws = new WebSocket(`ws://127.0.0.1:${serverInstance.server.address().port}/ws`);
       sockets.push(ws);
-      const events = [];
-      ws.on('message', (raw) => events.push(JSON.parse(raw)));
+      const registered = new Promise((resolve) => {
+        ws.on('message', (raw) => {
+          const message = JSON.parse(raw.toString());
+          if (message.event === 'client:registered') resolve(message.data.connectionId);
+        });
+      });
       await new Promise((resolve) => ws.on('open', resolve));
       ws.send(
         JSON.stringify({
@@ -215,8 +219,7 @@ describe('UT-012: transfer consent before bytes move', () => {
           data: { deviceName: `${label} Device`, platform: 'android' },
         })
       );
-      await new Promise((resolve) => setTimeout(resolve, 80));
-      connectionIds.push(events.find((e) => e.event === 'client:registered').data.connectionId);
+      connectionIds.push(await registered);
     }
     const [ownerId, thiefId] = connectionIds;
     assert.notEqual(ownerId, thiefId);
@@ -404,7 +407,15 @@ describe('UT-012: transfer consent before bytes move', () => {
     const ws = new WebSocket(`ws://127.0.0.1:${serverInstance.server.address().port}/ws`);
     sockets.push(ws);
     const events = [];
-    ws.on('message', (raw) => events.push(JSON.parse(raw)));
+    let resolveRegistration;
+    const registered = new Promise((resolve) => {
+      resolveRegistration = resolve;
+    });
+    ws.on('message', (raw) => {
+      const message = JSON.parse(raw.toString());
+      events.push(message);
+      if (message.event === 'client:registered') resolveRegistration(message.data.connectionId);
+    });
     await new Promise((resolve) => ws.on('open', resolve));
 
     ws.send(
@@ -413,9 +424,7 @@ describe('UT-012: transfer consent before bytes move', () => {
         data: { deviceName: 'Timeout Sender', platform: 'android' },
       })
     );
-    await new Promise((resolve) => setTimeout(resolve, 80));
-    const connectionId = events.find((e) => e.event === 'client:registered')?.data?.connectionId;
-    assert.ok(connectionId, 'sender must register to receive the expiry event');
+    const connectionId = await registered;
 
     const { body } = await requestOffer(base, [{ name: 'never_sent.bin', size: 32 }], {
       connectionId,
