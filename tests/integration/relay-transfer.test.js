@@ -13,7 +13,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { startServer } from '../../src/server.js';
-import { connectWs, waitForEventName, delay, WebSocket } from '../helpers/ws.js';
+import { connectWs, waitForEvent, waitForEventName, delay, WebSocket } from '../helpers/ws.js';
 
 const PIN = '1234';
 const DEVICE_TOKEN_B = 'b'.repeat(64);
@@ -316,6 +316,58 @@ describe('Relay transfers — receiver-only consent (UT-021)', () => {
     });
     assert.equal(sender.status, 200);
     assert.equal((await sender.json()).data.relay.state, 'cancelled');
+  });
+
+  it('never lets the sender, an observer or the host see the receiver’s download capability', async () => {
+    const relay = await openRelay('capability.bin');
+    const decision = await decideB(relay.relayId, 'accept');
+    const decisionBody = await decision.json();
+    const token = decisionBody.data.files[0].relayToken;
+    const grantId = decisionBody.data.files[0].grantId;
+    assert.match(token, /^[a-f0-9]{64}$/);
+
+    // The sender must still learn what it may upload...
+    const senderEvent = await waitForEvent(
+      clientA.events,
+      (event) => event.event === 'relay:decision' && event.data?.relayId === relay.relayId
+    );
+    assert.equal(senderEvent.data.files[0].grantId, grantId);
+    assert.equal(senderEvent.data.files[0].relayToken, undefined);
+    await delay(60);
+
+    // ...but the capability is the receiver's alone, everywhere (M4-QC-01).
+    for (const [who, client] of [
+      ['sender', clientA],
+      ['observer', clientC],
+      ['host', hostSocket],
+      ['receiver', clientB],
+    ]) {
+      const leaked = client.events.filter((event) => JSON.stringify(event).includes(token));
+      assert.equal(leaked.length, 0, `${who} must never receive the raw download capability`);
+      const named = client.events.filter((event) => JSON.stringify(event).includes('relayToken'));
+      assert.equal(named.length, 0, `${who} must not even see a relayToken field`);
+    }
+  });
+
+  it('does not grant readback to a peer that only claims another connection id', async () => {
+    const relay = await openRelay('readback.bin');
+
+    // C presents its own session but A's connection id (M4-QC-02).
+    const spoof = await fetch(`${ctx.baseUrl}/api/relay/offer/${relay.relayId}`, {
+      headers: jsonHeaders({ sessionToken: tokenC, connectionId: clientA.connId }),
+    });
+    assert.equal(spoof.status, 403);
+
+    // The two real parties still read it.
+    const asSender = await fetch(`${ctx.baseUrl}/api/relay/offer/${relay.relayId}`, {
+      headers: jsonHeaders({ sessionToken: tokenA, connectionId: clientA.connId }),
+    });
+    assert.equal(asSender.status, 200);
+
+    const asReceiver = await fetch(`${ctx.baseUrl}/api/relay/offer/${relay.relayId}`, {
+      headers: jsonHeaders({ sessionToken: tokenB, connectionId: clientB.connId }),
+    });
+    assert.equal(asReceiver.status, 200);
   });
 
   it('keeps a reconnected receiver able to decide, as a brand-new connection', async () => {

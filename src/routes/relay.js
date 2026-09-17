@@ -142,12 +142,21 @@ relayRouter.get('/api/relay/offer/:relayId', (req, res, next) => {
 
     if (!isHostRequest(req)) {
       const keys = actorKeys(req);
-      const connectionId = req.headers['x-connection-id'] || req.body?.connectionId || null;
       const isReceiver = intersects(keys, relay.receiver.keys);
-      const isSender = Boolean(
-        (connectionId && relay.sender?.connectionId === connectionId) ||
-        intersects(keys, relay.sender?.keys || [])
-      );
+
+      // The receiver is recognized by the identity keys bound when the offer was created.
+      // The sender is recognized the same way, or — for a client that presents no durable
+      // key — by verifying its connection against the live socket, its IP and its session,
+      // exactly like the write paths do. A claimed `X-Connection-Id` on its own is not
+      // authority (M4-QC-02).
+      let isSender = intersects(keys, relay.sender?.keys || []);
+      if (!isSender) {
+        const verified = resolveSender(req, { required: true });
+        isSender = Boolean(
+          verified.connectionId && relay.sender?.connectionId === verified.connectionId
+        );
+      }
+
       if (!isReceiver && !isSender) {
         throw new AppError('RELAY_FORBIDDEN', 403, 'Relay belongs to another peer');
       }
@@ -198,23 +207,37 @@ relayRouter.post('/api/relay/decision', (req, res, next) => {
     const result = runtime.relayService.decide(relayId, decisions, { keys: actorKeys(req) });
 
     const wss = req.app.get('wss');
-    const payload = {
-      relayId,
-      decisions: result.decisions,
-      // Returned only to the receiver, in this response. Never broadcast, never logged.
-      files: result.decisions.map((decision) => ({
-        ...decision,
-        relayToken: result.tokens[decision.index] || null,
-      })),
-    };
+
+    // Two DTOs on purpose (M4-QC-01). The download capability is the receiver's alone: it
+    // travels in the receiver's HTTP response exactly once and is never broadcast, so the
+    // event the sender receives carries only what it needs to upload.
+    const decisionSummary = result.decisions.map((decision) => ({
+      index: decision.index,
+      decision: decision.decision,
+      grantId: decision.grantId,
+    }));
 
     if (wss) {
-      sendToIdentity(wss, result.relay.sender?.keys || [], 'relay:decision', payload);
+      sendToIdentity(wss, result.relay.sender?.keys || [], 'relay:decision', {
+        relayId,
+        decisions: decisionSummary,
+        files: decisionSummary,
+      });
       const sanitized = runtime.relayService.sanitize(result.relay);
       broadcastEvent(wss, 'relay:update', { relay: sanitized }, (client) => Boolean(client.isHost));
     }
 
-    res.json({ success: true, data: payload });
+    res.json({
+      success: true,
+      data: {
+        relayId,
+        decisions: decisionSummary,
+        files: result.decisions.map((decision) => ({
+          ...decision,
+          relayToken: result.tokens[decision.index] || null,
+        })),
+      },
+    });
   } catch (error) {
     next(error);
   }
@@ -250,7 +273,9 @@ relayRouter.get('/api/relay/active', requireHost, (req, res) => {
 
 /**
  * POST /api/relay/revoke — host stops a relay and/or deletes what it left on disk.
- * The host may remove relayed bytes; it may not read them.
+ * The host can remove relayed bytes; the app offers it no way to read them. That is an
+ * authorization boundary inside the app, not encryption: the machine's owner still has
+ * the plaintext in the relay staging area.
  */
 relayRouter.post('/api/relay/revoke', requireHost, (req, res, next) => {
   try {

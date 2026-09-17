@@ -53,7 +53,7 @@ Số liệu đo trên trạng thái cuối của nhánh M4, ngày 2026-09-17, No
 ## 🚀 Tính năng nổi bật (Highlights)
 
 - ⚡ **Truyền qua mạng nội bộ**: Dữ liệu đi qua máy host trên Wi-Fi LAN, không đi qua cloud. Đây chưa phải truyền P2P trực tiếp giữa hai client.
-- 🎯 **Gửi riêng cho một thiết bị (relay)**: chọn đúng người nhận trong danh sách thiết bị đang online. Chỉ thiết bị đó được duyệt và được tải; host chở byte nhưng không đọc được nội dung. Xem [mục 3](#3-gửi-riêng-cho-một-thiết-bị-relay).
+- 🎯 **Gửi riêng cho một thiết bị (relay)**: chọn đúng người nhận trong danh sách thiết bị đang online. Chỉ thiết bị đó được duyệt và được tải; host chở byte nhưng app không cho host tải file đó. Xem [mục 3](#3-gửi-riêng-cho-một-thiết-bị-relay).
 - 📱 **Tương thích toàn diện đa nền tảng**:
   - **PC Host**: Windows 10/11, Linux (Ubuntu, Debian, Fedora, Arch...).
   - **Thiết bị di động**: Android (Chrome PWA), iPhone & iPad (Safari Standalone PWA).
@@ -165,9 +165,9 @@ Khi cả hai thiết bị đều đang mở app, người gửi có thể chọn
 4. File được gửi lên host và giữ ở vùng tạm riêng, **không** vào thư mục nhận của host. Thiết bị nhận mở tab **Incoming** và bấm **Download**.
 5. File tự xoá khi người nhận đã tải xong hoặc khi hết hạn `UTRANS_RELAY_TTL` (mặc định 1 giờ).
 
-Trong suốt quá trình đó: host **không** duyệt và **không** tải được file relay — host chỉ thấy một dòng metadata trong **Settings → Relay transfers** và có nút **Stop** để dừng/huỷ. Không thiết bị nào khác trong LAN nhìn thấy file này, kể cả trong tab **Files**.
+Trong suốt quá trình đó: host **không** duyệt và app **không** cho host tải file relay — host chỉ thấy một dòng metadata trong **Settings → Relay transfers** và có nút **Stop** để dừng/huỷ. Không thiết bị nào khác trong LAN nhìn thấy file này, kể cả trong tab **Files**.
 
-Giới hạn đã biết: nếu PIN tắt, liên kết tải của người nhận mang một capability dùng một lần (`?rt=…`), nên nó có thể nằm trong lịch sử trình duyệt của chính máy nhận. Nếu người nhận xoá dữ liệu trang (localStorage) trước khi tải, người gửi cần gửi lại. Chi tiết: [ADR-0004](docs/adr/0004-relay-receiver-authority.md).
+Giới hạn đã biết: đây là **ranh giới quyền trong app, không phải mã hoá** — file vẫn là bản plaintext trong vùng tạm relay, nên ai có quyền đọc filesystem trên máy host vẫn đọc được nội dung. Ngoài ra, nếu PIN tắt, liên kết tải của người nhận mang một capability dùng một lần (`?rt=…`), nên nó có thể nằm trong lịch sử trình duyệt của chính máy nhận. Nếu người nhận xoá dữ liệu trang (localStorage) trước khi tải, người gửi cần gửi lại. Chi tiết: [ADR-0004](docs/adr/0004-relay-receiver-authority.md).
 
 ### 4. Cài đặt PWA như Ứng dụng gốc
 

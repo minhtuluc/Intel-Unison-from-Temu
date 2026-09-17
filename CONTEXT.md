@@ -6,7 +6,7 @@ Host là máy chạy Node/Express, giữ staging, chunk sessions và thư mục 
 
 Client có thể upload vào staging qua `/api/share` rồi client khác download từ host: đó là trung chuyển qua host, không phải P2P.
 
-Từ M4 (nhánh `m4`, **chưa merge**), client còn có thể chọn **một thiết bị cụ thể** làm người nhận: A mở relay tới B, **chỉ B** được duyệt, file nằm ở vùng tạm riêng của host và **chỉ B** tải được. Host chở byte và có thể dừng relay, nhưng không duyệt và không đọc được file. Đây vẫn là relay qua host, chưa phải P2P.
+Từ M4 (nhánh `m4`, **chưa merge**), client còn có thể chọn **một thiết bị cụ thể** làm người nhận: A mở relay tới B, **chỉ B** được duyệt, file nằm ở vùng tạm riêng của host và **chỉ B** tải được. Host chở byte và có thể dừng relay, nhưng không duyệt và **app không cho host tải** file relay. Đây là ranh giới quyền trong app, **không phải** mã hoá đầu-cuối: file vẫn là plaintext trong vùng tạm relay. Đây vẫn là relay qua host, chưa phải P2P.
 
 Mỗi app instance có một **runtime** riêng (`createRuntime`) giữ config, staging, chunk sessions, pending, device registry, host capability và session store. Không có state dùng chung giữa hai instance trong cùng tiến trình.
 

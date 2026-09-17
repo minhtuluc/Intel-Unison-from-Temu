@@ -259,9 +259,13 @@ export class ChunkedUploadManager {
    * Streams chunk files sequentially into destination file to minimize memory usage.
    * @param {string} uploadId
    * @param {string} [targetDir] Destination directory
+   * @param {{ releaseQuota?: boolean }} [options] `releaseQuota: false` leaves the quota
+   *        reservation with the caller, which is what a relay needs: the merged file stays
+   *        on disk under a new owner, so releasing here would under-count real usage
+   *        (M4-QC-03). The new owner must release it exactly once.
    * @returns {Promise<{ fileName: string, filePath: string, size: number, mimeType: string, duration: number, averageSpeed: string }>}
    */
-  async complete(uploadId, targetDir = this.config.uploadDir) {
+  async complete(uploadId, targetDir = this.config.uploadDir, { releaseQuota = true } = {}) {
     if (this.completedOutcomes.has(uploadId)) {
       return { ...this.completedOutcomes.get(uploadId), alreadyCompleted: true };
     }
@@ -381,7 +385,7 @@ export class ChunkedUploadManager {
       });
     }
     this.sessions.delete(uploadId);
-    if (this.config.quotaTracker) {
+    if (releaseQuota && this.config.quotaTracker) {
       this.config.quotaTracker.release(session.fileSize);
     }
 

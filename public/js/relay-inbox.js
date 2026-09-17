@@ -160,7 +160,7 @@ export class RelayInbox {
       createElement(
         'p',
         { style: 'font-size: var(--font-size-xs); color: var(--color-text-secondary);' },
-        'Accepted files are held on the host for you to download. The host cannot read them.'
+        'Accepted files are held on the host for you to download, until they expire. The host app offers no download action for them — this is not end-to-end encryption.'
       ),
       createElement('div', { class: 'approval-actions' }, [
         createElement(

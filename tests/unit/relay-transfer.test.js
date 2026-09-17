@@ -216,6 +216,8 @@ describe('RelayTransferService: stored files, TTL and quota (UT-022)', () => {
       name: 'a.bin',
     });
     assert.equal(service.getStoredFile('f_1').state, 'stored');
+    // Attaching is what tells both peers the bytes are ready (M4-QC-04).
+    assert.equal(events.at(-1).state, 'stored');
 
     await delay(80);
     assert.equal(service.getStoredFile('f_1'), null);

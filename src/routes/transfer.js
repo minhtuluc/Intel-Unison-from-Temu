@@ -585,8 +585,9 @@ transferRouter.delete('/api/devices/trusted/:id', requireHost, async (req, res, 
  */
 transferRouter.get('/api/download/:fileId', async (req, res, next) => {
   try {
+    const runtime = req.app.locals.runtime;
     const { fileId } = req.params;
-    const fileRecord = req.app.locals.runtime.shareManager.getFile(fileId);
+    const fileRecord = runtime.shareManager.getFile(fileId);
 
     if (!fileRecord) {
       throw new AppError('FILE_NOT_FOUND', 404, `File ${fileId} not found`);
@@ -644,6 +645,17 @@ transferRouter.get('/api/download/:fileId', async (req, res, next) => {
     res.on('close', () => {
       stream.destroy();
     });
+
+    // Only a completed full download counts as delivered. A range request (206), a stream
+    // error or a client that walks away mid-transfer must not be reported as one, and a
+    // file that is already marked stays marked — one event per file (M4-QC-04).
+    if (fileRecord.acl?.mode === 'receiver') {
+      res.on('finish', () => {
+        if (res.statusCode === 200 && res.writableEnded) {
+          runtime.relayService.markDownloaded(fileId);
+        }
+      });
+    }
 
     stream.on('error', (err) => {
       if (!res.headersSent) {
@@ -1020,11 +1032,14 @@ transferRouter.post('/api/upload/complete', async (req, res, next) => {
       ? { relayId: session.relayId, fileIndex: session.relayFileIndex }
       : null;
 
-    // A relay-approved session reassembles straight into the relay staging area.
+    // A relay-approved session reassembles straight into the relay staging area. The
+    // reservation moves to the relay file, which owns it until TTL/revoke (M4-QC-03).
     const targetDir = relayGrant
       ? path.join(runtime.config.tempDir, 'relay')
       : path.join(runtime.config.tempDir, 'pending');
-    const result = await runtime.chunkedUploadManager.complete(uploadId, targetDir);
+    const result = await runtime.chunkedUploadManager.complete(uploadId, targetDir, {
+      releaseQuota: !relayGrant,
+    });
     if (result.pending) {
       return res.json({
         success: true,

@@ -16,7 +16,7 @@ import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
 import { startServer } from '../../src/server.js';
-import { connectWs, waitForEventName, WebSocket } from '../helpers/ws.js';
+import { connectWs, waitForEvent, waitForEventName, delay, WebSocket } from '../helpers/ws.js';
 
 const DEVICE_TOKEN_B = 'b'.repeat(64);
 const PAYLOAD = Buffer.from('relay payload bytes for the receiver only\n');
@@ -190,7 +190,7 @@ describe('Relay file storage and download ACL (UT-022)', () => {
     const host = await fetch(`${ctx.baseUrl}/api/download/${fileId}`, {
       headers: headers({ hostToken }),
     });
-    assert.equal(host.status, 403, 'the host carries the file but may not read it');
+    assert.equal(host.status, 403, 'the host app exposes no download action for relayed files');
 
     const wrongToken = await fetch(`${ctx.baseUrl}/api/download/${fileId}?rt=${'f'.repeat(64)}`);
     assert.equal(wrongToken.status, 403);
@@ -226,11 +226,13 @@ describe('Relay file storage and download ACL (UT-022)', () => {
     assert.deepEqual((await theirs.json()).data.files, []);
   });
 
-  it('relays a chunked upload the same way, and only the receiver can fetch it', async () => {
-    const name = 'relay-chunked.bin';
-    // Small enough to be a single chunk (the configured chunk size is megabytes), which
-    // keeps the assertion about routing and ACL rather than about chunk arithmetic.
-    const total = Buffer.from('chunked relay payload');
+  /**
+   * Runs a full chunked relay transfer and returns the stored file.
+   * Small enough to be a single chunk (the configured chunk size is megabytes), which
+   * keeps the assertions about routing, ACL and quota rather than chunk arithmetic.
+   */
+  async function sendChunkedRelayFile(name, payload) {
+    const total = Buffer.isBuffer(payload) ? payload : Buffer.from(payload);
     const checksum = crypto.createHash('sha256').update(total).digest('hex');
 
     const { grantId, relayToken } = await relayAndAccept(ctx, {
@@ -277,16 +279,188 @@ describe('Relay file storage and download ACL (UT-022)', () => {
     const completeBody = await completeRes.json();
     assert.equal(completeRes.status, 200, JSON.stringify(completeBody));
     assert.match(completeBody.data.relayId, /^rl_/);
-    const fileId = completeBody.data.fileId;
 
-    const receiver = await fetch(`${ctx.baseUrl}/api/download/${fileId}?rt=${relayToken}`);
+    return {
+      fileId: completeBody.data.fileId,
+      relayToken,
+      size: total.length,
+      content: total,
+      uploadId,
+      uploadToken,
+    };
+  }
+
+  it('relays a chunked upload the same way, and only the receiver can fetch it', async () => {
+    const stored = await sendChunkedRelayFile('relay-chunked.bin', 'chunked relay payload');
+
+    // The chunked path must announce the stored file too (M4-QC-04).
+    await waitForEvent(
+      clientB.events,
+      (e) => e.event === 'relay:stored' && e.data?.fileId === stored.fileId,
+      3000
+    );
+
+    const receiver = await fetch(
+      `${ctx.baseUrl}/api/download/${stored.fileId}?rt=${stored.relayToken}`
+    );
     assert.equal(receiver.status, 200);
-    assert.deepEqual(Buffer.from(await receiver.arrayBuffer()), total);
+    assert.deepEqual(Buffer.from(await receiver.arrayBuffer()), stored.content);
 
-    const observer = await fetch(`${ctx.baseUrl}/api/download/${fileId}`, {
+    const observer = await fetch(`${ctx.baseUrl}/api/download/${stored.fileId}`, {
       headers: headers({ connectionId: clientC.connId }),
     });
     assert.equal(observer.status, 403);
+  });
+
+  it('keeps chunked relay bytes charged to quota while they are on disk', async () => {
+    const runtime = ctx.serverInstance.runtime;
+    const baseline = runtime.quotaTracker.allocatedBytes;
+
+    const stored = await sendChunkedRelayFile('quota-chunked.bin', 'quota accounting payload');
+    assert.equal(
+      runtime.quotaTracker.allocatedBytes,
+      baseline + stored.size,
+      'the merged relay file must stay charged to quota (M4-QC-03)'
+    );
+
+    const revoke = await fetch(`${ctx.baseUrl}/api/relay/revoke`, {
+      method: 'POST',
+      headers: jsonHeaders(headers({ hostToken })),
+      body: JSON.stringify({ fileId: stored.fileId }),
+    });
+    assert.equal(revoke.status, 200);
+    assert.equal(
+      runtime.quotaTracker.allocatedBytes,
+      baseline,
+      'revoking the relay file must give the reservation back exactly once'
+    );
+  });
+
+  it('leaves no file or quota behind when registration fails after the merge', async () => {
+    const runtime = ctx.serverInstance.runtime;
+    const baseline = runtime.quotaTracker.allocatedBytes;
+    const name = 'relay-attach-failure.bin';
+    const total = Buffer.from('registration failure payload');
+    const checksum = crypto.createHash('sha256').update(total).digest('hex');
+
+    const { grantId } = await relayAndAccept(ctx, {
+      clientA,
+      clientB,
+      name,
+      size: total.length,
+    });
+
+    const initRes = await fetch(`${ctx.baseUrl}/api/upload/init`, {
+      method: 'POST',
+      headers: jsonHeaders({
+        ...headers({ connectionId: clientA.connId }),
+        'X-Transfer-Grant': grantId,
+      }),
+      body: JSON.stringify({
+        fileName: name,
+        fileSize: total.length,
+        mimeType: 'application/octet-stream',
+        checksum,
+      }),
+    });
+    const { uploadId, uploadToken } = (await initRes.json()).data;
+
+    const form = new FormData();
+    form.append('uploadId', uploadId);
+    form.append('chunkIndex', '0');
+    form.append('chunk', new Blob([total]), 'chunk_0');
+    await fetch(`${ctx.baseUrl}/api/upload/chunk`, {
+      method: 'POST',
+      headers: { 'X-Upload-Id': uploadId, 'X-Upload-Token': uploadToken },
+      body: form,
+    });
+
+    // Registration is the step after the merge; make it fail the way a disk error would.
+    const originalAddFile = runtime.shareManager.addFile;
+    runtime.shareManager.addFile = async () => {
+      throw new Error('synthetic registration failure');
+    };
+    let completeStatus;
+    try {
+      const completeRes = await fetch(`${ctx.baseUrl}/api/upload/complete`, {
+        method: 'POST',
+        headers: jsonHeaders({ 'X-Upload-Token': uploadToken }),
+        body: JSON.stringify({ uploadId }),
+      });
+      completeStatus = completeRes.status;
+    } finally {
+      runtime.shareManager.addFile = originalAddFile;
+    }
+
+    assert.ok(completeStatus >= 400, 'a failed registration must not report success');
+    assert.equal(
+      runtime.quotaTracker.allocatedBytes,
+      baseline,
+      'the reservation must be released exactly once, not leaked or double-released'
+    );
+    const entries = await fs.promises.readdir(path.join(ctx.tempDir, 'relay'));
+    assert.ok(!entries.includes(name), 'the merged file must not be left behind');
+  });
+
+  it('notifies the peers when bytes are stored, and only a full download as delivered', async () => {
+    const { fileId, relayToken } = await sendRelayFile('notify.bin');
+    // Earlier tests in this suite also downloaded files, so scope every count to this one.
+    const downloadsForFile = () =>
+      clientB.events.filter((e) => e.event === 'relay:downloaded' && e.data?.fileId === fileId);
+
+    // Both parties learn the bytes are ready (M4-QC-04).
+    await waitForEvent(
+      clientB.events,
+      (e) => e.event === 'relay:stored' && e.data?.fileId === fileId,
+      3000
+    );
+    await waitForEvent(
+      clientA.events,
+      (e) => e.event === 'relay:stored' && e.data?.fileId === fileId,
+      3000
+    );
+
+    // A range request is not a delivery.
+    const partial = await fetch(`${ctx.baseUrl}/api/download/${fileId}?rt=${relayToken}`, {
+      headers: { Range: 'bytes=0-3' },
+    });
+    assert.equal(partial.status, 206);
+    await partial.arrayBuffer();
+    await delay(80);
+    assert.equal(downloadsForFile().length, 0, 'a partial download must not be reported');
+
+    // A completed full download is, exactly once.
+    const full = await fetch(`${ctx.baseUrl}/api/download/${fileId}?rt=${relayToken}`);
+    assert.equal(full.status, 200);
+    await full.arrayBuffer();
+    await waitForEvent(
+      clientB.events,
+      (e) => e.event === 'relay:downloaded' && e.data?.fileId === fileId,
+      3000
+    );
+    await delay(80);
+    assert.equal(downloadsForFile().length, 1);
+
+    // Downloading it again does not announce it a second time.
+    const again = await fetch(`${ctx.baseUrl}/api/download/${fileId}?rt=${relayToken}`);
+    await again.arrayBuffer();
+    await delay(80);
+    assert.equal(downloadsForFile().length, 1);
+
+    // A client that walks away mid-transfer is not a delivery either.
+    const big = await sendChunkedRelayFile('abort.bin', Buffer.alloc(4 * 1024 * 1024, 7));
+    const controller = new AbortController();
+    await fetch(`${ctx.baseUrl}/api/download/${big.fileId}?rt=${big.relayToken}`, {
+      signal: controller.signal,
+    });
+    controller.abort();
+    await delay(200);
+    assert.equal(
+      clientB.events.filter((e) => e.event === 'relay:downloaded' && e.data?.fileId === big.fileId)
+        .length,
+      0,
+      'an aborted download must not be reported as delivered'
+    );
   });
 
   it('lets the host delete what it is carrying, without ever reading it', async () => {

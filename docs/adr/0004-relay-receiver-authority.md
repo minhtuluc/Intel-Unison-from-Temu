@@ -52,7 +52,8 @@ Hệ quả cụ thể của trạng thái cũ:
 ## Consequences
 
 - Lần đầu hệ thống có **hai cơ quan consent**: host (M3) và receiver (M4). Chúng dùng chung một cửa ghi và một hợp đồng grant, nhưng khác người có quyền quyết định.
-- Host mất quyền đọc nội dung file relay, kể cả khi host là chủ máy. Đây là chủ ý: host là kênh vận chuyển, không phải người nhận. Muốn lấy lại quyền đó thì phải đổi mô hình bằng một ADR khác, không phải bằng một route mới.
+- Host không còn đường tải file relay trong app. Đây là chủ ý: host là kênh vận chuyển, không phải người nhận. Muốn lấy lại quyền đó thì phải đổi mô hình bằng một ADR khác, không phải bằng một route mới.
+- **Đây là ranh giới quyền trong app, không phải mã hoá.** File vẫn là plaintext trong `tempDir/relay`; chủ máy host, root/admin hoặc bất kỳ process nào có quyền đọc filesystem vẫn đọc được nội dung. Nếu mục tiêu là "chỉ B đọc được nội dung" thì cần một mốc riêng cho mã hoá phía client với khoá chỉ A và B giữ — ADR này không hứa điều đó.
 - Relay **không** phải P2P: payload vẫn đi qua host hai lần (lên và xuống), và AI có quyền trên máy host vẫn đọc được file trên đĩa. ADR này không thay đổi giới hạn đó.
 - Danh tính bền dựa trên `localStorage`: xoá storage của máy B làm mất khả năng nhận lại file đang chờ; sender phải gửi lại. Với PIN bật, session cũng là một khóa, nên rủi ro này thấp hơn.
 - Khi PIN tắt, capability nằm trong URL (`?rt=`) nên có thể lọt vào lịch sử trình duyệt của **chính máy B**. Nó bị giới hạn bởi `relayTtlMs` và chỉ dùng được cho đúng một file.

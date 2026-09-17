@@ -1416,7 +1416,7 @@ class App {
   _buildRelayCard() {
     const card = this._settingsCard(
       'Relay transfers',
-      'Files being carried for another device. The host can stop one, but never read or approve it.'
+      'Files being carried for another device. The host can stop one, but has no action to approve or download it.'
     );
     card
       .querySelector('.settings-card__body')

@@ -300,6 +300,9 @@ export class RelayTransferService {
     if (record.timeoutId.unref) record.timeoutId.unref();
 
     this.storedFiles.set(fileId, record);
+    // Both peers learn the bytes are ready; the receiver needs this to refresh its inbox
+    // after it already accepted (M4-QC-04).
+    this._notifyStored('stored', record, 'STORED');
     return this.sanitizeStoredFile(record);
   }
 
