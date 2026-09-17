@@ -10,15 +10,16 @@ Trạng thái: chốt **trước khi đo** (2026-09-17), cùng nhánh `m5`. Theo
 
 Một lần truyền được coi là P2P thật khi **tất cả** các điều sau đúng trong suốt thời gian truyền:
 
-| #   | Quan sát                                                                  | Cách kiểm                                                 |
-| --- | ------------------------------------------------------------------------- | --------------------------------------------------------- |
-| 1   | Không có file mới dưới `tempDir/pending`, `tempDir/relay`, `uploadDir`    | So khớp danh sách + tổng byte trước/sau                   |
-| 2   | `runtime.quotaTracker.allocatedBytes` không đổi                           | Đọc trước/sau qua `GET /api/quota` hoặc trực tiếp runtime |
-| 3   | Byte qua WebSocket chỉ tăng theo cỡ SDP/candidate, **không** theo cỡ file | Counter signaling của server, so với cỡ file              |
-| 4   | Không có `relay:stored` / `relay:downloaded` cho transfer đó              | Vết event WS                                              |
-| 5   | Có `p2p:state { state: 'connected' }` cho transfer đó                     | Vết event WS                                              |
+| #   | Quan sát                                                                  | Cách kiểm                                                  |
+| --- | ------------------------------------------------------------------------- | ---------------------------------------------------------- |
+| 1   | Không có file mới dưới `tempDir/pending`, `tempDir/relay`, `uploadDir`    | So khớp danh sách + tổng byte trước/sau                    |
+| 2   | `runtime.quotaTracker.allocatedBytes` không đổi                           | Đọc trước/sau qua `GET /api/quota` hoặc trực tiếp runtime  |
+| 3   | Byte qua WebSocket chỉ tăng theo cỡ SDP/candidate, **không** theo cỡ file | Counter signaling của server, so với cỡ file               |
+| 4   | Không có `relay:stored` / `relay:downloaded` cho transfer đó              | Vết event WS                                               |
+| 5   | Có `p2p:state { state: 'connected' }` cho transfer đó                     | Vết event WS                                               |
+| 6   | File vượt `p2pMaxInMemoryBytes` **không** phát sinh byte P2P nào          | Ca âm: phải thấy đường relay chạy, không thấy `p2p:signal` |
 
-Chỉ tiêu (1) và (2) là bằng chứng **server-side**; (3) là bằng chứng định lượng; (4)/(5) là bằng chứng định danh. Không được kết luận P2P chỉ từ (5)/tốc độ.
+Chỉ tiêu (1) và (2) là bằng chứng **server-side**; (3) là bằng chứng định lượng; (4)/(5)/(6) là bằng chứng định danh. Không được kết luận P2P chỉ từ (5)/tốc độ.
 
 ## 3. Môi trường đo (ghi vào báo cáo, không bỏ trống)
 
@@ -32,18 +33,18 @@ Mỗi cấu hình đo **3 lần**; báo cáo cả 3 và p50. Với 3 mẫu, p95 
 
 ## 4. Ma trận đo
 
-| Cỡ file | Vai trò           | Số lần | Ghi chú                              |
-| ------- | ----------------- | ------ | ------------------------------------ |
-| 10 MiB  | P2P               | 3      | Vừa một frame lớn; kiểm framing      |
-| 100 MiB | P2P               | 3      | Vượt ngưỡng chunked của app (100 MB) |
-| 1 GiB   | P2P               | 3      | Kiểm backpressure dài hơi            |
-| 100 MiB | Relay (đối chứng) | 3      | Cùng thiết bị, cùng mạng, để so sánh |
+| Cỡ file            | Vai trò           | Số lần | Ghi chú                                                                                  |
+| ------------------ | ----------------- | ------ | ---------------------------------------------------------------------------------------- |
+| 10 MiB             | P2P               | 3      | Dưới trần bộ nhớ; kiểm framing + backpressure                                            |
+| 64 MiB (bằng trần) | P2P               | 3      | Sát `p2pMaxInMemoryBytes`; đo **peak buffer ở receiver**, đây là ca biên của sink bộ nhớ |
+| 100 MiB            | Relay (đối chứng) | 3      | Vượt trần → **không** thử P2P (quan sát #6); cùng thiết bị/mạng để so sánh               |
+| 1 GiB              | Relay (ca âm)     | 1      | Trên HTTP LAN không có sink ghi ra đĩa, nên 1 GiB **không** phải ca P2P; ghi rõ là ca âm |
 
-Đối chứng relay là bắt buộc: nếu không có nó, mọi so sánh "nhanh hơn" đều không có cơ sở.
+Đối chứng relay là bắt buộc: nếu không có nó, mọi so sánh "nhanh hơn" đều không có cơ sở. Ca 1 GiB chỉ quay lại dạng P2P khi có secure context và sink ghi thẳng ra đĩa (xem ADR-0005 quyết định 9).
 
 ## 5. Chỉ số thu thập
 
-**Phía client (spike hiện ra, chép tay vào báo cáo):** thời gian tới `connected` (ms), thời gian truyền phía receiver tính từ frame đầu tới frame cuối (s), throughput phía receiver (MiB/s), số frame, số lần vòng gửi phải chờ backpressure, checksum khớp hay không, loại candidate quan sát được (host/mDNS/IP thật). Thời gian enqueue ở sender chỉ dùng để chẩn đoán backpressure, không được báo cáo là throughput end-to-end.
+**Phía client (spike hiện ra, chép tay vào báo cáo):** thời gian tới `connected` (ms), thời gian truyền phía receiver tính từ frame đầu tới frame cuối (s), throughput phía receiver (MiB/s), số frame, số lần vòng gửi phải chờ backpressure, **peak byte đang giữ ở sink của receiver**, checksum khớp hay không, loại candidate quan sát được (host/mDNS/IP thật). Thời gian enqueue ở sender chỉ dùng để chẩn đoán backpressure, không được báo cáo là throughput end-to-end.
 
 **Phía host (chụp trước/sau mỗi lần đo):**
 
@@ -60,12 +61,12 @@ Ngoài ra ghi: RSS của tiến trình host, số byte signaling server đã chu
 
 ## 6. Mẫu bảng kết quả
 
-| Cỡ      | Transport | Lần  | connected (ms) | Thời gian (s) | MiB/s | Δ đĩa host (B) | Δ quota (B) | Signaling (B) | Checksum |
-| ------- | --------- | ---- | -------------- | ------------- | ----- | -------------- | ----------- | ------------- | -------- |
-| 10 MiB  | P2P       | 1..3 |                |               |       | **0**          | **0**       |               | khớp     |
-| 100 MiB | P2P       | 1..3 |                |               |       | **0**          | **0**       |               | khớp     |
-| 1 GiB   | P2P       | 1..3 |                |               |       | **0**          | **0**       |               | khớp     |
-| 100 MiB | Relay     | 1..3 | —              |               |       | > 0            | > 0         | —             | khớp     |
+| Cỡ            | Transport | Lần  | connected (ms) | Thời gian (s) | MiB/s | Peak buffer (MiB) | Δ đĩa host (B) | Δ quota (B) | Signaling (B) | Checksum |
+| ------------- | --------- | ---- | -------------- | ------------- | ----- | ----------------- | -------------- | ----------- | ------------- | -------- |
+| 10 MiB        | P2P       | 1..3 |                |               |       |                   | **0**          | **0**       |               | khớp     |
+| 64 MiB        | P2P       | 1..3 |                |               |       |                   | **0**          | **0**       |               | khớp     |
+| 100 MiB       | Relay     | 1..3 | —              |               |       | —                 | > 0            | > 0         | —             | khớp     |
+| 1 GiB (ca âm) | Relay     | 1    | —              |               |       | —                 | > 0            | > 0         | —             | khớp     |
 
 ## 7. Điều không được tuyên bố từ phép đo này
 
@@ -73,4 +74,5 @@ Ngoài ra ghi: RSS của tiến trình host, số byte signaling server đã chu
 - Không tuyên bố p95/p99 với 3 mẫu.
 - Không tuyên bố mức tiêu thụ RAM của app chỉ từ RSS của host (client không quan sát được từ host).
 - Không tuyên bố P2P hoạt động ngoài LAN cùng subnet: không có STUN/TURN trong phạm vi M5.
+- Không tuyên bố P2P cho file lớn trên HTTP LAN: trần `p2pMaxInMemoryBytes` là giới hạn được công bố, và file vượt trần đi relay theo thiết kế (ADR-0005 quyết định 9).
 - Không tuyên bố đã kiểm chứng trên iOS/Android nếu chưa thực sự chạy trên hai nền tảng đó (ghi rõ nền tảng nào đã chạy).
