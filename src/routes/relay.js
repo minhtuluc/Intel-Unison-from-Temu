@@ -144,18 +144,10 @@ relayRouter.get('/api/relay/offer/:relayId', (req, res, next) => {
       const keys = actorKeys(req);
       const isReceiver = intersects(keys, relay.receiver.keys);
 
-      // The receiver is recognized by the identity keys bound when the offer was created.
-      // The sender is recognized the same way, or — for a client that presents no durable
-      // key — by verifying its connection against the live socket, its IP and its session,
-      // exactly like the write paths do. A claimed `X-Connection-Id` on its own is not
-      // authority (M4-QC-02).
-      let isSender = intersects(keys, relay.sender?.keys || []);
-      if (!isSender) {
-        const verified = resolveSender(req, { required: true });
-        isSender = Boolean(
-          verified.connectionId && relay.sender?.connectionId === verified.connectionId
-        );
-      }
+      // Readback needs a durable proof bound to the relay. Falling back to the claimed
+      // connection id would let another tab on the same IP borrow the sender identity
+      // when PIN is disabled (M4-QC-R2-01).
+      const isSender = intersects(keys, relay.sender?.keys || []);
 
       if (!isReceiver && !isSender) {
         throw new AppError('RELAY_FORBIDDEN', 403, 'Relay belongs to another peer');

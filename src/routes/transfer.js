@@ -1001,6 +1001,13 @@ transferRouter.post('/api/upload/complete', async (req, res, next) => {
     const existingOutcome = runtime.chunkedUploadManager.getCompletedOutcome(uploadId);
     if (existingOutcome) {
       assertChunkSessionOwner(req, existingOutcome);
+      if (existingOutcome.relayFailed) {
+        throw new AppError(
+          'RELAY_STORE_FAILED',
+          409,
+          'Relay storage failed; start a new relay transfer'
+        );
+      }
       if (existingOutcome.pending) {
         return res.json({
           success: true,
@@ -1076,8 +1083,14 @@ transferRouter.post('/api/upload/complete', async (req, res, next) => {
           relayGrant
         );
       } catch (err) {
+        // Keep a relay-specific terminal outcome before cleanup. Otherwise a retry sees
+        // the generic completion result and routes the missing file into host pending.
+        runtime.chunkedUploadManager.recordCompletedOutcome(uploadId, {
+          ...result,
+          relayFailed: true,
+        });
         // A merged file that could not be registered must not squat in the relay area
-        // or keep holding quota: the sender can retry the completion.
+        // or keep holding quota. The sender must start a new relay transfer.
         try {
           await fs.promises.unlink(result.filePath);
         } catch {

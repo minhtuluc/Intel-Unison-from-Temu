@@ -400,6 +400,19 @@ describe('Relay file storage and download ACL (UT-022)', () => {
     );
     const entries = await fs.promises.readdir(path.join(ctx.tempDir, 'relay'));
     assert.ok(!entries.includes(name), 'the merged file must not be left behind');
+
+    const retryRes = await fetch(`${ctx.baseUrl}/api/upload/complete`, {
+      method: 'POST',
+      headers: jsonHeaders({ 'X-Upload-Token': uploadToken }),
+      body: JSON.stringify({ uploadId }),
+    });
+    assert.equal(retryRes.status, 409);
+    assert.equal((await retryRes.json()).error.code, 'RELAY_STORE_FAILED');
+    assert.equal(
+      runtime.pendingUploadManager.listPending().some((item) => item.fileName === name),
+      false,
+      'retrying a failed relay registration must never enter the host pending flow'
+    );
   });
 
   it('notifies the peers when bytes are stored, and only a full download as delivered', async () => {

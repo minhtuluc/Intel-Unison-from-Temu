@@ -8,7 +8,14 @@ Base: `origin/main` tại thời điểm M4 được tạo
 
 ## Kết luận
 
-**Vòng tái kiểm tra vẫn chưa đủ điều kiện merge.** Commit `091cf16` đã đóng đúng M4-QC-01, M4-QC-03, M4-QC-04 và M4-QC-05; M4-QC-02 chỉ được đóng khi PIN bật. Hai probe âm tại interface thật còn phát hiện một bypass readback khi tắt PIN và một lỗi retry đổi relay thành host pending upload.
+**Hai blocker vòng 2 đã được QC tự vá trong thay đổi đi cùng báo cáo này.** M4-QC-R2-01 không còn fallback từ identity key sang connection ID + IP; M4-QC-R2-02 giữ terminal outcome riêng cho relay attach failure nên retry không thể rơi xuống host pending. Phạm vi nhỏ được khóa bằng hai regression integration đúng seam, không chạy lại các suite không liên quan theo quy ước QC mới.
+
+### Bản vá trực tiếp của QC cho vòng 2
+
+- M4-QC-R2-01: readback sender chỉ chấp nhận durable identity key đã bind. No-PIN C dùng device token riêng nhưng khai connection ID của A nhận `403`; A dùng token của A nhận `200`.
+- M4-QC-R2-02: attach failure ghi `relayFailed` terminal outcome trước cleanup. Retry cùng upload ID/token nhận `409 RELAY_STORE_FAILED`, không tạo pending record hay host prompt.
+- Regression mục tiêu: `2/2` pass bằng `node --test --test-name-pattern="claimed sender connection id|leaves no file or quota" tests/integration/relay-transfer.test.js tests/integration/relay-acl.test.js`.
+- Không chạy lại full suite trong lượt tự vá nhỏ này. Full gate gần nhất trước patch là `515/515` pass; CI của commit mới là nguồn kiểm tra rộng sau khi push.
 
 ## Tái kiểm tra commit `091cf16` — vòng 2
 

@@ -16,7 +16,9 @@ import { startServer } from '../../src/server.js';
 import { connectWs, waitForEvent, waitForEventName, delay, WebSocket } from '../helpers/ws.js';
 
 const PIN = '1234';
+const DEVICE_TOKEN_A = 'a'.repeat(64);
 const DEVICE_TOKEN_B = 'b'.repeat(64);
+const DEVICE_TOKEN_C = 'c'.repeat(64);
 
 const jsonHeaders = ({ sessionToken, hostToken, connectionId, deviceToken } = {}) => {
   const headers = { 'Content-Type': 'application/json' };
@@ -519,23 +521,51 @@ describe('Relay transfers — durable identity without a PIN (UT-020 + UT-021)',
     // No PIN: there is no session to lean on, so the device token is the only durable
     // identity a receiver can present. That is exactly the M4 requirement.
     ctx = await bootServer('utrans-relay-nopin-', { offerTtlMs: 30000 });
-    clientA = await connectWs(ctx.port, { deviceName: 'Sender', platform: 'linux' });
+    clientA = await connectWs(ctx.port, {
+      deviceName: 'Sender',
+      platform: 'linux',
+      deviceToken: DEVICE_TOKEN_A,
+    });
     clientB = await connectWs(ctx.port, {
       deviceName: 'Receiver',
       platform: 'android',
       deviceToken: DEVICE_TOKEN_B,
     });
-    clientC = await connectWs(ctx.port, { deviceName: 'Observer', platform: 'ios' });
+    clientC = await connectWs(ctx.port, {
+      deviceName: 'Observer',
+      platform: 'ios',
+      deviceToken: DEVICE_TOKEN_C,
+    });
   });
 
   after(async () => {
     await shutdown({ ...ctx, clients: [clientA, clientB, clientC] });
   });
 
+  it('does not treat a claimed sender connection id as no-PIN readback authority', async () => {
+    const offer = await fetch(`${ctx.baseUrl}/api/relay/offer`, {
+      method: 'POST',
+      headers: jsonHeaders({ connectionId: clientA.connId, deviceToken: DEVICE_TOKEN_A }),
+      body: JSON.stringify(offerBody(clientB.device.id, 'nopin-readback.bin')),
+    });
+    const relay = (await offer.json()).data.relay;
+    assert.equal(offer.status, 201);
+
+    const spoofed = await fetch(`${ctx.baseUrl}/api/relay/offer/${relay.relayId}`, {
+      headers: jsonHeaders({ connectionId: clientA.connId, deviceToken: DEVICE_TOKEN_C }),
+    });
+    assert.equal(spoofed.status, 403);
+
+    const sender = await fetch(`${ctx.baseUrl}/api/relay/offer/${relay.relayId}`, {
+      headers: jsonHeaders({ connectionId: clientA.connId, deviceToken: DEVICE_TOKEN_A }),
+    });
+    assert.equal(sender.status, 200);
+  });
+
   it('still recognizes and authorizes the receiver after a reconnect', async () => {
     const res = await fetch(`${ctx.baseUrl}/api/relay/offer`, {
       method: 'POST',
-      headers: jsonHeaders({ connectionId: clientA.connId }),
+      headers: jsonHeaders({ connectionId: clientA.connId, deviceToken: DEVICE_TOKEN_A }),
       body: JSON.stringify(offerBody(clientB.device.id, 'nopin.bin')),
     });
     const relay = (await res.json()).data.relay;
