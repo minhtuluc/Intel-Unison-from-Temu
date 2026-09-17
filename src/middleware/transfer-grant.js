@@ -84,8 +84,8 @@ export function requireTransferGrant({ required = true } = {}) {
       );
     }
 
-    const offerService = req.app.locals.runtime?.offerService;
-    if (!offerService) {
+    const runtime = req.app.locals.runtime;
+    if (!runtime?.offerService) {
       return next(new AppError('TRANSFER_GRANT_UNAVAILABLE', 500, 'Transfer consent unavailable'));
     }
 
@@ -101,32 +101,36 @@ export function requireTransferGrant({ required = true } = {}) {
     const sessions = req.app.locals.sessions || req.app.locals.runtime?.sessions;
     const reqToken = extractSessionToken(req);
 
-    const grants = [];
+    // A grant may come from the host offer flow (M3) or the relay flow (M4); the write
+    // gate treats them the same and asks the runtime which service owns each id.
+    const claims = [];
     try {
       for (const grantId of grantIds) {
-        grants.push(
-          offerService.beginGrant(grantId, {
+        const service = runtime.findGrantService?.(grantId) || runtime.offerService;
+        claims.push({
+          service,
+          grant: service.beginGrant(grantId, {
             connectionId,
             isSessionOwner: (grantConnId) =>
               Boolean(reqToken && sessions?.hasConnection?.(reqToken, grantConnId)),
-          })
-        );
+          }),
+        });
       }
     } catch (err) {
       // Do not leave the already-claimed grants stuck in `in_use`.
-      for (const grant of grants) offerService.releaseGrant(grant.grantId);
+      for (const { service, grant } of claims) service.releaseGrant(grant.grantId);
       return next(err);
     }
 
-    req.transferGrants = grants;
+    req.transferGrants = claims.map((claim) => claim.grant);
 
     let settled = false;
     const settle = (fulfilled) => {
       if (settled) return;
       settled = true;
-      for (const grant of grants) {
-        if (fulfilled) offerService.fulfillGrant(grant.grantId);
-        else offerService.releaseGrant(grant.grantId);
+      for (const { service, grant } of claims) {
+        if (fulfilled) service.fulfillGrant(grant.grantId);
+        else service.releaseGrant(grant.grantId);
       }
     };
 
@@ -148,11 +152,13 @@ export function requireTransferGrant({ required = true } = {}) {
  * consent to real bytes: name, size and checksum must match what was approved (M3-QC-02).
  * @param {import('express').Request} req
  * @param {Array<{originalname?: string, fileName?: string, name?: string, size?: number, fileSize?: number, checksum?: string}>} files
+ * @returns {Array<{file: object, grant: object}>} the matched pairs, so a caller can tell
+ *          which grant authorized which file (relay uploads need that mapping)
  * @throws {AppError}
  */
 export function assertGrantsMatchFiles(req, files) {
   const grants = req.transferGrants;
-  if (!grants || grants.length === 0) return;
+  if (!grants || grants.length === 0) return [];
 
   if (!Array.isArray(files) || files.length === 0) {
     throw new AppError('NO_FILES_UPLOADED', 400, 'No files provided in upload');
@@ -168,6 +174,7 @@ export function assertGrantsMatchFiles(req, files) {
   // Match on the approved identity rather than position, so multipart ordering
   // cannot be used to smuggle a different file past the host's decision.
   const unmatched = [...grants];
+  const pairs = [];
   for (const file of files) {
     const fileName = file.originalname || file.fileName || file.name;
     const fileSize = Number(file.size ?? file.fileSize);
@@ -190,6 +197,8 @@ export function assertGrantsMatchFiles(req, files) {
         `File "${fileName || 'unnamed'}" (${fileSize} bytes) does not match approved metadata`
       );
     }
-    unmatched.splice(index, 1);
+    const [grant] = unmatched.splice(index, 1);
+    pairs.push({ file, grant });
   }
+  return pairs;
 }

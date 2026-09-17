@@ -72,6 +72,13 @@ export class TransferEngine {
     /** The full task batch behind each offer. Decisions are indexed against the
      *  offer manifest, so resolving them needs the whole batch, not the undecided subset. */
     this.offerTasks = new Map();
+    /** Relay batches, keyed by relayId. Same idea as offerTasks, but the receiver —
+     *  not the host — is the one deciding (M4). */
+    this.relayTasks = new Map();
+    /** Polling fallbacks for relays, keyed by relayId, for the same reason. */
+    this.relayPollers = new Map();
+    /** Device id of the chosen receiver; null means "send to the host", as before. */
+    this.receiverDeviceId = options.receiverDeviceId || null;
 
     this.listeners = new Map();
   }
@@ -119,10 +126,13 @@ export class TransferEngine {
   /**
    * Adds files to the upload queue and initiates processing.
    * @param {FileList|File[]} files
+   * @param {{ receiverDeviceId?: string|null }} [options] send to one device instead of the host
    * @returns {Array<object>} Created tasks
    */
-  addFiles(files) {
+  addFiles(files, options = {}) {
     const addedTasks = [];
+    const receiverDeviceId =
+      options.receiverDeviceId !== undefined ? options.receiverDeviceId : this.receiverDeviceId;
 
     for (const file of files) {
       const isChunked = file.size >= 100 * 1024 * 1024;
@@ -137,6 +147,8 @@ export class TransferEngine {
         // awaiting_consent -> queued -> uploading -> (awaiting_approval) -> completed|error
         status: 'awaiting_consent',
         offerId: null,
+        relayId: null,
+        receiverDeviceId: receiverDeviceId || null,
         grantId: null,
         bytesUploaded: 0,
         progress: 0,
@@ -172,9 +184,12 @@ export class TransferEngine {
   }
 
   /**
-   * Announces a batch to the host and starts the approved files.
+   * Announces a batch and starts the files that were approved.
    * Nothing is uploaded before a grant comes back: the server refuses payloads that
    * were not approved, so asking first is the only way the transfer can succeed.
+   *
+   * With a receiver selected the batch is a relay (M4): the chosen device decides, and
+   * the file ends up addressed to it rather than in the host's receive folder.
    * @param {Array<object>} tasks
    */
   async _requestConsent(tasks) {
@@ -183,24 +198,45 @@ export class TransferEngine {
       size: task.size,
       mimeType: task.type,
     }));
+    const receiverDeviceId = tasks[0]?.receiverDeviceId || null;
 
     let body;
     try {
       const headers = this._ownershipHeaders(null, { 'Content-Type': 'application/json' });
-      const response = await apiFetch('/api/transfer/offer', {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({ files: manifest }),
-      });
+      const response = receiverDeviceId
+        ? await apiFetch('/api/relay/offer', {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ receiverDeviceId, files: manifest }),
+          })
+        : await apiFetch('/api/transfer/offer', {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ files: manifest }),
+          });
       body = await response.json();
       if (!response.ok) {
         throw new Error(body?.error?.message || `HTTP ${response.status}`);
       }
     } catch (err) {
+      const message = receiverDeviceId
+        ? `Could not ask the receiver to accept: ${err.message}`
+        : `Could not ask the host to approve: ${err.message}`;
       for (const task of tasks) {
         this._dropConsentTask(task);
-        this._markError(task, `Could not ask the host to approve: ${err.message}`);
+        this._markError(task, message);
       }
+      this._emit('queue:updated', this.getStatus());
+      return;
+    }
+
+    if (receiverDeviceId) {
+      // The receiver answers over WebSocket (or by polling, if it is slow to reply);
+      // until then the tasks keep no concurrency slot.
+      const relay = body.data.relay;
+      this.relayTasks.set(relay.relayId, tasks);
+      for (const task of tasks) task.relayId = relay.relayId;
+      this._watchRelay(relay.relayId);
       this._emit('queue:updated', this.getStatus());
       return;
     }
@@ -267,6 +303,83 @@ export class TransferEngine {
   }
 
   /**
+   * Applies receiver decisions to the tasks that produced them.
+   * The relay decides with "accepted"/"declined" rather than the host's
+   * "approved"/"rejected" — same meaning, different authority.
+   * @returns {number} how many tasks were cleared to upload
+   */
+  _applyRelayDecisions(relayId, files, { announce = false } = {}) {
+    const tasks = this.relayTasks.get(relayId);
+    if (!tasks) return 0;
+
+    let accepted = 0;
+    for (const decision of files || []) {
+      const task = tasks[decision.index];
+      if (!task || task.status !== 'awaiting_consent') continue;
+
+      if (decision.decision === 'accepted' && decision.grantId) {
+        task.grantId = decision.grantId;
+        task.status = 'queued';
+        this._dropConsentTask(task);
+        this.queue.push(task);
+        accepted++;
+      } else if (decision.decision === 'declined') {
+        this._dropConsentTask(task);
+        this._markRejected(task);
+        if (announce) this._emit('queue:updated', this.getStatus());
+      }
+    }
+
+    if (accepted > 0) {
+      this._emit('queue:updated', this.getStatus());
+      this._processQueue();
+    }
+    return accepted;
+  }
+
+  /** Stops watching a relay once every task in it has been decided. */
+  _settleRelay(relayId) {
+    const batch = this.relayTasks.get(relayId) || [];
+    const stillWaiting = batch.some(
+      (task) => task.status === 'awaiting_consent' && this.consentPending.includes(task)
+    );
+    if (stillWaiting) return;
+
+    const poller = this.relayPollers.get(relayId);
+    if (poller) {
+      clearInterval(poller);
+      this.relayPollers.delete(relayId);
+    }
+    this.relayTasks.delete(relayId);
+  }
+
+  /**
+   * Waits for the receiver's answer. The WebSocket event is the fast path; polling
+   * covers a dropped connection so the sender is never stuck on a decided relay.
+   */
+  _watchRelay(relayId) {
+    if (this.relayPollers.has(relayId)) return;
+
+    const poller = setInterval(async () => {
+      try {
+        const response = await apiFetch(`/api/relay/offer/${relayId}`, {
+          headers: this._ownershipHeaders(),
+        });
+        if (!response.ok) return;
+        const { data } = await response.json();
+        if (data.relay?.state === 'pending') return;
+
+        this._applyRelayDecisions(relayId, data.decisions, { announce: true });
+        this._settleRelay(relayId);
+      } catch {
+        // Keep polling; a transient failure is not a decision.
+      }
+    }, 3000);
+    if (typeof poller.unref === 'function') poller.unref();
+    this.relayPollers.set(relayId, poller);
+  }
+
+  /**
    * Waits for a decision. The WebSocket event is the fast path; polling covers a
    * dropped connection so the sender is never stuck waiting on a decided offer.
    */
@@ -299,6 +412,8 @@ export class TransferEngine {
   dispose() {
     for (const poller of this.offerPollers.values()) clearInterval(poller);
     this.offerPollers.clear();
+    for (const poller of this.relayPollers.values()) clearInterval(poller);
+    this.relayPollers.clear();
   }
 
   _dropConsentTask(task) {
@@ -924,6 +1039,30 @@ export class TransferEngine {
    * @param {object} data
    */
   handleWebSocketEvent(event, data) {
+    // Relay decisions are matched by relayId, before any transferId exists (M4).
+    if (event === 'relay:decision' || event === 'relay:offer:expired') {
+      const relayId = data?.relayId;
+      if (!relayId) return;
+
+      const batch = this.relayTasks.get(relayId);
+      if (!batch) return;
+
+      if (event === 'relay:offer:expired') {
+        for (const task of batch) {
+          if (task.status !== 'awaiting_consent') continue;
+          this._dropConsentTask(task);
+          this._markError(task, 'The receiver did not answer in time');
+        }
+      } else {
+        // Files the receiver left undecided stay waiting until the relay closes.
+        this._applyRelayDecisions(relayId, data.files, { announce: true });
+      }
+
+      this._settleRelay(relayId);
+      this._emit('queue:updated', this.getStatus());
+      return;
+    }
+
     // Consent decisions are matched by offerId, before any transferId exists.
     if (event === 'transfer:offer:decision' || event === 'transfer:offer:expired') {
       const offerId = data?.offerId;

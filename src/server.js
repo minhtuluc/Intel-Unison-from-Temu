@@ -17,6 +17,7 @@ import { errorHandler } from './middleware/error-handler.js';
 import { infoRouter } from './routes/info.js';
 import { filesRouter } from './routes/files.js';
 import { transferRouter } from './routes/transfer.js';
+import { relayRouter } from './routes/relay.js';
 import { createServiceWorkerHandler } from './routes/service-worker.js';
 import { settingsRouter } from './routes/settings.js';
 import { setupWebSocket } from './websocket/index.js';
@@ -119,6 +120,7 @@ export function createServer(runtimeOrOptions = {}) {
   app.use(infoRouter);
   app.use(requireSession, filesRouter);
   app.use(requireSession, transferRouter);
+  app.use(requireSession, relayRouter);
   app.use(requireSession, settingsRouter);
 
   // Centralized error handler

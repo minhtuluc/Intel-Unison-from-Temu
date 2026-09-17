@@ -25,9 +25,10 @@ export class ShareManager {
    * @param {string} filePath - Absolute or relative path to file
    * @param {string} [customName] - Optional custom display name
    * @param {boolean} [isTemp] - True if file is temporary upload (cleaned up on unshare)
+   * @param {{ acl?: { mode: string, receiverKeys?: string[], receiverTokenHash?: string|null, relayId?: string } }} [options]
    * @returns {Promise<object>} Public file metadata
    */
-  async addFile(filePath, customName = null, isTemp = false) {
+  async addFile(filePath, customName = null, isTemp = false, options = {}) {
     if (!filePath || typeof filePath !== 'string') {
       throw new AppError('INVALID_PATH', 400, 'File path must be a non-empty string');
     }
@@ -87,6 +88,9 @@ export class ShareManager {
       isTemp: Boolean(isTemp),
       sharedAt: new Date().toISOString(),
       hasThumbnail: false,
+      // Files staged for everyone are public; a relayed file is addressed to one receiver
+      // and must never appear in the general listing (UT-022).
+      acl: options.acl || { mode: 'public' },
     };
 
     this.stagedFiles.set(fileId, fileRecord);
@@ -199,10 +203,14 @@ export class ShareManager {
 
   /**
    * Returns all staged files and summary statistics for clients.
+   * Relay-addressed files are excluded: they belong to one receiver, and listing them
+   * here would advertise a transfer to everyone on the LAN.
    * @returns {{ files: object[], totalSize: number, totalSizeFormatted: string, fileCount: number }}
    */
   listFiles() {
-    const files = Array.from(this.stagedFiles.values()).map((f) => this._getPublicMetadata(f));
+    const files = Array.from(this.stagedFiles.values())
+      .filter((file) => this._isPublic(file))
+      .map((f) => this._getPublicMetadata(f));
     const totalSize = files.reduce((sum, f) => sum + (f.size || 0), 0);
 
     return {
@@ -211,6 +219,11 @@ export class ShareManager {
       totalSizeFormatted: formatFileSize(totalSize),
       fileCount: files.length,
     };
+  }
+
+  /** @private True when a file is meant for every authenticated client. */
+  _isPublic(fileRecord) {
+    return !fileRecord.acl || fileRecord.acl.mode === 'public';
   }
 
   /**
@@ -229,37 +242,47 @@ export class ShareManager {
   }
 
   /**
-   * Sweeps abandoned temporary files in staging directory that are not tracked in this.stagedFiles.
+   * Sweeps abandoned temporary files in the staging and relay directories that are not
+   * tracked in this.stagedFiles.
    * @param {string} tempDir
    * @param {number} [olderThanMs] Defaults to 1 hour
    */
   async sweepOrphans(tempDir, olderThanMs = 3600000) {
     if (!tempDir) return;
-    const stagingDir = path.join(tempDir, 'staging');
-    try {
-      const entries = await fs.promises.readdir(stagingDir, { withFileTypes: true });
-      const activePaths = new Set();
-      for (const f of this.stagedFiles.values()) {
-        if (!f.path) continue;
-        const p = path.resolve(f.path);
-        activePaths.add(p);
+
+    const activePaths = new Set();
+    for (const f of this.stagedFiles.values()) {
+      if (!f.path) continue;
+      const p = path.resolve(f.path);
+      activePaths.add(p);
+      if (process.platform === 'win32') {
+        activePaths.add(p.toLowerCase());
+      }
+      try {
+        const real = await fs.promises.realpath(p);
+        activePaths.add(real);
         if (process.platform === 'win32') {
-          activePaths.add(p.toLowerCase());
+          activePaths.add(real.toLowerCase());
         }
-        try {
-          const real = await fs.promises.realpath(p);
-          activePaths.add(real);
-          if (process.platform === 'win32') {
-            activePaths.add(real.toLowerCase());
-          }
-        } catch {
-          // Ignore if realpath fails
-        }
+      } catch {
+        // Ignore if realpath fails
+      }
+    }
+
+    // Both directories hold app-managed temporary copies: browser staging, and relayed
+    // files waiting for their receiver. Neither may be reclaimed while still tracked.
+    for (const dirName of ['staging', 'relay']) {
+      const dir = path.join(tempDir, dirName);
+      let entries;
+      try {
+        entries = await fs.promises.readdir(dir, { withFileTypes: true });
+      } catch {
+        continue; // Directory not created yet
       }
 
       for (const entry of entries) {
         if (!entry.isFile()) continue;
-        const fullPath = path.join(stagingDir, entry.name);
+        const fullPath = path.join(dir, entry.name);
         let realFullPath = fullPath;
         try {
           realFullPath = await fs.promises.realpath(fullPath);
@@ -274,20 +297,18 @@ export class ShareManager {
             (activePaths.has(fullPath.toLowerCase()) ||
               activePaths.has(realFullPath.toLowerCase())));
 
-        if (!isTracked) {
-          try {
-            const stat = await fs.promises.stat(fullPath);
-            if (olderThanMs <= 0 || Date.now() - stat.mtimeMs >= olderThanMs) {
-              await fs.promises.unlink(fullPath);
-              logger.info('Swept orphaned staging file', { file: entry.name });
-            }
-          } catch {
-            // Ignore individual file error
+        if (isTracked) continue;
+
+        try {
+          const stat = await fs.promises.stat(fullPath);
+          if (olderThanMs <= 0 || Date.now() - stat.mtimeMs >= olderThanMs) {
+            await fs.promises.unlink(fullPath);
+            logger.info('Swept orphaned staging file', { file: entry.name, dir: dirName });
           }
+        } catch {
+          // Ignore individual file error
         }
       }
-    } catch {
-      // Ignore if stagingDir does not exist yet
     }
   }
 

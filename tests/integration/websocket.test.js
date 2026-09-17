@@ -2,6 +2,7 @@ import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { WebSocket } from 'ws';
 import { startServer } from '../../src/server.js';
+import { deviceTokenKey } from '../../src/utils/client-identity.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -88,6 +89,44 @@ describe('WebSocket Server Integration Tests', () => {
     assert.ok(data.devices.some((d) => d.label === 'Pixel 8 Pro'));
 
     ws.close();
+  });
+
+  it('indexes a durable device identity from client:register and drops it on disconnect', async () => {
+    const deviceToken = 'c'.repeat(64);
+    const key = deviceTokenKey(deviceToken);
+    const ws = new WebSocket(wsUrl);
+
+    await new Promise((resolve, reject) => {
+      ws.on('open', resolve);
+      ws.on('error', reject);
+    });
+
+    const registeredPromise = new Promise((resolve) => {
+      ws.on('message', (raw) => {
+        const msg = JSON.parse(raw.toString());
+        if (msg.event === 'client:registered') resolve(msg.data);
+      });
+    });
+
+    ws.send(
+      JSON.stringify({
+        event: 'client:register',
+        data: { deviceName: 'Relay receiver', platform: 'android', deviceToken },
+      })
+    );
+
+    const data = await registeredPromise;
+    assert.equal(runtime.discovery.getConnectionIdsForKeys([key]).has(data.connectionId), true);
+
+    const closed = new Promise((resolve) => ws.on('close', resolve));
+    ws.close();
+    await closed;
+
+    const deadline = Date.now() + 2000;
+    while (runtime.discovery.getConnectionIdsForKeys([key]).size > 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(runtime.discovery.getConnectionIdsForKeys([key]).size, 0);
   });
 
   it('should respond to client:ping with server:pong', async () => {

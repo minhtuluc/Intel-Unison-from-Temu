@@ -10,6 +10,17 @@ import { handleWsMessage, broadcastEvent } from './handlers.js';
 import { DiscoveryService } from '../services/discovery.js';
 import { extractSessionCookie } from '../middleware/session-auth.js';
 
+/**
+ * Removes the session-derived identity key from a socket, leaving its durable keys
+ * intact. Called when a session is revoked or expires while the socket is still open.
+ * @param {object} client
+ */
+function dropSessionIdentity(client) {
+  const keys = (client.identityKeys || []).filter((key) => !String(key).startsWith('sess:'));
+  client.identityKeys = keys;
+  client.discovery?.updateIdentityKeys?.(client.connectionId, keys);
+}
+
 export function setupWebSocket(server, auth = {}) {
   const { hostAuth, sessions, pinRequired = false, discovery = new DiscoveryService() } = auth;
   const wss = new WebSocketServer({ server, path: '/ws' });
@@ -20,6 +31,8 @@ export function setupWebSocket(server, auth = {}) {
       if (client.sessionToken === revokedToken || client.cookieToken === revokedToken) {
         client.authorized = false;
         client.sessionToken = null;
+        // The session key must stop resolving the moment the credential dies.
+        dropSessionIdentity(client);
         try {
           client.close(1008, 'Session revoked');
         } catch {
@@ -34,6 +47,7 @@ export function setupWebSocket(server, auth = {}) {
       if (client.isHost) continue;
       client.authorized = false;
       client.sessionToken = null;
+      dropSessionIdentity(client);
       try {
         client.close(1008, 'Session revoked');
       } catch {
@@ -45,6 +59,8 @@ export function setupWebSocket(server, auth = {}) {
   wss.on('connection', (ws, req) => {
     ws.isAlive = true;
     ws.connectionId = randomUUID();
+    // Server-derived identity keys; filled in on client:register (UT-020).
+    ws.identityKeys = [];
     ws.discovery = discovery;
     ws._remoteIp = req.socket.remoteAddress;
     ws.verifyHost = (token) => Boolean(hostAuth?.verify(req, token));

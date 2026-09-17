@@ -2,7 +2,7 @@
 
 ## Trạng thái thực tế và cách vận hành
 
-Chỉ phiên host đã xác thực được xem danh sách chờ và Accept/Decline. Chạy `npm start` và dùng browser do launcher mở; QR/public URL dành cho client. Khi không tự mở browser, dùng liên kết `Host approval URL` riêng được in ở terminal trên máy host. Không chia sẻ liên kết riêng này. Sau restart cần mở lại phiên host.
+Chỉ phiên host đã xác thực được xem danh sách chờ và Accept/Decline **upload thường**. Với relay (gửi cho một thiết bị cụ thể), **chính thiết bị nhận** là bên Accept/Decline — host không duyệt và không tải được file đó. Chạy `npm start` và dùng browser do launcher mở; QR/public URL dành cho client. Khi không tự mở browser, dùng liên kết `Host approval URL` riêng được in ở terminal trên máy host. Không chia sẻ liên kết riêng này. Sau restart cần mở lại phiên host.
 
 Nếu đặt `UTRANS_PIN` (4-6 chữ số), host yêu cầu PIN: client phải nhập PIN trong cổng kết nối trước khi xem, tải hay gửi file. PIN trống giữ hành vi LAN mở như trước. Phiên PIN có expiry, thu hồi được (`POST /api/auth/logout`), và mất khi restart. Chi tiết quyết định: [ADR-0002](docs/adr/0002-session-runtime-authority.md).
 
@@ -10,9 +10,9 @@ Stage đường dẫn nguồn (nhánh JSON của `POST /api/share`, dùng cho CL
 
 Mô hình hiện tại truyền qua host, chưa có P2P trực tiếp giữa client. Xem [báo cáo và roadmap](REPORT-ROADMAP.md), [quy chuẩn agent](AGENTS.md) và [quality system](docs/agents/quality.md). Chạy `npm run quality` trên Node 22/24 để kiểm tra lint, format, test và coverage.
 
-M1 (commit `64cff86`) và M2 (PR #2, commit `047706f`) đã merge vào `main`. M3 (UT-011, UT-012, UT-016, UT-018) đang nằm trên nhánh `m3-core-ux-consent`, **chưa merge** — đang chờ QC quyết định.
+M1 (commit `64cff86`), M2 (PR #2) và M3 (PR #3) đã merge vào `main`. M4 (UT-020–UT-024, gửi cho một người nhận) đang nằm trên nhánh `m4`, **chưa merge** — đang chờ QC quyết định. Quyết định thiết kế: [ADR-0004](docs/adr/0004-relay-receiver-authority.md).
 
-Số liệu đo trên trạng thái cuối của nhánh M3, ngày 2026-09-16, Node 24.15.0 / Windows: **424 automated tests pass**, coverage **90,18% line / 82,97% branch / 87,66% function**, lint và format sạch (`npm run quality`). **Chưa** kiểm chứng: điện thoại thật (Android Chrome / iOS Safari), TLS LAN, vòng đời cache service worker trên browser thật (repo không có E2E browser), và CI chưa chạy cho nhánh này. Các tuyên bố bên dưới cần đối chiếu giới hạn còn mở trong báo cáo.
+Số liệu đo trên trạng thái cuối của nhánh M4, ngày 2026-09-17, Node 22.23.1 / Linux: **510 automated tests pass**, coverage **95,43% line / 86,84% branch / 93,99% function**, lint và format sạch (`npm run quality`). **Chưa** kiểm chứng: điện thoại/browser thật (UI chọn người nhận và view Incoming mới chỉ có unit test), TLS LAN, vòng đời cache service worker trên browser thật (repo không có E2E browser), và CI chưa chạy cho nhánh này. Các tuyên bố bên dưới cần đối chiếu giới hạn còn mở trong báo cáo.
 
 <p align="center">
   <img src="public/favicon.svg" alt="UniversalTrans Logo" width="96" height="96" />
@@ -25,8 +25,8 @@ Số liệu đo trên trạng thái cuối của nhánh M3, ngày 2026-09-16, No
 
 <p align="center">
   <img src="https://img.shields.io/badge/node-%3E%3D20.0.0-brightgreen" alt="Node Version" />
-  <img src="https://img.shields.io/badge/tests-424%20passed-success" alt="Tests" />
-  <img src="https://img.shields.io/badge/coverage-90.18%25-blue" alt="Coverage" />
+  <img src="https://img.shields.io/badge/tests-510%20passed-success" alt="Tests" />
+  <img src="https://img.shields.io/badge/coverage-95.43%25-blue" alt="Coverage" />
   <img src="https://img.shields.io/badge/port-8080%20default-orange" alt="Port 8080" />
   <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License" />
   <img src="https://img.shields.io/badge/pwa-standalone%20ready-purple" alt="PWA Ready" />
@@ -42,7 +42,8 @@ Số liệu đo trên trạng thái cuối của nhánh M3, ngày 2026-09-16, No
 4. [Hướng dẫn sử dụng chi tiết (Step-by-Step)](#-hướng-dẫn-sử-dụng-chi-tiết)
    - [Gửi file từ PC sang Điện thoại](#1-gửi-file-từ-máy-tính-sang-điện-thoại)
    - [Gửi file từ Điện thoại sang PC](#2-gửi-file-từ-điện-thoại-sang-máy-tính)
-   - [Cài đặt PWA như Ứng dụng gốc](#3-cài-đặt-pwa-như-ứng-dụng-gốc)
+   - [Gửi riêng cho một thiết bị (relay)](#3-gửi-riêng-cho-một-thiết-bị-relay)
+   - [Cài đặt PWA như Ứng dụng gốc](#4-cài-đặt-pwa-như-ứng-dụng-gốc)
 5. [Cơ chế kiến trúc & An toàn dữ liệu](#-cơ-chế-kiến-trúc--an-toàn-dữ-liệu)
 6. [Lệnh phát triển & Kiểm thử (Tests)](#-lệnh-phát-triển--kiểm-thử)
 7. [Xử lý sự cố thường gặp (Troubleshooting)](#-xử-lý-sự-cố-thường-gặp)
@@ -52,6 +53,7 @@ Số liệu đo trên trạng thái cuối của nhánh M3, ngày 2026-09-16, No
 ## 🚀 Tính năng nổi bật (Highlights)
 
 - ⚡ **Truyền qua mạng nội bộ**: Dữ liệu đi qua máy host trên Wi-Fi LAN, không đi qua cloud. Đây chưa phải truyền P2P trực tiếp giữa hai client.
+- 🎯 **Gửi riêng cho một thiết bị (relay)**: chọn đúng người nhận trong danh sách thiết bị đang online. Chỉ thiết bị đó được duyệt và được tải; host chở byte nhưng không đọc được nội dung. Xem [mục 3](#3-gửi-riêng-cho-một-thiết-bị-relay).
 - 📱 **Tương thích toàn diện đa nền tảng**:
   - **PC Host**: Windows 10/11, Linux (Ubuntu, Debian, Fedora, Arch...).
   - **Thiết bị di động**: Android (Chrome PWA), iPhone & iPad (Safari Standalone PWA).
@@ -153,7 +155,21 @@ utrans -p 9090
    - Bấm **Decline All**: không file nào được gửi, không byte nào được ghi.
    - Tick **Remember this device** để lần sau thiết bị đó không phải duyệt lại (thu hồi được).
 
-### 3. Cài đặt PWA như Ứng dụng gốc
+### 3. Gửi riêng cho một thiết bị (relay)
+
+Khi cả hai thiết bị đều đang mở app, người gửi có thể chọn **đúng một thiết bị** làm người nhận thay vì gửi cho host:
+
+1. Trên thiết bị gửi, mở tab **Upload**. Ở ô **Send to**, chọn thiết bị nhận (mặc định là `Host PC (approval as usual)` — luồng cũ không đổi).
+2. Chọn file và bấm gửi. Lúc này **chưa có byte nào** được truyền: server chỉ nhận metadata (tên, cỡ, loại).
+3. Trên **thiết bị nhận** hiện hộp thoại `File sent to this device`; người nhận tick từng file và bấm **Accept Selected** (hoặc **Decline All**).
+4. File được gửi lên host và giữ ở vùng tạm riêng, **không** vào thư mục nhận của host. Thiết bị nhận mở tab **Incoming** và bấm **Download**.
+5. File tự xoá khi người nhận đã tải xong hoặc khi hết hạn `UTRANS_RELAY_TTL` (mặc định 1 giờ).
+
+Trong suốt quá trình đó: host **không** duyệt và **không** tải được file relay — host chỉ thấy một dòng metadata trong **Settings → Relay transfers** và có nút **Stop** để dừng/huỷ. Không thiết bị nào khác trong LAN nhìn thấy file này, kể cả trong tab **Files**.
+
+Giới hạn đã biết: nếu PIN tắt, liên kết tải của người nhận mang một capability dùng một lần (`?rt=…`), nên nó có thể nằm trong lịch sử trình duyệt của chính máy nhận. Nếu người nhận xoá dữ liệu trang (localStorage) trước khi tải, người gửi cần gửi lại. Chi tiết: [ADR-0004](docs/adr/0004-relay-receiver-authority.md).
+
+### 4. Cài đặt PWA như Ứng dụng gốc
 
 - **Android (Chrome / Edge)**: Nút **Install App** chỉ xuất hiện khi trình duyệt bắn sự kiện `beforeinstallprompt`, tức là khi trang chạy trong secure context (HTTPS hoặc `localhost`). Truy cập bằng LAN HTTP thì nút bị ẩn và bạn cần vào menu trình duyệt ➔ _Thêm vào MH chính_.
 - **iPhone / iPad (Safari)**: Bấm nút **Install App** (hoặc nút **Chia sẻ / Share** hình ô vuông mũi tên lên của Safari) ➔ Cuộn xuống chọn **Thêm vào MH chính (Add to Home Screen)**.

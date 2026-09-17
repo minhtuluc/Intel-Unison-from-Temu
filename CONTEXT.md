@@ -4,7 +4,9 @@
 
 Host là máy chạy Node/Express, giữ staging, chunk sessions và thư mục nhận. Client là browser trên điện thoại hoặc máy khác. HTTP mang dữ liệu file; WebSocket mang sự kiện điều khiển. Chưa có WebRTC DataChannel hay đường dữ liệu client↔client trực tiếp.
 
-Client có thể upload vào staging qua `/api/share` rồi client khác download từ host: đó là trung chuyển qua host, không phải P2P và chưa phải tính năng chọn người nhận riêng.
+Client có thể upload vào staging qua `/api/share` rồi client khác download từ host: đó là trung chuyển qua host, không phải P2P.
+
+Từ M4 (nhánh `m4`, **chưa merge**), client còn có thể chọn **một thiết bị cụ thể** làm người nhận: A mở relay tới B, **chỉ B** được duyệt, file nằm ở vùng tạm riêng của host và **chỉ B** tải được. Host chở byte và có thể dừng relay, nhưng không duyệt và không đọc được file. Đây vẫn là relay qua host, chưa phải P2P.
 
 Mỗi app instance có một **runtime** riêng (`createRuntime`) giữ config, staging, chunk sessions, pending, device registry, host capability và session store. Không có state dùng chung giữa hai instance trong cùng tiến trình.
 
@@ -28,16 +30,21 @@ Mỗi app instance có một **runtime** riêng (`createRuntime`) giữ config, 
 | Transfer grant      | Vé dùng một lần phát cho mỗi file được duyệt. Gửi qua header `X-Transfer-Grant`, bind theo `(tên, cỡ)` và `connectionId`; là thứ duy nhất mở được đường ghi.        |
 | Trusted device      | Thiết bị host đã đánh dấu tin cậy nên offer được tự duyệt, vẫn ghi lịch sử. Client giữ token 256-bit; server **chỉ lưu hash**. Thu hồi được.                        |
 | Pending transfer    | File đã nhận vào đĩa tạm, đang chờ host duyệt. Chỉ còn áp dụng cho upload do **chính host** khởi tạo; file đã có consent lưu thẳng, không qua bước này.             |
-| Accept / Decline    | Quyết định của host; accept chuyển file, decline xóa bản tạm.                                                                                                       |
+| Accept / Decline    | Quyết định của host cho upload thường; với relay, quyết định tương đương là **Accept / Decline của receiver**.                                                      |
 | Transfer history    | Bản ghi các kết cục giao dịch (completed/rejected/expired), lưu bền ở `dataDir`. Host thấy tất cả; client chỉ thấy giao dịch của chính connection mình.             |
-| Receiver            | Bên được chọn nhận trong thiết kế tương lai; hiện chỉ host nhận upload.                                                                                             |
-| Relay               | Client A → host → client B, dữ liệu đi qua host.                                                                                                                    |
+| Receiver            | Thiết bị được **người gửi chọn** để nhận một relay. Danh tính do server cấp; chỉ receiver được duyệt và được tải file của mình.                                     |
+| Relay               | Client A → host → client B, dữ liệu đi qua host. Từ M4: chọn được receiver, consent thuộc về receiver, file có ACL theo receiver.                                   |
+| Relay transfer      | Một lô file A gửi riêng cho B. Offer là metadata thuần; B duyệt từng file; file được giữ ở `tempDir/relay` với TTL, không vào thư mục nhận của host.                |
+| Client identity key | Khóa do server suy ra cho một kết nối: `conn:<connectionId>`, `dev:<sha256(deviceToken)>`, `sess:<sessionToken>`. `X-Connection-Id` không tạo ra khóa.              |
+| Relay capability    | Token 256-bit phát **một lần** cho receiver khi duyệt, dùng qua `?rt=` để tải file relay khi không có session cookie. Server chỉ lưu SHA-256.                       |
 | P2P                 | Dữ liệu đi trực tiếp giữa hai client; host có thể làm signaling. Chưa triển khai.                                                                                   |
 | Instance file       | `os.tmpdir()/utrans-<port>.json` ghi PID đang sở hữu listener; script dừng chỉ kill đúng PID này.                                                                   |
 
 ## Cam kết và giới hạn
 
 - Quyền host không đồng nghĩa đã sửa toàn bộ PIN/pairing hoặc bảo mật LAN.
+- Từ M4 (nhánh `m4`, chưa merge): host **không** duyệt và **không** tải được file relay. Chỉ receiver đã bind mới duyệt được (`403 RELAY_FORBIDDEN` cho mọi trường hợp khác, kể cả host capability), và file relay không xuất hiện trong `/api/shared`. Chi tiết: `docs/adr/0004-relay-receiver-authority.md`.
+- File relay nằm ở `tempDir/relay`, không vào `uploadDir`; hết `relayTtlMs` thì bị xoá và quota được trả lại. Host chỉ thấy metadata qua `/api/relay/active`.
 - Từ M3 (nhánh `m3-core-ux-consent`, chưa merge): client phải có consent trước khi truyền. `POST /api/upload` và `/api/upload/init` từ chối request không kèm grant bằng `428 TRANSFER_GRANT_REQUIRED`, trừ khi request mang host capability đã xác minh. Chi tiết: `docs/adr/0003-consent-before-transfer.md`.
 - Trust là quyết định **bền** duy nhất trong hệ thống: nó sống qua restart ở `dataDir`, khác session và host capability đều mất khi restart. Xoá `dataDir` mất danh sách thiết bị tin cậy và lịch sử, không mất file đã nhận.
 - `uploadDir` là trường config **duy nhất** đổi được lúc chạy (host-only, có validate). Mọi trường khác vẫn bất biến trong vòng đời tiến trình.
