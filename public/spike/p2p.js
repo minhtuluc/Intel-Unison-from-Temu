@@ -12,7 +12,8 @@
 
 const ICE_WAIT_MS = 8000;
 const TEST_SIZE = 1024 * 1024;
-const FRAME_SIZE = 64 * 1024;
+// Keep each message below the 64 KiB default used when max-message-size is absent.
+const FRAME_SIZE = 60 * 1024;
 const BUFFER_HIGH = 512 * 1024;
 const BUFFER_LOW = 128 * 1024;
 const STEP_TIMEOUT_MS = 10000;
@@ -69,6 +70,18 @@ function reportStepError(role, error, button) {
   log(`[${role}] LỖI: ${error?.name || 'Error'}: ${detail}`, 'bad');
   setState('Lỗi thiết lập', `${error?.name || 'Error'}: ${detail}`, 'bad');
   button.disabled = false;
+}
+
+function normalizeRemoteSdp(sdp, role) {
+  const lines = sdp.split(/\r?\n/);
+  const accepted = lines.filter((line) => !/^a=max-message-size:\d+\s*$/.test(line));
+  if (accepted.length !== lines.length) {
+    log(
+      `${role}: bỏ thuộc tính max-message-size để tương thích; spike dùng frame ${FRAME_SIZE} byte`,
+      'ok'
+    );
+  }
+  return accepted.join('\r\n');
 }
 
 // ---------------------------------------------------------------- môi trường
@@ -290,7 +303,10 @@ el('btn-answer').onclick = async () => {
   try {
     const pc = createPeer('B');
     log('B: đang áp dụng offer của A…');
-    await withStepTimeout(pc.setRemoteDescription({ type: 'offer', sdp }), 'setRemoteDescription');
+    await withStepTimeout(
+      pc.setRemoteDescription({ type: 'offer', sdp: normalizeRemoteSdp(sdp, 'B') }),
+      'setRemoteDescription'
+    );
     log('B: offer hợp lệ, đang tạo answer…');
     const answer = await withStepTimeout(pc.createAnswer(), 'createAnswer');
     await withStepTimeout(pc.setLocalDescription(answer), 'setLocalDescription');
@@ -312,7 +328,7 @@ el('btn-accept').onclick = async () => {
   try {
     log('A: đang áp dụng answer của B…');
     await withStepTimeout(
-      ctx.pc.setRemoteDescription({ type: 'answer', sdp }),
+      ctx.pc.setRemoteDescription({ type: 'answer', sdp: normalizeRemoteSdp(sdp, 'A') }),
       'setRemoteDescription'
     );
     const info = describeCandidates(sdp);
