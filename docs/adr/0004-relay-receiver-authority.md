@@ -1,6 +1,6 @@
 # ADR-0004 — relay tới một người nhận, quyền quyết định thuộc receiver
 
-Status: Đề xuất cùng nhánh `m4` (2026-09-17); **chưa merge** — chờ QC.
+Status: Accepted — đã merge vào `main` qua PR #4 (nhánh `m4`, 2026-09-17), sau hai vòng QC (`REVIEW-M4-QC.md`).
 
 Bổ sung cho [ADR-0001](0001-host-approval-authority.md), [ADR-0002](0002-session-runtime-authority.md) và [ADR-0003](0003-consent-before-transfer.md); không thay thế. ADR-0001 quy định **ai** được duyệt (host); ADR-0003 quy định **thời điểm** consent (trước khi một byte chạm đĩa). ADR này quy định điều gì xảy ra khi **người nhận không phải host**: ai được chọn người nhận, ai có quyền đồng ý, file nằm ở đâu, và ai được tải nó.
 

@@ -1,6 +1,6 @@
 # ADR-0003 — consent trước khi truyền, thiết bị tin cậy và cấu hình đổi lúc chạy
 
-Status: Đề xuất cùng nhánh `m3-core-ux-consent` (2026-09-16); **chưa merge** — chờ QC.
+Status: Accepted — đã merge vào `main` qua PR #3 (nhánh `m3-core-ux-consent`, 2026-09-16).
 
 Bổ sung cho [ADR-0001](0001-host-approval-authority.md) và [ADR-0002](0002-session-runtime-authority.md); không thay thế. ADR-0001 quy định ai được duyệt; ADR-0002 quy định quyền của client, phạm vi state một instance và vòng đời tiến trình. ADR này quy định **thời điểm** consent, cách một consent được bind vào đúng dữ liệu, và phạm vi cấu hình được phép đổi khi đang chạy.
 

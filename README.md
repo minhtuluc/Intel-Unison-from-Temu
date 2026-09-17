@@ -10,7 +10,7 @@ Stage đường dẫn nguồn (nhánh JSON của `POST /api/share`, dùng cho CL
 
 Mô hình hiện tại truyền qua host, chưa có P2P trực tiếp giữa client. Xem [báo cáo và roadmap](REPORT-ROADMAP.md), [quy chuẩn agent](AGENTS.md) và [quality system](docs/agents/quality.md). Chạy `npm run quality` trên Node 22/24 để kiểm tra lint, format, test và coverage.
 
-M1 (commit `64cff86`), M2 (PR #2) và M3 (PR #3) đã merge vào `main`. M4 (UT-020–UT-024, gửi cho một người nhận) đang nằm trên nhánh `m4`, **chưa merge** — đang chờ QC quyết định. Quyết định thiết kế: [ADR-0004](docs/adr/0004-relay-receiver-authority.md).
+M1 (commit `64cff86`), M2 (PR #2), M3 (PR #3) và M4 (PR #4) đã merge vào `main`. M5 (UT-025–…, nền tảng P2P) đang nằm trên nhánh `m5`, **chưa merge**. Quyết định thiết kế đã có: [ADR-0004](docs/adr/0004-relay-receiver-authority.md) (relay) và [ADR-0005](docs/adr/0005-p2p-transport-authority.md) (P2P).
 
 Số liệu đo trên trạng thái cuối của nhánh M4, ngày 2026-09-17, Node 22.23.1 / Linux: **510 automated tests pass**, coverage **95,43% line / 86,84% branch / 93,99% function**, lint và format sạch (`npm run quality`). **Chưa** kiểm chứng: điện thoại/browser thật (UI chọn người nhận và view Incoming mới chỉ có unit test), TLS LAN, vòng đời cache service worker trên browser thật (repo không có E2E browser), và CI chưa chạy cho nhánh này. Các tuyên bố bên dưới cần đối chiếu giới hạn còn mở trong báo cáo.
 

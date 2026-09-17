@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="vi">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>UTrans — spike P2P (chỉ để đo, không phải UI sản phẩm)</title>
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      body {
+        margin: 0;
+        padding: 16px;
+        font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        background: #14161a;
+        color: #e8eaed;
+      }
+      h1 {
+        font-size: 16px;
+        margin: 0 0 4px;
+      }
+      .warn {
+        border-left: 3px solid #f0a13a;
+        background: #2a2216;
+        padding: 8px 10px;
+        margin: 12px 0;
+        font-size: 13px;
+      }
+      section {
+        border: 1px solid #2c313a;
+        border-radius: 8px;
+        padding: 12px;
+        margin-bottom: 12px;
+      }
+      h2 {
+        font-size: 13px;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        color: #9aa4b2;
+        margin: 0 0 8px;
+      }
+      button {
+        font: inherit;
+        padding: 8px 12px;
+        margin: 4px 6px 4px 0;
+        border-radius: 6px;
+        border: 1px solid #3a4250;
+        background: #22272f;
+        color: #e8eaed;
+        cursor: pointer;
+      }
+      button:disabled {
+        opacity: 0.45;
+        cursor: not-allowed;
+      }
+      textarea {
+        width: 100%;
+        min-height: 110px;
+        font: 12px/1.45 ui-monospace, monospace;
+        background: #0f1115;
+        color: #d7dce3;
+        border: 1px solid #2c313a;
+        border-radius: 6px;
+        padding: 8px;
+        box-sizing: border-box;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 13px;
+      }
+      td {
+        padding: 3px 6px;
+        border-bottom: 1px solid #23272e;
+        vertical-align: top;
+      }
+      td:first-child {
+        color: #9aa4b2;
+        width: 44%;
+      }
+      #log {
+        max-height: 260px;
+        overflow: auto;
+        background: #0f1115;
+        border: 1px solid #2c313a;
+        border-radius: 6px;
+        padding: 8px;
+        font-size: 12px;
+        white-space: pre-wrap;
+      }
+      .ok {
+        color: #5ec27a;
+      }
+      .bad {
+        color: #ff6b6b;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Spike P2P — xác minh ICE/DataChannel trên HTTP LAN</h1>
+    <p style="color: #9aa4b2; margin: 0">
+      Mở trang này trên <strong>cả hai</strong> thiết bị, cùng một Wi-Fi. Không cần đăng nhập, không
+      có dữ liệu nào gửi lên host ngoài việc tải chính trang này.
+    </p>
+
+    <div class="warn">
+      Đây là <strong>trang đo tạm thời</strong> cho mốc M5 (UT-026), không phải UI sản phẩm. Nó trao
+      đổi SDP bằng tay để tách câu hỏi “trình duyệt có cho P2P trên HTTP LAN không” khỏi mọi phần
+      khác. Kết quả chép vào <code>docs/benchmarks/p2p-spike-&lt;ngày&gt;.md</code>.
+    </div>
+
+    <section>
+      <h2>0. Môi trường</h2>
+      <table id="env"></table>
+    </section>
+
+    <section>
+      <h2>1. Bên A — tạo offer</h2>
+      <button id="btn-offer">Tạo offer</button>
+      <button id="btn-copy-offer">Copy offer</button>
+      <textarea id="offer-out" placeholder="Offer của A sẽ hiện ở đây (kèm ICE candidate)"></textarea>
+    </section>
+
+    <section>
+      <h2>2. Bên B — dán offer rồi tạo answer</h2>
+      <textarea id="offer-in" placeholder="Dán offer của A vào đây"></textarea>
+      <button id="btn-answer">Tạo answer</button>
+      <button id="btn-copy-answer">Copy answer</button>
+      <textarea id="answer-out" placeholder="Answer của B sẽ hiện ở đây"></textarea>
+    </section>
+
+    <section>
+      <h2>3. Bên A — dán answer để kết nối</h2>
+      <textarea id="answer-in" placeholder="Dán answer của B vào đây"></textarea>
+      <button id="btn-accept">Kết nối</button>
+    </section>
+
+    <section>
+      <h2>4. Kết quả</h2>
+      <table id="state"></table>
+      <div style="margin-top: 8px">
+        <button id="btn-send" disabled>Gửi 1 MiB qua DataChannel</button>
+        <button id="btn-reset">Reset</button>
+      </div>
+    </section>
+
+    <section>
+      <h2>Log</h2>
+      <div id="log"></div>
+    </section>
+
+    <script type="module" src="./p2p.js"></script>
+  </body>
+</html>
