@@ -51,19 +51,18 @@ function setState(label, value, cls = '') {
 function reportEnvironment() {
   const table = el('env');
   const hasPc = typeof window.RTCPeerConnection === 'function';
-  row(
-    table,
-    'RTCPeerConnection',
-    hasPc ? 'có' : 'KHÔNG CÓ',
-    hasPc ? 'ok' : 'bad'
-  );
+  row(table, 'RTCPeerConnection', hasPc ? 'có' : 'KHÔNG CÓ', hasPc ? 'ok' : 'bad');
   row(
     table,
     'RTCDataChannel',
     typeof window.RTCDataChannel === 'function' ? 'có' : 'không có lớp constructor'
   );
   row(table, 'isSecureContext', String(window.isSecureContext));
-  row(table, 'crypto.subtle', typeof crypto?.subtle === 'object' ? 'có' : 'KHÔNG CÓ (bình thường trên HTTP)');
+  row(
+    table,
+    'crypto.subtle',
+    typeof crypto?.subtle === 'object' ? 'có' : 'KHÔNG CÓ (bình thường trên HTTP)'
+  );
   row(table, 'origin', location.origin);
   row(table, 'user agent', navigator.userAgent);
   if (!hasPc) {
@@ -118,6 +117,7 @@ const ctx = {
   backpressureWaits: 0,
   receivedBytes: 0,
   receivedHash: 0x811c9dc5,
+  receiveStartedAt: null,
   finished: false,
 };
 
@@ -178,9 +178,11 @@ function attachChannel(channel) {
     setState('DataChannel', 'closed');
     el('btn-send').disabled = true;
   };
-  channel.onerror = (event) => log(`data channel error: ${event?.error?.message || 'unknown'}`, 'bad');
+  channel.onerror = (event) =>
+    log(`data channel error: ${event?.error?.message || 'unknown'}`, 'bad');
   channel.onmessage = (event) => {
     const frame = new Uint8Array(event.data);
+    if (ctx.receivedBytes === 0) ctx.receiveStartedAt = performance.now();
     ctx.receivedHash = fnv1a(frame, ctx.receivedHash);
     ctx.receivedBytes += frame.length;
     if (ctx.receivedBytes >= TEST_SIZE && !ctx.finished) {
@@ -196,7 +198,6 @@ function attachChannel(channel) {
       log(`nhận đủ ${ctx.receivedBytes} byte; checksum ${ok ? 'khớp' : 'LỆCH'}`, ok ? 'ok' : 'bad');
     }
   };
-  ctx.receiveStartedAt = performance.now();
 }
 
 /** Chờ ICE gathering xong để SDP chứa sẵn candidate (không cần trickle qua tay). */
@@ -226,9 +227,7 @@ function reportIce(pc) {
     'Candidate dạng IP',
     info.mdns > 0 ? 'mDNS (.local) — LAN cần resolve được mDNS' : 'IP thật trong SDP'
   );
-  log(
-    `candidate: ${info.total} tổng, host ${info.host}, srflx ${info.srflx}, mDNS ${info.mdns}`
-  );
+  log(`candidate: ${info.total} tổng, host ${info.host}, srflx ${info.srflx}, mDNS ${info.mdns}`);
 }
 
 // ---------------------------------------------------------------- UI
@@ -314,12 +313,15 @@ el('btn-send').onclick = async () => {
   ctx.sentBytes = offset;
   const seconds = (performance.now() - started) / 1000;
   setState(
-    'Gửi 1 MiB',
-    `${offset} byte, ${ctx.sentFrames} frame, ${(offset / 1024 / 1024 / seconds).toFixed(1)} MiB/s, chờ backpressure ${ctx.backpressureWaits} lần`
+    'Xếp hàng gửi 1 MiB',
+    `${offset} byte, ${ctx.sentFrames} frame, ${(seconds * 1000).toFixed(0)} ms, chờ backpressure ${ctx.backpressureWaits} lần`
   );
   setState('Checksum nguồn', expected.toString(16));
   setState('DataChannel', 'đã gửi xong');
-  log(`gửi xong ${offset} byte trong ${(seconds * 1000).toFixed(0)} ms`, 'ok');
+  log(
+    `đã xếp hàng ${offset} byte trong ${(seconds * 1000).toFixed(0)} ms; tốc độ thật xem ở bên nhận`,
+    'ok'
+  );
   el('btn-send').disabled = false;
 };
 

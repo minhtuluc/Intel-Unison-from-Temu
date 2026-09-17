@@ -43,7 +43,7 @@ Mỗi cấu hình đo **3 lần**; báo cáo cả 3 và p50. Với 3 mẫu, p95 
 
 ## 5. Chỉ số thu thập
 
-**Phía client (spike hiện ra, chép tay vào báo cáo):** thời gian tới `connected` (ms), thời gian truyền toàn bộ (s), throughput (MiB/s), số frame, số lần vòng gửi phải chờ backpressure, checksum khớp hay không, loại candidate quan sát được (host/mDNS/IP thật).
+**Phía client (spike hiện ra, chép tay vào báo cáo):** thời gian tới `connected` (ms), thời gian truyền phía receiver tính từ frame đầu tới frame cuối (s), throughput phía receiver (MiB/s), số frame, số lần vòng gửi phải chờ backpressure, checksum khớp hay không, loại candidate quan sát được (host/mDNS/IP thật). Thời gian enqueue ở sender chỉ dùng để chẩn đoán backpressure, không được báo cáo là throughput end-to-end.
 
 **Phía host (chụp trước/sau mỗi lần đo):**
 

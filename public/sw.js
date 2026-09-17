@@ -62,8 +62,13 @@ self.addEventListener('activate', (event) => {
 self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
 
-  // Network-first (bypass cache) for API and WebSocket
-  if (url.pathname.startsWith('/api') || url.pathname.startsWith('/ws')) {
+  // APIs/WebSocket describe live state. Spike pages are measurement instruments and
+  // must never be served from an older shell cache during a go/no-go run.
+  if (
+    url.pathname.startsWith('/api') ||
+    url.pathname.startsWith('/ws') ||
+    url.pathname.startsWith('/spike/')
+  ) {
     return;
   }
 

@@ -2,6 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import vm from 'node:vm';
 import request from 'supertest';
 import { createServer } from '../../src/server.js';
 import { APP_VERSION } from '../../src/version.js';
@@ -123,6 +124,33 @@ describe('PWA & Static Assets (Unit)', () => {
         /addEventListener\('message'[\s\S]*?self\.skipWaiting\(\)/,
         'activation waits for the page to ask, so an update cannot swap assets mid-transfer'
       );
+    });
+
+    it('keeps P2P measurement pages out of the runtime cache', () => {
+      const swCode = fs.readFileSync(swPath, 'utf8');
+      const listeners = {};
+      vm.runInNewContext(swCode, {
+        URL,
+        console,
+        caches: {},
+        fetch: () => {},
+        self: {
+          clients: { claim: () => {} },
+          addEventListener: (type, handler) => {
+            listeners[type] = handler;
+          },
+        },
+      });
+
+      let responseWasIntercepted = false;
+      listeners.fetch({
+        request: { method: 'GET', url: 'http://127.0.0.1:8080/spike/p2p.js' },
+        respondWith: () => {
+          responseWasIntercepted = true;
+        },
+      });
+
+      assert.equal(responseWasIntercepted, false, 'spike requests must always reach the network');
     });
   });
 
