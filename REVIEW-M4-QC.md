@@ -3,13 +3,67 @@
 Ngày rà soát: 2026-09-17  
 Nhánh: `m4`  
 Commit được rà soát: `e6d4560c16ac5750111c8b949cf37dce37ada9ed`  
+Commit vá tái kiểm tra: `091cf1677512891a63611e7b4aace15f6482e500`
 Base: `origin/main` tại thời điểm M4 được tạo
 
 ## Kết luận
 
-**Chưa đủ điều kiện merge.** Hướng kiến trúc A → host relay → B và mô hình “receiver quyết định” là đúng, nhưng còn bốn lỗi có thể tái hiện tại interface HTTP/WebSocket thật. Trong đó có một lỗi làm lộ capability tải file của receiver cho sender, và một lỗi cho phép client mượn `X-Connection-Id` của client khác để vượt ACL readback.
+**Vòng tái kiểm tra vẫn chưa đủ điều kiện merge.** Commit `091cf16` đã đóng đúng M4-QC-01, M4-QC-03, M4-QC-04 và M4-QC-05; M4-QC-02 chỉ được đóng khi PIN bật. Hai probe âm tại interface thật còn phát hiện một bypass readback khi tắt PIN và một lỗi retry đổi relay thành host pending upload.
 
-`npm run quality` và GitHub Actions vẫn xanh vì các test hiện tại chưa đặt assertion tại đúng ranh giới sau khi receiver quyết định, sau khi file được lưu, sau khi tải hoàn tất và sau khi chunked upload hoàn tất.
+## Tái kiểm tra commit `091cf16` — vòng 2
+
+### Trạng thái các finding vòng 1
+
+| Finding  | Trạng thái    | Bằng chứng                                                                                                               |
+| -------- | ------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| M4-QC-01 | Đã đóng       | Sender WS chỉ nhận decision/grant; raw relay token chỉ còn trong HTTP response của receiver. Regression event test pass. |
+| M4-QC-02 | Đóng một phần | Spoof bị chặn khi PIN bật, nhưng vẫn qua được ở no-PIN/same-IP; xem M4-QC-R2-01.                                         |
+| M4-QC-03 | Đã đóng       | Chunked relay giữ reservation khi file còn trên đĩa; revoke trả quota đúng baseline.                                     |
+| M4-QC-04 | Đã đóng       | `stored` được phát sau attach; full `200` phát đúng một `downloaded`; range không đánh dấu hoàn tất.                     |
+| M4-QC-05 | Đã đóng       | UI/tài liệu đã mô tả đúng đây là ACL trong app, không phải mã hóa đầu-cuối.                                              |
+
+### M4-QC-R2-01 — P1 — No-PIN vẫn cho mượn connection ID của sender
+
+**Vị trí:** `src/routes/relay.js:152-158`, qua fallback `resolveSender()`.
+
+Nhánh sửa ưu tiên identity key, nhưng khi không giao nhau lại gọi `resolveSender`. Khi PIN tắt, `resolveSender` xác minh connection ID chủ yếu bằng IP. Hai client/tab cùng IP có thể gửi `X-Connection-Id` của A và được coi là A, trái invariant “X-Connection-Id không tạo quyền”. Test mới chỉ khóa trường hợp PIN bật nên bỏ sót nhánh này.
+
+**Bằng chứng probe integration:** server no-PIN có A, B, C cùng kết nối thật; A tạo relay, request khác khai connection ID của A đọc lại relay:
+
+```text
+without a PIN, an unrelated same-IP peer must not borrow the sender connection id
+actual: 200
+expected: 403
+```
+
+**Yêu cầu vá:** readback phải dựa vào giao của identity key đã bind, không fallback sang connection header + IP. Shipped browser đã có device token; caller không có durable proof thì không được readback. Nếu cần hỗ trợ client không có device token, phải cấp capability server-generated riêng thay vì tin connection ID tự khai.
+
+**Regression test bắt buộc:** thêm no-PIN A/B/C, C có socket/device token riêng nhưng khai connection ID của A vẫn nhận `403`; A với device token của A nhận `200`.
+
+### M4-QC-R2-02 — P1 — Retry sau attach failure đổi relay thành upload thường
+
+**Vị trí:** `src/services/chunked-upload.js:414`, `src/routes/transfer.js:1064-1118`.
+
+`complete()` ghi generic `completionResult` trước khi route đăng ký file relay. Nếu `storeRelayFile()` lỗi, catch xóa file và release quota nhưng giữ generic completed outcome. Request complete lặp lại không còn session nên mất `relayGrant`; route đi xuống nhánh thường, tạo pending record cho host và trả `200`, dù file relay đã bị xóa. Việc này vừa báo thành công giả, vừa vượt ranh giới “relay không trở thành file nhận của host”.
+
+**Bằng chứng probe integration:** gây lỗi `shareManager.addFile` sau merge; request đầu trả `500`, retry cùng upload ID/token trả:
+
+```text
+HTTP 200
+pending.fileName = relay-attach-failure.bin
+```
+
+**Yêu cầu vá:** completion outcome phải giữ loại ownership (`relay`) từ trước hoặc chỉ được publish sau khi attach thành công. Failure phải để lại trạng thái retry/tombstone nhất quán; tuyệt đối không rơi xuống `createPending`. Nếu đã xóa byte thì retry phải trả lỗi ổn định và yêu cầu sender mở relay mới; nếu cam kết retry thật thì phải giữ file + quota an toàn cho lần attach lại.
+
+**Regression test bắt buộc:** inject lỗi sau merge, retry complete cùng upload ID; không trả `200`, không tạo pending/host prompt, không còn file/quota rác, không sinh bản thứ hai.
+
+### Gate vòng 2
+
+- Regression M4 hiện có: `46/46` pass.
+- `npm run quality`: `515/515` pass trên Windows, Node `v24.15.0`; lint/format/coverage pass, coverage tổng `90.61%` line / `81.21%` branch / `89.50%` function.
+- GitHub Actions `Quality` cho `091cf16`: pass trên matrix Ubuntu/Windows × Node 22/24 ([run 35177233019](https://github.com/minhtuluc/Intel-Unison-from-Temu/actions/runs/35177233019)).
+- Hai probe R2 đã chạy trên HTTP/WS thật rồi được gỡ; nhánh không bị để lại test đỏ.
+- Chưa smoke test trình duyệt thật, thiết bị thật hoặc artifact đóng gói.
 
 ## Kết quả gate hiện tại
 
@@ -19,7 +73,7 @@ Base: `origin/main` tại thời điểm M4 được tạo
 - Probe QC tạm thời đã được chạy trên server thật rồi gỡ khỏi worktree; không để lại test đỏ hoặc sửa production trong commit báo cáo này.
 - Chưa smoke test trình duyệt thật, thiết bị thật hoặc artifact đóng gói.
 
-## Lỗi bắt buộc vá
+## Phát hiện vòng 1 — giữ lại làm tham chiếu
 
 ### M4-QC-01 — P0 — Capability tải của receiver bị broadcast cho sender
 
