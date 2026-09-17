@@ -10,6 +10,8 @@
  * (App thật đã tránh vấn đề này bằng cách dùng SHA-256 incremental pure-JS trong utils.js.)
  */
 
+import { decodeSdpToken, encodeSdpToken } from './sdp-envelope.js';
+
 const ICE_WAIT_MS = 8000;
 const TEST_SIZE = 1024 * 1024;
 // Keep each message below the 64 KiB default used when max-message-size is absent.
@@ -70,18 +72,6 @@ function reportStepError(role, error, button) {
   log(`[${role}] LỖI: ${error?.name || 'Error'}: ${detail}`, 'bad');
   setState('Lỗi thiết lập', `${error?.name || 'Error'}: ${detail}`, 'bad');
   button.disabled = false;
-}
-
-function normalizeRemoteSdp(sdp, role) {
-  const lines = sdp.split(/\r?\n/);
-  const accepted = lines.filter((line) => !/^a=max-message-size:\d+\s*$/.test(line));
-  if (accepted.length !== lines.length) {
-    log(
-      `${role}: bỏ thuộc tính max-message-size để tương thích; spike dùng frame ${FRAME_SIZE} byte`,
-      'ok'
-    );
-  }
-  return accepted.join('\r\n');
 }
 
 // ---------------------------------------------------------------- môi trường
@@ -278,7 +268,7 @@ el('btn-offer').onclick = async () => {
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
   await waitForIceGathering(pc);
-  el('offer-out').value = pc.localDescription.sdp;
+  el('offer-out').value = encodeSdpToken(pc.localDescription.sdp);
   reportIce(pc);
   log('A: offer đã sẵn sàng — copy sang B');
 };
@@ -296,22 +286,20 @@ function copyFrom(id) {
 }
 
 el('btn-answer').onclick = async () => {
-  const sdp = el('offer-in').value.trim();
-  if (!sdp) return log('chưa dán offer của A', 'bad');
+  const input = el('offer-in').value.trim();
+  if (!input) return log('chưa dán offer của A', 'bad');
   const button = el('btn-answer');
   button.disabled = true;
   try {
+    const sdp = decodeSdpToken(input);
     const pc = createPeer('B');
     log('B: đang áp dụng offer của A…');
-    await withStepTimeout(
-      pc.setRemoteDescription({ type: 'offer', sdp: normalizeRemoteSdp(sdp, 'B') }),
-      'setRemoteDescription'
-    );
+    await withStepTimeout(pc.setRemoteDescription({ type: 'offer', sdp }), 'setRemoteDescription');
     log('B: offer hợp lệ, đang tạo answer…');
     const answer = await withStepTimeout(pc.createAnswer(), 'createAnswer');
     await withStepTimeout(pc.setLocalDescription(answer), 'setLocalDescription');
     await waitForIceGathering(pc);
-    el('answer-out').value = pc.localDescription.sdp;
+    el('answer-out').value = encodeSdpToken(pc.localDescription.sdp);
     reportIce(pc);
     log('B: answer đã sẵn sàng — copy về A');
   } catch (error) {
@@ -320,15 +308,16 @@ el('btn-answer').onclick = async () => {
 };
 
 el('btn-accept').onclick = async () => {
-  const sdp = el('answer-in').value.trim();
-  if (!sdp) return log('chưa dán answer của B', 'bad');
+  const input = el('answer-in').value.trim();
+  if (!input) return log('chưa dán answer của B', 'bad');
   if (!ctx.pc) return log('chưa tạo offer ở bước 1', 'bad');
   const button = el('btn-accept');
   button.disabled = true;
   try {
+    const sdp = decodeSdpToken(input);
     log('A: đang áp dụng answer của B…');
     await withStepTimeout(
-      ctx.pc.setRemoteDescription({ type: 'answer', sdp: normalizeRemoteSdp(sdp, 'A') }),
+      ctx.pc.setRemoteDescription({ type: 'answer', sdp }),
       'setRemoteDescription'
     );
     const info = describeCandidates(sdp);
