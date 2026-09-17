@@ -15,6 +15,7 @@ const TEST_SIZE = 1024 * 1024;
 const FRAME_SIZE = 64 * 1024;
 const BUFFER_HIGH = 512 * 1024;
 const BUFFER_LOW = 128 * 1024;
+const STEP_TIMEOUT_MS = 10000;
 
 const el = (id) => document.getElementById(id);
 
@@ -44,6 +45,30 @@ function setState(label, value, cls = '') {
   if (!stateFields[label]) stateFields[label] = row(el('state'), label, '—');
   stateFields[label].textContent = value;
   stateFields[label].className = cls;
+}
+
+async function withStepTimeout(promise, label) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`${label} không hoàn tất sau ${STEP_TIMEOUT_MS / 1000} giây`)),
+          STEP_TIMEOUT_MS
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function reportStepError(role, error, button) {
+  const detail = error?.message || String(error);
+  log(`[${role}] LỖI: ${error?.name || 'Error'}: ${detail}`, 'bad');
+  setState('Lỗi thiết lập', `${error?.name || 'Error'}: ${detail}`, 'bad');
+  button.disabled = false;
 }
 
 // ---------------------------------------------------------------- môi trường
@@ -260,25 +285,41 @@ function copyFrom(id) {
 el('btn-answer').onclick = async () => {
   const sdp = el('offer-in').value.trim();
   if (!sdp) return log('chưa dán offer của A', 'bad');
-  el('btn-answer').disabled = true;
-  const pc = createPeer('B');
-  await pc.setRemoteDescription({ type: 'offer', sdp });
-  const answer = await pc.createAnswer();
-  await pc.setLocalDescription(answer);
-  await waitForIceGathering(pc);
-  el('answer-out').value = pc.localDescription.sdp;
-  reportIce(pc);
-  log('B: answer đã sẵn sàng — copy về A');
+  const button = el('btn-answer');
+  button.disabled = true;
+  try {
+    const pc = createPeer('B');
+    log('B: đang áp dụng offer của A…');
+    await withStepTimeout(pc.setRemoteDescription({ type: 'offer', sdp }), 'setRemoteDescription');
+    log('B: offer hợp lệ, đang tạo answer…');
+    const answer = await withStepTimeout(pc.createAnswer(), 'createAnswer');
+    await withStepTimeout(pc.setLocalDescription(answer), 'setLocalDescription');
+    await waitForIceGathering(pc);
+    el('answer-out').value = pc.localDescription.sdp;
+    reportIce(pc);
+    log('B: answer đã sẵn sàng — copy về A');
+  } catch (error) {
+    reportStepError('B', error, button);
+  }
 };
 
 el('btn-accept').onclick = async () => {
   const sdp = el('answer-in').value.trim();
   if (!sdp) return log('chưa dán answer của B', 'bad');
   if (!ctx.pc) return log('chưa tạo offer ở bước 1', 'bad');
-  el('btn-accept').disabled = true;
-  await ctx.pc.setRemoteDescription({ type: 'answer', sdp });
-  const info = describeCandidates(sdp);
-  log(`A: đã nhận answer (${info.total} candidate)`);
+  const button = el('btn-accept');
+  button.disabled = true;
+  try {
+    log('A: đang áp dụng answer của B…');
+    await withStepTimeout(
+      ctx.pc.setRemoteDescription({ type: 'answer', sdp }),
+      'setRemoteDescription'
+    );
+    const info = describeCandidates(sdp);
+    log(`A: đã nhận answer (${info.total} candidate)`);
+  } catch (error) {
+    reportStepError('A', error, button);
+  }
 };
 
 el('btn-send').onclick = async () => {
