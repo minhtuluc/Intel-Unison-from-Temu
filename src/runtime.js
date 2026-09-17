@@ -17,6 +17,7 @@ import { PendingUploadService } from './services/pending-upload.js';
 import { DiscoveryService } from './services/discovery.js';
 import { StorageQuotaTracker } from './services/storage-quota.js';
 import { TransferOfferService } from './services/transfer-offer.js';
+import { RelayTransferService } from './services/relay-transfer.js';
 import { TrustedDeviceService } from './services/trusted-devices.js';
 import { TransferHistoryService } from './services/transfer-history.js';
 import { createHostAuth } from './middleware/host-auth.js';
@@ -37,7 +38,8 @@ export function createRuntime(options = {}) {
   // Reconcile existing disk usage from chunks and pending directories
   const chunksDir = path.join(config.tempDir, 'chunks');
   const pendingDir = path.join(config.tempDir, 'pending');
-  quotaTracker.reconcileFromDiskSync([chunksDir, pendingDir]);
+  const relayDir = path.join(config.tempDir, 'relay');
+  quotaTracker.reconcileFromDiskSync([chunksDir, pendingDir, relayDir]);
 
   const runtime = {
     config,
@@ -48,6 +50,7 @@ export function createRuntime(options = {}) {
     pendingUploadManager: new PendingUploadService({ config, quotaTracker }),
     trustedDevices: new TrustedDeviceService({ config }),
     offerService: new TransferOfferService({ config }),
+    relayService: null,
     history: new TransferHistoryService({ config }),
     discovery: new DiscoveryService({ maxConnectedDevices: config.maxConnectedDevices }),
     hostAuth: createHostAuth(),
@@ -63,6 +66,18 @@ export function createRuntime(options = {}) {
         }
       }
       return chunkCount + runtime.inFlightSimpleUploads;
+    },
+    /**
+     * Locates the consent service that owns a grant. Host-approved files (M3) and
+     * relay-approved files (M4) both reach disk through the same write gate, which must
+     * not care which authority issued the grant.
+     * @param {string} grantId
+     * @returns {object|null}
+     */
+    findGrantService(grantId) {
+      if (runtime.offerService.hasGrant?.(grantId)) return runtime.offerService;
+      if (runtime.relayService?.hasGrant?.(grantId)) return runtime.relayService;
+      return null;
     },
     /**
      * Records the port the HTTP listener actually bound to (matters for port 0).
@@ -94,16 +109,18 @@ export function createRuntime(options = {}) {
         runtime.shareManager.sweepOrphans(runtime.config.tempDir, olderThanMs),
       ]);
       runtime.offerService.sweepGrants();
+      runtime.relayService?.sweepGrants?.();
     },
 
     /**
-     * Re-scans disk for chunks and pending uploads to align quota allocation.
+     * Re-scans disk for chunks, pending uploads and relayed files to align quota allocation.
      * @returns {Promise<number>}
      */
     async reconcileDiskQuota() {
       const chunks = path.join(runtime.config.tempDir, 'chunks');
       const pending = path.join(runtime.config.tempDir, 'pending');
-      return await quotaTracker.reconcileFromDisk([chunks, pending]);
+      const relay = path.join(runtime.config.tempDir, 'relay');
+      return await quotaTracker.reconcileFromDisk([chunks, pending, relay]);
     },
 
     /**
@@ -172,6 +189,7 @@ export function createRuntime(options = {}) {
             runCleanupTask('chunkedUploadManager', () => runtime.chunkedUploadManager.cleanup()),
             runCleanupTask('pendingUploadManager', () => runtime.pendingUploadManager.cleanup()),
             runCleanupTask('offerService', () => runtime.offerService.cleanup()),
+            runCleanupTask('relayService', () => runtime.relayService?.cleanup()),
             // Flush before the process can exit, or the last outcomes are lost.
             runCleanupTask('history', () => runtime.history.flush()),
             runCleanupTask('sessions', () => runtime.sessions.revokeAll()),
@@ -217,6 +235,88 @@ export function createRuntime(options = {}) {
 
       return runtime.stoppingPromise;
     },
+  };
+
+  // Relay transfers (M4): the receiver approves, the host only carries the bytes.
+  runtime.relayService = new RelayTransferService({
+    config,
+    shareManager: runtime.shareManager,
+    quotaTracker,
+  });
+
+  // A relay nobody answers must end loudly for both peers, with no bytes written.
+  runtime.relayService.onOfferExpire = ({ relayId, sender, receiver }) => {
+    const relay = runtime.relayService.getRelay(relayId);
+    for (const file of relay?.files || []) {
+      if (file.decision !== 'expired') continue;
+      runtime.history.record({
+        status: 'expired',
+        reason: 'TIMEOUT',
+        source: 'relay',
+        fileName: file.name,
+        size: file.size,
+        sender,
+      });
+    }
+
+    const wss = runtime.wss || runtime.app?.get('wss');
+    if (wss) {
+      sendTransferTerminalEvent(
+        wss,
+        'relay:offer:expired',
+        { relayId, reason: 'TIMEOUT' },
+        sender,
+        receiver?.keys
+      );
+    }
+  };
+
+  // Stored relay files report every lifecycle transition, so neither peer has to guess
+  // why a file appeared or vanished.
+  runtime.relayService.onStoredEvent = ({
+    state,
+    reason,
+    relayId,
+    fileIndex,
+    fileId,
+    fileName,
+    size,
+    sender,
+    receiver,
+  }) => {
+    runtime.history.record({
+      status: state,
+      reason,
+      source: 'relay',
+      fileName,
+      size,
+      sender,
+    });
+
+    const wss = runtime.wss || runtime.app?.get('wss');
+    if (!wss) return;
+    const event =
+      state === 'stored'
+        ? 'relay:stored'
+        : state === 'downloaded'
+          ? 'relay:downloaded'
+          : 'relay:expired';
+    sendTransferTerminalEvent(
+      wss,
+      event,
+      {
+        relayId,
+        fileId,
+        fileIndex,
+        fileName,
+        size,
+        reason,
+        // Lets a client tell whether it is the sender or the receiver of this relay.
+        senderConnectionId: sender?.connectionId || null,
+      },
+      sender,
+      receiver?.keys
+    );
   };
 
   // Background periodic sweeper for orphaned temp files

@@ -75,3 +75,63 @@ describe('Device registry: server-issued identity keyed by connection', () => {
     assert.deepEqual(discovery.getDevices(), []);
   });
 });
+
+describe('Device registry: identity key index (UT-020)', () => {
+  it('resolves every live connection sharing an identity key', () => {
+    const discovery = new DiscoveryService();
+    discovery.addConnection('conn-a', { identityKeys: ['conn:conn-a', 'dev:abc', 'sess:t1'] });
+    discovery.addConnection('conn-b', { identityKeys: ['conn:conn-b', 'dev:abc'] });
+    discovery.addConnection('conn-c', { identityKeys: ['conn:conn-c'] });
+
+    assert.deepEqual([...discovery.getConnectionIdsForKeys(['dev:abc'])].sort(), [
+      'conn-a',
+      'conn-b',
+    ]);
+    assert.deepEqual([...discovery.getConnectionIdsForKeys(['sess:t1'])], ['conn-a']);
+    assert.equal(discovery.getConnectionIdsForKeys(['dev:missing']).size, 0);
+    assert.equal(discovery.getConnectionIdsForKeys([]).size, 0);
+  });
+
+  it('replaces keys on re-registration and drops them on disconnect', () => {
+    const discovery = new DiscoveryService();
+    discovery.addConnection('conn-a', { identityKeys: ['dev:abc'] });
+    discovery.addConnection('conn-a', { identityKeys: ['conn:conn-a'] });
+
+    assert.equal(discovery.getConnectionIdsForKeys(['dev:abc']).size, 0);
+    assert.deepEqual([...discovery.getConnectionIdsForKeys(['conn:conn-a'])], ['conn-a']);
+
+    discovery.removeConnection('conn-a');
+    assert.equal(discovery.getConnectionIdsForKeys(['conn:conn-a']).size, 0);
+  });
+
+  it('drops a lapsed credential without touching the durable keys', () => {
+    const discovery = new DiscoveryService();
+    discovery.addConnection('conn-a', { identityKeys: ['conn:conn-a', 'dev:abc', 'sess:t1'] });
+
+    discovery.updateIdentityKeys('conn-a', ['conn:conn-a', 'dev:abc']);
+
+    assert.equal(discovery.getConnectionIdsForKeys(['sess:t1']).size, 0);
+    assert.deepEqual([...discovery.getConnectionIdsForKeys(['dev:abc'])], ['conn-a']);
+  });
+
+  it('leaves no identity behind when the device cap rejects a registration', () => {
+    const discovery = new DiscoveryService({ maxConnectedDevices: 1 });
+    discovery.addConnection('conn-1', { identityKeys: ['dev:one'] });
+
+    assert.throws(
+      () => discovery.addConnection('conn-2', { identityKeys: ['dev:two'] }),
+      /Maximum connected devices/
+    );
+    assert.equal(discovery.getConnectionIdsForKeys(['dev:two']).size, 0);
+    assert.deepEqual([...discovery.getConnectionIdsForKeys(['dev:one'])], ['conn-1']);
+  });
+
+  it('clears the identity index with the devices', () => {
+    const discovery = new DiscoveryService();
+    discovery.addConnection('conn-a', { identityKeys: ['dev:abc'] });
+
+    discovery.clear();
+    assert.equal(discovery.getConnectionIdsForKeys(['dev:abc']).size, 0);
+    assert.equal(discovery.identityIndex.size, 0);
+  });
+});

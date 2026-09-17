@@ -4,6 +4,7 @@
  */
 
 import { logger } from '../utils/logger.js';
+import { identityKeysForSocket } from '../utils/client-identity.js';
 
 export function handleWsMessage(wss, ws, rawMessage) {
   let message;
@@ -18,7 +19,7 @@ export function handleWsMessage(wss, ws, rawMessage) {
 
   switch (event) {
     case 'client:register': {
-      const { deviceName, platform, hostToken, sessionToken } = data || {};
+      const { deviceName, platform, hostToken, sessionToken, deviceToken } = data || {};
 
       const session = ws.verifySession?.(sessionToken);
       ws.isHost = Boolean(ws.verifyHost?.(hostToken));
@@ -30,6 +31,9 @@ export function handleWsMessage(wss, ws, rawMessage) {
       }
 
       if (!ws.authorized) {
+        // A rejected registration must not leave stale identity keys indexed.
+        ws.identityKeys = [];
+        ws.discovery?.updateIdentityKeys?.(ws.connectionId, []);
         if (ws.readyState === 1) {
           ws.send(
             JSON.stringify({
@@ -47,6 +51,12 @@ export function handleWsMessage(wss, ws, rawMessage) {
 
       // Identity is the connection, not the payload. Claimed name/platform are
       // stored as untrusted display labels only.
+      ws.identityKeys = identityKeysForSocket({
+        connectionId: ws.connectionId,
+        sessionToken: ws.sessionToken,
+        deviceToken,
+      });
+
       let deviceRecord;
       try {
         deviceRecord = ws.discovery.addConnection(ws.connectionId, {
@@ -54,6 +64,7 @@ export function handleWsMessage(wss, ws, rawMessage) {
           platform,
           ip: ws._remoteIp || '127.0.0.1',
           isHost: ws.isHost,
+          identityKeys: ws.identityKeys,
         });
       } catch (err) {
         if (ws.readyState === 1) {
@@ -169,19 +180,43 @@ export function broadcastEvent(wss, event, data, filterOrExclude = null) {
 }
 
 /**
+ * Sends an event only to sockets presenting one of the given identity keys (UT-021).
+ * This is how a relay offer reaches its receiver — and only its receiver — including
+ * after the receiver reconnects and re-establishes the same durable key.
+ * @param {object} wss
+ * @param {Iterable<string>} keys
+ * @param {string} event
+ * @param {object} data
+ */
+export function sendToIdentity(wss, keys, event, data) {
+  if (!wss || !wss.clients) return;
+  const wanted = new Set(keys || []);
+  if (wanted.size === 0) return;
+  broadcastEvent(wss, event, data, (client) => {
+    const clientKeys = client.identityKeys || [];
+    return clientKeys.some((key) => wanted.has(key));
+  });
+}
+
+/**
  * Sends terminal transfer outcome events only to the host and the specific sender socket.
  * Other connected clients will never receive terminal transfer events of unrelated transfers.
  * @param {object} wss
  * @param {string} event
  * @param {object} data
  * @param {object} [sender]
+ * @param {Iterable<string>} [recipientKeys] extra identity keys to reach (relay receiver)
  */
-export function sendTransferTerminalEvent(wss, event, data, sender = null) {
+export function sendTransferTerminalEvent(wss, event, data, sender = null, recipientKeys = null) {
+  const extra = new Set(recipientKeys || []);
   broadcastEvent(wss, event, data, (client) => {
     if (client.isHost) return true;
     const hasSenderInfo = sender && (sender.connectionId || (sender.ip && sender.ip !== 'unknown'));
-    if (!hasSenderInfo) return true;
+    if (!hasSenderInfo && extra.size === 0) return true;
     if (sender?.connectionId && client.connectionId === sender.connectionId) {
+      return true;
+    }
+    if (extra.size > 0 && (client.identityKeys || []).some((key) => extra.has(key))) {
       return true;
     }
     return false;

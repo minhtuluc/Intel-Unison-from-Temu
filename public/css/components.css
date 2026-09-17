@@ -1283,3 +1283,66 @@
   color: var(--danger, #ff6b6b);
   font-size: 0.85rem;
 }
+
+/* ==========================================================================
+   Relay transfers (M4) — send-to picker and the receiver's inbox
+   ========================================================================== */
+
+.upload-receiver-row {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.upload-receiver-label {
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  color: var(--color-text-secondary);
+}
+
+.upload-receiver-hint {
+  font-size: var(--font-size-xs);
+  color: var(--color-text-secondary);
+}
+
+select.settings-input {
+  cursor: pointer;
+  appearance: none;
+}
+
+.relay-inbox-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.relay-inbox-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  background: var(--color-bg-secondary);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+}
+
+.relay-inbox-item__info {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+  flex: 1;
+}
+
+.relay-inbox-item__name {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.relay-inbox-item__meta {
+  font-size: var(--font-size-xs);
+  color: var(--color-text-secondary);
+}

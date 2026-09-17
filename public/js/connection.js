@@ -5,7 +5,7 @@
  */
 
 import { hostHeaders } from './host-session.js';
-import { getSessionToken } from './api.js';
+import { getSessionToken, getDeviceToken } from './api.js';
 
 export class ConnectionManager {
   constructor() {
@@ -207,6 +207,9 @@ export class ConnectionManager {
     this.send('client:register', {
       hostToken: hostHeaders()['X-Host-Token'],
       sessionToken: getSessionToken(),
+      // Durable device identity so the server can still recognize this device after a
+      // reconnect or reload (relay receiver routing, UT-020).
+      deviceToken: getDeviceToken(),
       deviceName,
       platform,
       isHost:

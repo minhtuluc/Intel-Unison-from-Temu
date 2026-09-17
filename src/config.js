@@ -27,6 +27,9 @@ export const DEFAULT_CONFIG = {
   // How long a transfer offer waits for the host before it is abandoned with no
   // bytes moved. Kept short: the sender is blocked on this decision.
   offerTtlMs: 2 * 60 * 1000, // 2 minutes
+  // How long a relayed file waits in the relay staging area for its receiver to download
+  // it. Long enough to be useful, short enough that an ignored file does not squat on disk.
+  relayTtlMs: 60 * 60 * 1000, // 1 hour
   thumbnailSize: 200,
   thumbnailQuality: 80,
   pin: null,
@@ -116,6 +119,11 @@ export function validateConfig(cfg) {
     throw new AppError('CONFIG_INVALID', 500, 'offerTtlMs must be a positive integer.');
   }
 
+  const relayTtlMs = Number(cfg.relayTtlMs ?? DEFAULT_CONFIG.relayTtlMs);
+  if (!Number.isInteger(relayTtlMs) || relayTtlMs <= 0) {
+    throw new AppError('CONFIG_INVALID', 500, 'relayTtlMs must be a positive integer.');
+  }
+
   const sessionTtlMs = Number(cfg.sessionTtlMs);
   if (!Number.isInteger(sessionTtlMs) || sessionTtlMs <= 0) {
     throw new AppError(
@@ -183,6 +191,9 @@ export function loadConfig(overrides = {}) {
     offerTtlMs: env.UTRANS_OFFER_TTL
       ? parseInt(env.UTRANS_OFFER_TTL, 10)
       : DEFAULT_CONFIG.offerTtlMs,
+    relayTtlMs: env.UTRANS_RELAY_TTL
+      ? parseInt(env.UTRANS_RELAY_TTL, 10)
+      : DEFAULT_CONFIG.relayTtlMs,
     thumbnailSize: DEFAULT_CONFIG.thumbnailSize,
     thumbnailQuality: DEFAULT_CONFIG.thumbnailQuality,
     pin: env.UTRANS_PIN ? env.UTRANS_PIN.trim() : DEFAULT_CONFIG.pin,

@@ -6,6 +6,7 @@ import os from 'node:os';
 import crypto from 'node:crypto';
 import WebSocket from 'ws';
 import { startServer } from '../../src/server.js';
+import { connectWs as connectWsShared } from '../helpers/ws.js';
 
 describe('M3 QC Review Regression Suite (M3-QC-01 to M3-QC-04)', () => {
   let tempDir;
@@ -23,39 +24,7 @@ describe('M3 QC Review Regression Suite (M3-QC-01 to M3-QC-04)', () => {
 
   /** Helper to connect and register a WebSocket client with PIN session */
   function connectWs(port, sessionToken, deviceName, platform) {
-    return new Promise((resolve, reject) => {
-      const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`);
-      let connId = null;
-
-      ws.on('open', () => {
-        ws.send(
-          JSON.stringify({
-            event: 'client:register',
-            data: {
-              deviceName,
-              platform,
-              sessionToken,
-            },
-          })
-        );
-      });
-
-      ws.on('message', (raw) => {
-        try {
-          const msg = JSON.parse(raw.toString());
-          if (msg.event === 'client:registered') {
-            connId = msg.data.connectionId;
-            resolve({ ws, connId });
-          } else if (msg.event === 'client:rejected') {
-            reject(new Error(`WS rejected: ${JSON.stringify(msg.data)}`));
-          }
-        } catch (err) {
-          reject(err);
-        }
-      });
-
-      ws.on('error', reject);
-    });
+    return connectWsShared(port, { sessionToken, deviceName, platform });
   }
 
   before(async () => {

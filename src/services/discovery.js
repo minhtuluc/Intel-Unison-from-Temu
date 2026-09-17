@@ -15,13 +15,15 @@ export class DiscoveryService {
     this.devices = new Map();
     /** @type {Map<string, string>} connectionId -> deviceId */
     this.connections = new Map();
+    /** @type {Map<string, Set<string>>} identity key -> connectionIds currently presenting it */
+    this.identityIndex = new Map();
     this.maxConnectedDevices = Number(options.maxConnectedDevices || 20);
   }
 
   /**
    * Registers a connection, creating its own device record.
    * @param {string} connectionId
-   * @param {{ label?: string, platform?: string, ip?: string, isHost?: boolean }} [info]
+   * @param {{ label?: string, platform?: string, ip?: string, isHost?: boolean, identityKeys?: string[] }} [info]
    */
   addConnection(connectionId, info = {}) {
     const now = Date.now();
@@ -30,6 +32,9 @@ export class DiscoveryService {
     const existingId = this.connections.get(connectionId);
     const existing = existingId ? this.devices.get(existingId) : null;
     if (existing) {
+      // Identity keys are server-derived (see utils/client-identity.js); re-registering
+      // the same socket replaces its previous index entries rather than stacking them.
+      this.updateIdentityKeys(connectionId, info.identityKeys);
       existing.label = info.label || existing.label;
       existing.platform = info.platform || existing.platform;
       existing.ip = info.ip || existing.ip;
@@ -39,12 +44,16 @@ export class DiscoveryService {
     }
 
     if (!info.isHost && this.devices.size >= this.maxConnectedDevices) {
+      // Rejected registration must leave no identity behind: cap the device count first.
+      this.updateIdentityKeys(connectionId, []);
       throw new AppError(
         'TOO_MANY_DEVICES',
         429,
         `Maximum connected devices (${this.maxConnectedDevices}) reached`
       );
     }
+
+    this.updateIdentityKeys(connectionId, info.identityKeys);
 
     const device = {
       id: randomUUID(),
@@ -84,11 +93,28 @@ export class DiscoveryService {
   }
 
   removeConnection(connectionId) {
+    this._unindexIdentity(connectionId);
     const deviceId = this.connections.get(connectionId);
     if (!deviceId) return false;
     this.connections.delete(connectionId);
     this.devices.delete(deviceId);
     return true;
+  }
+
+  /**
+   * Connection IDs of live sockets presenting any of the given identity keys.
+   * This is how a relay offer reaches its receiver even after a reconnect.
+   * @param {Iterable<string>} keys
+   * @returns {Set<string>}
+   */
+  getConnectionIdsForKeys(keys = []) {
+    const matched = new Set();
+    for (const key of keys) {
+      const connectionIds = this.identityIndex.get(key);
+      if (!connectionIds) continue;
+      for (const connectionId of connectionIds) matched.add(connectionId);
+    }
+    return matched;
   }
 
   getDevices() {
@@ -100,5 +126,40 @@ export class DiscoveryService {
   clear() {
     this.devices.clear();
     this.connections.clear();
+    this.identityIndex.clear();
+  }
+
+  /**
+   * Replaces the identity keys a connection is indexed under. Used when a credential
+   * lapses (e.g. a revoked session) without the socket having closed yet.
+   * @param {string} connectionId
+   * @param {Iterable<string>} keys
+   */
+  updateIdentityKeys(connectionId, keys = []) {
+    this._unindexIdentity(connectionId);
+    this._indexIdentity(connectionId, Array.isArray(keys) ? keys : Array.from(keys || []));
+  }
+
+  /** @private */
+  _indexIdentity(connectionId, keys = []) {
+    if (!connectionId || !Array.isArray(keys)) return;
+    for (const key of keys) {
+      if (typeof key !== 'string' || !key) continue;
+      let connectionIds = this.identityIndex.get(key);
+      if (!connectionIds) {
+        connectionIds = new Set();
+        this.identityIndex.set(key, connectionIds);
+      }
+      connectionIds.add(connectionId);
+    }
+  }
+
+  /** @private */
+  _unindexIdentity(connectionId) {
+    if (!connectionId) return;
+    for (const [key, connectionIds] of this.identityIndex) {
+      connectionIds.delete(connectionId);
+      if (connectionIds.size === 0) this.identityIndex.delete(key);
+    }
   }
 }

@@ -358,6 +358,15 @@ export class TransferOfferService {
   }
 
   /**
+   * True when this service issued the grant. The shared write gate asks every consent
+   * service who owns a grant id, so it does not have to know which flow it came from.
+   * @param {string} grantId
+   */
+  hasGrant(grantId) {
+    return this.grants.has(grantId);
+  }
+
+  /**
    * Grants issued for an offer, so a sender that missed the WebSocket decision can
    * still collect what it was allowed to upload.
    * @param {string} offerId

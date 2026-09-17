@@ -7,6 +7,7 @@ import { connection } from './connection.js';
 import { FileBrowser } from './file-browser.js';
 import { DropZone } from './drop-zone.js';
 import { transferEngine } from './transfer.js';
+import { relayInbox } from './relay-inbox.js';
 import { createElement, getFileSvg, showModal, closeModal, showQrModal, showToast } from './ui.js';
 import { describeReason, formatFileSize, formatRelativeTime, readApiError } from './utils.js';
 import {
@@ -36,6 +37,9 @@ class App {
     this.deferredPrompt = null;
     this.isHost = false;
     this.pendingApprovals = [];
+    // Relay transfers (M4): the device this batch is addressed to, if not the host.
+    this.selectedReceiverDeviceId = null;
+    this.relayActive = [];
     // Batches announced by senders (UT-012). Consent happens here, before any bytes.
     this.pendingOffers = [];
     // One-shot notices: each of these would otherwise repeat on every retry.
@@ -163,6 +167,10 @@ class App {
         this._renderTransfersView();
         break;
 
+      case 'incoming':
+        this._renderIncomingView();
+        break;
+
       case 'devices':
         this._renderDevicesView();
         break;
@@ -256,6 +264,54 @@ class App {
 
     container.appendChild(fileInput);
     container.appendChild(cameraInput);
+
+    // Send-to picker (M4). Default is the host, which is the pre-M4 behaviour; picking a
+    // device makes this a relay the receiver has to accept.
+    const otherDevices = (this.connectedDevices || []).filter(
+      (device) => device.id !== this.localDeviceId && !device.isHost
+    );
+    const receiverSelect = createElement(
+      'select',
+      {
+        class: 'settings-input',
+        id: 'upload-receiver-select',
+        onchange: (event) => {
+          this.selectedReceiverDeviceId = event.target.value || null;
+        },
+      },
+      [
+        createElement(
+          'option',
+          { value: '', selected: !this.selectedReceiverDeviceId },
+          'Host PC (approval as usual)'
+        ),
+        ...otherDevices.map((device) =>
+          createElement(
+            'option',
+            {
+              value: device.id,
+              selected: device.id === this.selectedReceiverDeviceId,
+            },
+            `${device.label} (${device.platform || 'device'})`
+          )
+        ),
+      ]
+    );
+
+    container.appendChild(
+      createElement('div', { class: 'upload-receiver-row' }, [
+        createElement('label', { class: 'upload-receiver-label' }, 'Send to'),
+        receiverSelect,
+        createElement(
+          'p',
+          { class: 'upload-receiver-hint' },
+          this.selectedReceiverDeviceId
+            ? 'Only the selected device can accept this transfer, and only it can download the file.'
+            : 'Pick a device to send directly to it instead of the host.'
+        ),
+      ])
+    );
+
     container.appendChild(dropzone);
 
     // Selected files preview list
@@ -342,10 +398,16 @@ class App {
 
   _startUploadBatch() {
     if (this.selectedUploadFiles.length === 0) return;
-    transferEngine.addFiles(this.selectedUploadFiles);
+    const receiverDeviceId = this.selectedReceiverDeviceId || null;
+    transferEngine.addFiles(this.selectedUploadFiles, { receiverDeviceId });
     this.selectedUploadFiles = [];
     window.location.hash = '#transfers';
-    showToast({ message: 'Upload queued! View progress in Transfers tab', type: 'info' });
+    showToast({
+      message: receiverDeviceId
+        ? 'Relay queued — waiting for the receiver to accept'
+        : 'Upload queued! View progress in Transfers tab',
+      type: 'info',
+    });
   }
 
   /* ==========================================================================
@@ -556,6 +618,27 @@ class App {
       progressBar,
       metaRow,
     ]);
+  }
+
+  /* ==========================================================================
+     Incoming (relay) View — files other devices addressed to this one
+     ========================================================================== */
+
+  async _renderIncomingView() {
+    this.mainContainer.innerHTML = '';
+    const container = createElement('div', { class: 'view-container' });
+    this.mainContainer.appendChild(container);
+
+    await relayInbox.load();
+    relayInbox.renderInto(container);
+  }
+
+  /** Called after this device answered a relay offer, so the inbox reflects it. */
+  async _handleRelayDecided() {
+    if (this.currentView === 'incoming') {
+      await this._renderIncomingView();
+    }
+    if (this.isHost) await this._loadRelayActive();
   }
 
   /* ==========================================================================
@@ -1120,6 +1203,71 @@ class App {
       if (this.isHost) this._loadPendingOffers();
     });
 
+    // A relay addressed to this device. The server sends it only to the receiver, so
+    // seeing it here means this device is the one being asked (M4).
+    connection.on('relay:offer', (data) => {
+      if (data?.relay) {
+        relayInbox.promptOffer(data.relay, { onDecided: () => this._handleRelayDecided() });
+      }
+    });
+
+    connection.on('relay:decision', (data) => {
+      transferEngine.handleWebSocketEvent('relay:decision', data);
+      if (this.isHost) this._loadRelayActive();
+    });
+
+    connection.on('relay:offer:expired', (data) => {
+      transferEngine.handleWebSocketEvent('relay:offer:expired', data);
+      if (this.isHost) this._loadRelayActive();
+    });
+
+    // Stored / expired / downloaded are sent to the sender, the receiver and the host;
+    // each of them needs a different sentence, so read who we are from the payload.
+    const isRelaySender = (data) =>
+      Boolean(data?.senderConnectionId && data.senderConnectionId === window.utransConnectionId);
+
+    connection.on('relay:stored', async (data) => {
+      if (this.isHost) {
+        await this._loadRelayActive();
+        return;
+      }
+      showToast(
+        isRelaySender(data)
+          ? { message: 'Delivered — waiting for the receiver to download', type: 'success' }
+          : {
+              message: `${data?.fileName || 'A file'} was sent to this device — open Incoming`,
+              type: 'success',
+            }
+      );
+      if (this.currentView === 'incoming') await this._renderIncomingView();
+    });
+
+    connection.on('relay:downloaded', async (data) => {
+      if (this.isHost) {
+        await this._loadRelayActive();
+        return;
+      }
+      if (isRelaySender(data)) {
+        showToast({ message: 'The receiver downloaded your file', type: 'info' });
+      }
+    });
+
+    connection.on('relay:expired', async (data) => {
+      if (this.isHost) {
+        await this._loadRelayActive();
+        return;
+      }
+      showToast({
+        message: `${data?.fileName || 'A relayed file'} expired before it was downloaded`,
+        type: 'warning',
+      });
+      if (this.currentView === 'incoming') await this._renderIncomingView();
+    });
+
+    connection.on('relay:update', () => {
+      if (this.isHost) this._loadRelayActive();
+    });
+
     connection.on('client:registered', (data) => {
       this.isHost = data?.device?.isHost === true;
       // Server-issued identity for this connection; used only to flag "This Device".
@@ -1188,6 +1336,7 @@ class App {
       this._buildReceiveFolderCard(),
       this._buildStorageCard(),
       this._buildTrustedDevicesCard(),
+      ...(this.isHost ? [this._buildRelayCard()] : []),
       this._buildHistoryCard()
     );
 
@@ -1264,6 +1413,21 @@ class App {
     return card;
   }
 
+  _buildRelayCard() {
+    const card = this._settingsCard(
+      'Relay transfers',
+      'Files being carried for another device. The host can stop one, but has no action to approve or download it.'
+    );
+    card
+      .querySelector('.settings-card__body')
+      .append(
+        createElement('ul', { class: 'settings-list', id: 'relay-active-list' }, [
+          createElement('li', { class: 'settings-list__empty' }, 'Loading…'),
+        ])
+      );
+    return card;
+  }
+
   _buildHistoryCard() {
     const card = this._settingsCard(
       'Recent transfers',
@@ -1284,6 +1448,7 @@ class App {
       this._loadReceiveDir(),
       this._loadQuota(),
       this._loadTrustedDevices(),
+      this._loadRelayActive(),
       this._loadHistory(),
     ]);
   }
@@ -1403,6 +1568,74 @@ class App {
       showToast({ type: 'danger', message: `Could not revoke: ${describeReason(err)}` });
     } finally {
       await this._loadTrustedDevices();
+    }
+  }
+
+  /**
+   * Host management view of relay transfers (M4). Metadata only: the host carries the
+   * bytes for another device and can stop a transfer, but has no download handle.
+   */
+  async _loadRelayActive() {
+    if (!this.isHost) return;
+    const list = document.getElementById('relay-active-list');
+    if (!list) return;
+
+    try {
+      const res = await apiFetch('/api/relay/active', { headers: hostHeaders() });
+      if (!res.ok) return;
+      const body = await res.json();
+      const relays = body.data?.relays || [];
+      const stored = body.data?.stored || [];
+      this.relayActive = [...relays, ...stored];
+
+      if (this.relayActive.length === 0) {
+        list.replaceChildren(
+          createElement('li', { class: 'settings-list__empty' }, 'No relay transfers right now')
+        );
+        return;
+      }
+
+      list.replaceChildren(
+        ...this.relayActive.map((item) => {
+          const isStored = Boolean(item.fileId);
+          const name = isStored ? item.name || 'file' : `${(item.files || []).length} file(s)`;
+          const meta = isStored
+            ? `${item.sender?.label || 'a device'} → ${item.receiver?.label || 'a device'} • expires ${new Date(item.expiresAt).toLocaleTimeString()}`
+            : `${item.sender?.label || 'a device'} → ${item.receiver?.label || 'a device'}`;
+          return createElement('li', { class: 'settings-list__row' }, [
+            createElement('div', { class: 'settings-list__text' }, [
+              createElement('div', { class: 'settings-list__name' }, name),
+              createElement('div', { class: 'settings-list__meta' }, meta),
+            ]),
+            createElement(
+              'button',
+              {
+                class: 'btn btn--ghost btn--sm',
+                onclick: () => this._revokeRelay(item),
+              },
+              'Stop'
+            ),
+          ]);
+        })
+      );
+    } catch {
+      // Leave the last known list in place; a refresh failure is not a state change.
+    }
+  }
+
+  async _revokeRelay(item) {
+    try {
+      const res = await apiFetch('/api/relay/revoke', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...hostHeaders() },
+        body: JSON.stringify(item.fileId ? { fileId: item.fileId } : { relayId: item.relayId }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      showToast({ type: 'success', message: 'Relay stopped' });
+    } catch (err) {
+      showToast({ type: 'danger', message: `Could not stop the relay: ${describeReason(err)}` });
+    } finally {
+      await this._loadRelayActive();
     }
   }
 

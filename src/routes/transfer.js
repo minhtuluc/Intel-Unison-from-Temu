@@ -11,14 +11,40 @@ import crypto from 'node:crypto';
 import multer from 'multer';
 import { broadcastEvent, sendTransferTerminalEvent } from '../websocket/handlers.js';
 import { AppError } from '../middleware/error-handler.js';
-import { parseRange, reserveWritableFile } from '../utils/file-utils.js';
+import { parseRange, reserveWritableFile, atomicMove } from '../utils/file-utils.js';
 import { requireHost } from '../middleware/host-auth.js';
 import { extractSessionToken } from '../middleware/session-auth.js';
 import { requireTransferGrant, assertGrantsMatchFiles } from '../middleware/transfer-grant.js';
+import { assertDownloadAllowed } from '../middleware/download-acl.js';
 import { hashDeviceToken } from '../services/trusted-devices.js';
 import { resolveSender } from '../utils/connection-identity.js';
 
 export const transferRouter = Router();
+
+/**
+ * Moves a finished relay upload into the relay staging area and registers it for its
+ * receiver. Relayed bytes never enter the host's receive directory, and the file carries
+ * an ACL so only the addressed receiver can fetch it (UT-022).
+ * @param {object} runtime
+ * @param {{ path: string, name: string, size: number, mimeType?: string|null }} file
+ * @param {{ relayId: string, fileIndex: number }} grant relay grant issued by the receiver
+ * @returns {Promise<object>} public metadata of the stored file
+ */
+async function storeRelayFile(runtime, { path: tempPath, name, size, mimeType }, grant) {
+  const relayDir = path.join(runtime.config.tempDir, 'relay');
+  const moved = await atomicMove(tempPath, relayDir, name);
+  const acl = runtime.relayService.getFileAcl(grant.relayId, grant.fileIndex);
+  const meta = await runtime.shareManager.addFile(moved.filePath, name, true, { acl });
+  runtime.relayService.attachStoredFile({
+    relayId: grant.relayId,
+    fileIndex: grant.fileIndex,
+    fileId: meta.id,
+    size,
+    name,
+    mimeType: mimeType || null,
+  });
+  return meta;
+}
 
 function hashUploadToken(token) {
   return crypto.createHash('sha256').update(token).digest();
@@ -559,12 +585,16 @@ transferRouter.delete('/api/devices/trusted/:id', requireHost, async (req, res, 
  */
 transferRouter.get('/api/download/:fileId', async (req, res, next) => {
   try {
+    const runtime = req.app.locals.runtime;
     const { fileId } = req.params;
-    const fileRecord = req.app.locals.runtime.shareManager.getFile(fileId);
+    const fileRecord = runtime.shareManager.getFile(fileId);
 
     if (!fileRecord) {
       throw new AppError('FILE_NOT_FOUND', 404, `File ${fileId} not found`);
     }
+
+    // A relayed file belongs to one receiver; the host has no bypass here.
+    assertDownloadAllowed(req, fileRecord);
 
     let stat;
     try {
@@ -616,6 +646,17 @@ transferRouter.get('/api/download/:fileId', async (req, res, next) => {
       stream.destroy();
     });
 
+    // Only a completed full download counts as delivered. A range request (206), a stream
+    // error or a client that walks away mid-transfer must not be reported as one, and a
+    // file that is already marked stays marked — one event per file (M4-QC-04).
+    if (fileRecord.acl?.mode === 'receiver') {
+      res.on('finish', () => {
+        if (res.statusCode === 200 && res.writableEnded) {
+          runtime.relayService.markDownloaded(fileId);
+        }
+      });
+    }
+
     stream.on('error', (err) => {
       if (!res.headersSent) {
         next(err);
@@ -651,6 +692,10 @@ transferRouter.post(
   parseSimpleUpload,
   async (req, res, next) => {
     const runtime = req.app.locals.runtime;
+    // Files already handed to a relay receiver, keyed by their multer temp path. A later
+    // failure in the same batch must take them back, and their quota belongs to the relay
+    // service from that point on — releasing it here too would under-count the disk.
+    const relayStored = new Map();
     try {
       const files = req.files || [];
       if (files.length === 0) {
@@ -659,7 +704,14 @@ transferRouter.post(
 
       // The gate ran before Multer, so this is what binds the parsed bytes to what
       // the host actually approved: wrong name, wrong size or extra files all fail.
-      assertGrantsMatchFiles(req, files);
+      const pairs = assertGrantsMatchFiles(req, files);
+
+      // A relay grant names the receiver the file belongs to; the host-approved grants
+      // do not, and keep flowing down the M3 path unchanged.
+      const relayGrants = new Map();
+      for (const pair of pairs) {
+        if (pair.grant.relayId) relayGrants.set(pair.file, pair.grant);
+      }
 
       // Sender attribution is strictly verified against active connection and remote IP
       const sender = resolveSender(req);
@@ -670,6 +722,29 @@ transferRouter.post(
       const wss = req.app.get('wss');
 
       for (const f of files) {
+        const relayGrant = relayGrants.get(f);
+        if (relayGrant) {
+          const meta = await storeRelayFile(
+            runtime,
+            {
+              path: f.path,
+              name: f.originalname || f.filename,
+              size: f.size,
+              mimeType: f.mimetype,
+            },
+            relayGrant
+          );
+          uploaded.push({
+            name: f.originalname || f.filename,
+            size: f.size,
+            relayId: relayGrant.relayId,
+            fileId: meta.id,
+            status: 'relayed',
+          });
+          relayStored.set(f.path, meta.id);
+          continue;
+        }
+
         const recordParams = {
           fileName: f.originalname || f.filename,
           fileSize: f.size,
@@ -715,12 +790,22 @@ transferRouter.post(
     } catch (error) {
       if (req.files && Array.isArray(req.files)) {
         for (const f of req.files) {
+          // Relay files are no longer pending: revokeFile removes them and releases
+          // their quota, so the generic rollback must leave them alone.
+          if (relayStored.has(f.path)) continue;
           try {
             if (fs.existsSync(f.path)) await fs.promises.unlink(f.path);
           } catch {
             // ignore unlink failure
           }
           if (runtime.quotaTracker) runtime.quotaTracker.release(f.size);
+        }
+      }
+      for (const fileId of relayStored.values()) {
+        try {
+          runtime.relayService.revokeFile(fileId);
+        } catch {
+          // A revoke failure must not mask the original error.
         }
       }
       next(error);
@@ -778,6 +863,12 @@ transferRouter.post('/api/upload/init', requireTransferGrant(), async (req, res,
     const uploadToken = runtime.pinRequired ? null : crypto.randomBytes(32).toString('hex');
     if (session) {
       session.sender = sender;
+      // A relay-approved session stores its bytes for the receiver, not in the host's
+      // receive directory; the grant is what carries that destination (UT-022).
+      if (grant?.relayId) {
+        session.relayId = grant.relayId;
+        session.relayFileIndex = grant.fileIndex;
+      }
       if (uploadToken) session.ownerTokenHash = hashUploadToken(uploadToken).toString('hex');
     }
 
@@ -910,6 +1001,13 @@ transferRouter.post('/api/upload/complete', async (req, res, next) => {
     const existingOutcome = runtime.chunkedUploadManager.getCompletedOutcome(uploadId);
     if (existingOutcome) {
       assertChunkSessionOwner(req, existingOutcome);
+      if (existingOutcome.relayFailed) {
+        throw new AppError(
+          'RELAY_STORE_FAILED',
+          409,
+          'Relay storage failed; start a new relay transfer'
+        );
+      }
       if (existingOutcome.pending) {
         return res.json({
           success: true,
@@ -924,6 +1022,10 @@ transferRouter.post('/api/upload/complete', async (req, res, next) => {
           },
         });
       }
+      if (existingOutcome.relay) {
+        // Same relay completion retried: report the stored file, do not merge again.
+        return res.json({ success: true, data: existingOutcome.relay });
+      }
     }
 
     // Read before completion clears the session: this is the consent the host gave
@@ -933,9 +1035,18 @@ transferRouter.post('/api/upload/complete', async (req, res, next) => {
       assertChunkSessionOwner(req, session);
     }
     const preApproved = Boolean(session?.preApproved);
+    const relayGrant = session?.relayId
+      ? { relayId: session.relayId, fileIndex: session.relayFileIndex }
+      : null;
 
-    const pendingDir = path.join(runtime.config.tempDir, 'pending');
-    const result = await runtime.chunkedUploadManager.complete(uploadId, pendingDir);
+    // A relay-approved session reassembles straight into the relay staging area. The
+    // reservation moves to the relay file, which owns it until TTL/revoke (M4-QC-03).
+    const targetDir = relayGrant
+      ? path.join(runtime.config.tempDir, 'relay')
+      : path.join(runtime.config.tempDir, 'pending');
+    const result = await runtime.chunkedUploadManager.complete(uploadId, targetDir, {
+      releaseQuota: !relayGrant,
+    });
     if (result.pending) {
       return res.json({
         success: true,
@@ -956,6 +1067,52 @@ transferRouter.post('/api/upload/complete', async (req, res, next) => {
       sender = resolveSender(req);
     } else {
       sender = result.sender || resolveSender(req);
+    }
+
+    if (relayGrant) {
+      let meta;
+      try {
+        meta = await storeRelayFile(
+          runtime,
+          {
+            path: result.filePath,
+            name: result.fileName,
+            size: result.size,
+            mimeType: result.mimeType,
+          },
+          relayGrant
+        );
+      } catch (err) {
+        // Keep a relay-specific terminal outcome before cleanup. Otherwise a retry sees
+        // the generic completion result and routes the missing file into host pending.
+        runtime.chunkedUploadManager.recordCompletedOutcome(uploadId, {
+          ...result,
+          relayFailed: true,
+        });
+        // A merged file that could not be registered must not squat in the relay area
+        // or keep holding quota. The sender must start a new relay transfer.
+        try {
+          await fs.promises.unlink(result.filePath);
+        } catch {
+          // Ignore unlink failure; the sweeper will reclaim it.
+        }
+        if (runtime.quotaTracker) runtime.quotaTracker.release(result.size);
+        throw err;
+      }
+      const relayOutcome = {
+        relayId: relayGrant.relayId,
+        fileId: meta.id,
+        fileName: result.fileName,
+        size: result.size,
+        duration: result.duration,
+        averageSpeed: result.averageSpeed,
+      };
+      runtime.chunkedUploadManager.recordCompletedOutcome(uploadId, {
+        ...result,
+        relay: relayOutcome,
+      });
+      // The receiver is notified by the relay service; the host is not asked to approve.
+      return res.json({ success: true, data: relayOutcome });
     }
 
     const recordParams = {
